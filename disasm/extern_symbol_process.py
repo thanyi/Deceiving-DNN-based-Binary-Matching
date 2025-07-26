@@ -44,10 +44,16 @@ def pltgot(filepath):
     Handle library functions linked through .plt.got and substitute them with correct symbols
     :param filepath: path to target executable
     """
-    with open('plts.info') as f:
-        f.seek(-2, os.SEEK_END)
-        while f.read(1) != '\n': f.seek(-2, os.SEEK_CUR)
-        lastplt = f.readline().split()
+    lastplt = None 
+    with open('plts.info', 'r') as f:
+        lines = f.readlines() 
+        if lines: 
+            lastplt = lines[-1].strip().split() 
+ 
+    if lastplt is None: 
+        print "Warning: plts.info is empty or malformed, cannot determine lastplt."
+        return 
+    
     lastplt = (int(lastplt[0],16), re.escape(lastplt[1].rstrip('>:')))
 
     pltgotsym = check_output('readelf -r ' + filepath + ' | awk \'/_GLOB_DAT/ {print $1,$5}\' | grep -v __gmon_start__ | cat', shell=True).strip()
@@ -60,7 +66,7 @@ def pltgot(filepath):
     pltgottargets = check_output(config.objdump + ' -Dr -j .plt.got ' + filepath + ' | grep jmp | cut -f1,3', shell=True)
     def pltgotmapper(l):
         items = l.strip().split()
-        dest = int(items[4] if '#' in items else items[2].lstrip('*'), 16)
+        dest = int(items[items.index('#') + 1] if '#' in items else items[2].lstrip('*'), 16)
         return (int(items[0].rstrip(':'), 16), dest)
     pltgottargets = dict(map(pltgotmapper, pltgottargets.strip().split('\n')))
     pltgottargets = {e[0]: '<' + pltgotsym[e[1]] + '@plt>' for e in pltgottargets.iteritems() if e[1] in pltgotsym}

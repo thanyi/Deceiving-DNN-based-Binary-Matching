@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Configuration
 """
@@ -103,7 +104,7 @@ def setup(filepath, gccopt='', exdata='', instrument=False):
     global excludedata
     with open('elf.info') as f: elf_info = f.readline()
     is_32 = 'ELF 32-bit' in elf_info
-    is_lib = 'LSB shared object' in elf_info
+    is_lib = ('LSB shared object' in elf_info) and ('interpreter' not in elf_info)
     is_dynamic = 'dynamically linked' in elf_info
     is_unstrip = 'not stripped' in elf_info
     gccoptions = gccopt

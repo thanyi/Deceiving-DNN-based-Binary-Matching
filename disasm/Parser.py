@@ -75,6 +75,11 @@ class parseX86(base_parser):
     Parser for x86 instructions
     """
 
+    def __init__(self):
+        super(parseX86, self).__init__()
+        # Add support for new x86 instructions
+        self.nop_instructions = {'ENDBR64', 'NOTRACK'}
+
     def unptr_symb(self, s):
         """
         Parse basic indirect addressing: (%rax)
@@ -291,6 +296,9 @@ class parseX86(base_parser):
         Parse operator
         :param sym: lexeme
         """
+        # Handle NOP-like instructions
+        if sym.upper() in self.nop_instructions:
+            return sym
         if sym not in Types.Op: raise InvalidOpException('Invalid operator: ' + sym.upper())
         if Opcode_utils.call_patt.match(sym): self.call_des = True  # @UndefinedVariable
         return sym

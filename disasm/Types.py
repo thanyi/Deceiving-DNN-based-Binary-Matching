@@ -218,7 +218,7 @@ if config.arch == config.ARCH_X86:
                       'XORB', 'XORL', 'SAHF', 'ANDW', 'NOTB', 'NOTW', 'XORPD', 'XORPS',
                       'ANDQ', 'XORQ', 'ANDPS', 'ANDNPS', 'ORPS', 'ANDPD', 'NOTQ', 'ANDNPD',
                       'ORPD', 'PAND', 'POR', 'PANDN', 'VXORPD', 'VPXOR', 'BSF', 'POPCNT', 'TZCNT',
-                      'VZEROUPPER', 'VXORPS', 'VANDPS'
+                      'VZEROUPPER', 'VXORPS', 'VANDPS', 'BTC'
     ], True)
     RolOp = RecSet(['ROL', 'SHL', 'SHR', 'SHLD', 'SHRD', 'SHRL', 'ROR', 'RORL',
                     'SAL', 'SAR', 'SHLL', 'ROLL', 'SHRB', 'SHLB', 'SARL', 'ROLW', 'SHLW',
@@ -260,13 +260,13 @@ if config.arch == config.ARCH_X86:
     SetOp = RecSet(['SETA', 'SETAE', 'SETB', 'SETBE', 'SETC',
                     'SETNBE', 'SETNC', 'SETNG', 'SETNE',
                     'SETE', 'SETNP', 'SETGE', 'SETG', 'SETLE',
-                    'SETL', 'SETP', 'SETNS', 'SETS'
+                    'SETL', 'SETP', 'SETNS', 'SETS', 'SETO'
     ], True)
     OtherOp = RecSet(['NOP', 'HLT', 'NOPW', 'NOPL', 'UD2'], True)
     JumpOp = RecSet(['JMP', 'JNE', 'JE', 'JB', 'JNAE', 'JNP',
                      'JC', 'JNB', 'JAE', 'JNC', 'JBE', 'JNA', 'JO',
                      'JA', 'JNBE', 'JL', 'JNGE', 'JGE', 'JNL', 'JLE',
-                     'JNG', 'JG', 'JNLE', 'JS', 'JNS', 'JP', 'JMPQ'
+                     'JNG', 'JG', 'JNLE', 'JS', 'JNS', 'JP', 'JMPQ', 'JNO'
     ], True)
     LoopOp = RecSet(['LOOP', 'LOOPE', 'LOOPNE'], True)
     FlagOp = RecSet(['CLD', 'CLTD', 'CLTQ'], True)

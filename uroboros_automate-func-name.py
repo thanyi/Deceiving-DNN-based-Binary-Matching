@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Main module
 """
@@ -7,18 +8,41 @@ import os
 import shutil
 import sys
 from argparse import ArgumentParser, RawTextHelpFormatter
-
+import logging
 from termcolor import colored
-
+import fileinput
 import config
 import pickle 
 import gen_address_mapping
 import pickle_gen_mapping
 
+log_file_path = '/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/log/uroboro.log'
+logging.basicConfig(filename=log_file_path,
+                    level=logging.DEBUG,
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    filemode='a') # 'a' for append, 'w' for overwrite
+logger = logging.getLogger(__name__)
+
 def open_path(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
+
+
+def fix_final_s(filepath):
+    _main_globl_added = False
+    for line in fileinput.input(filepath, inplace=True):
+        line = line.replace(' w ', ' nopw ') 
+        line = line.replace(' l ', ' nopl ') 
+        line = line.replace('notrack %ra', 'notrack jmpq *%rax')
+        line = line.replace('notrack %rb', 'notrack jmpq *%rbx')
+        line = line.replace('notrack %rc', 'notrack jmpq *%rcx')
+        line = line.replace('notrack %rd', 'notrack jmpq *%rdx')
+
+        if "main :" in line and not _main_globl_added:
+            sys.stdout.write(".globl main\n")
+            _main_globl_added = True 
+        sys.stdout.write(line)
 
 def process(filepath, instrument=False, fexclude='',specific_function=None):
     """
@@ -39,8 +63,12 @@ def process(filepath, instrument=False, fexclude='',specific_function=None):
 
         func_addr.func_addr(filepath, 0, fexclude)
 
-        os.system(config.strip + ' ' + filepath)
+        logger.info("[uroboros_automate-func-name.py:process]: finished dump.s, faddr.txt, faddr_old.txt")
+        logger.debug("[uroboros_automate-func-name.py:process]: filepath = {}".format(filepath))
+        
         main_discover.main_discover(filepath)
+        os.system(config.strip + ' ' + filepath)
+        os.system('file ' + filepath + ' > elf.info')
 
         init.main(filepath, instrument,specific_function = specific_function)
         if not os.path.isfile("final.s"): return False
@@ -53,12 +81,18 @@ def process(filepath, instrument=False, fexclude='',specific_function=None):
         with open('final.s', 'a') as f:
             with open('final_data.s', 'r') as fd: f.write(fd.read())
             if instrument: f.write('\n\n'.join(map(lambda e: e['plain'].instrdata, config.instrumentors)))
+        logger.info("[uroboros_automate-func-name.py:process]: write final_data.s done!")
+        fix_final_s('final.s')  # fix the final.s
+        logger.info("[uroboros_automate-func-name.py:process]: compile_process.main start!")
 
         compile_process.main(filepath)
+        logger.info("[uroboros_automate-func-name.py:process]: compile_process.main done!")
         if instrument:
             for worker in config.instrumentors:
                 worker['main'].aftercompile()
-        if compile_process.reassemble() != 0: return False
+        if compile_process.reassemble() != 0: 
+            logger.error("[uroboros_automate-func-name.py:process]: compile_process.reassemble() != 0, return False...")
+            return False
 
     except Exception as e:
         print e
@@ -79,7 +113,7 @@ def check(filepath, assumptions, gccopt='', excludedata='', instrument=False):
     :return: True if everything ok
     """
     if not assumptions: assumptions = []
-
+    logger.debug('[uroboros_automate-func-name.py:check]:filepath = {}'.format(filepath))
     if not os.path.isfile(filepath):
         sys.stderr.write("Cannot find input binary\n")
         return False
@@ -191,15 +225,16 @@ a label or an address range of data section to exclude from symbol search""")
         diversifications.append(diversifications[-1])
 
     abs_path = os.path.dirname(os.path.abspath(__file__))
-
     open_path(args.folder)
-    
+    logger.debug("[uroboros_automate-func-name.py:main]: args.binary = {}," \
+                            " args.mode = {}, args.function = {}".format(args.binary, args.mode, args.function))
     for i in range(1, num_iteration + 1):
         workdir = abs_path + '/workdir_' + str(i)
         if not os.path.isdir(workdir):
             os.mkdir(workdir)
 
-        print colored(('iteration %d dir:' + workdir) % i, 'green')
+        # print colored(('iteration %d dir:' + workdir) % i, 'green')
+        # logger.info(('iteration %d dir:' + workdir) % i, 'green')
         os.chdir(workdir)
         # run after setting the work directory
         set_diversification(diversifications[i - 1], i)
@@ -248,10 +283,13 @@ a label or an address range of data section to exclude from symbol search""")
             # process(filepath, instrument=False, fexclude='',specific_function=None)
             if process(os.path.basename(filepath), args.instrument, fexclude = fexclude,specific_function=specific_function):
                 # this will parse and return the pickled object 
+                logger.info("[uroboros_automate-func-name.py:main]: process func returns True !")
                 mapping_dict = gen_address_mapping.gen_mapping(args.mode)
-                with open(args.folder+'/mapping_dict.pickle', 'wb') as handle:
+                # logger.debug("[uroboros_automate-func-name.py:main]]: mapping_dict is {}".format(mapping_dict))
+                logger.debug("[uroboros_automate-func-name.py:main]]: args.folder is {}".format(args.folder))
+                with open(args.folder+'mapping_dict.pickle', 'wb') as handle:
                     pickle.dump(mapping_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
+                logger.info("[uroboros_automate-func-name.py:main]: write mapping_dict.pickle done !")
                 if args.mode == "original" :
                     sym_to_addr,sym_to_cur_sym = pickle_gen_mapping.gen_seed(mapping_dict)
                 else:
@@ -280,4 +318,5 @@ a label or an address range of data section to exclude from symbol search""")
 
 
 if __name__ == "__main__":
+    logger.info('[uroboros_automate-func-name.main]: ========== uroboros start ==========')
     main()

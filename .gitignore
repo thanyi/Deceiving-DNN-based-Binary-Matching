@@ -4,3 +4,11 @@ workdir*/
 .gdbinit
 .gdb_history
 .idea/
+workdir_1/
+bin_bk/
+uroboro_testing/
+uroboro_testing.bak/
+log/
+
+
+*.csv

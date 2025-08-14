@@ -1,5 +1,7 @@
 import glob
 import os 
+import logging
+logger = logging.getLogger(__name__)
 
 '''
 Original : 
@@ -49,6 +51,7 @@ def gen_mapping(mode):
     fs = open('final.s').read()
     fs = fs.split('\n')
     arr = []
+    logger.info("[gen_address_mapping.py:gen_mapping]:Loaded final.s ...")
     # mapping dict
     # In all of case ,we will save the mapping 
     # between new symbol and old addr
@@ -57,6 +60,7 @@ def gen_mapping(mode):
     old_addr_to_new_symbol = {}
 
     new_symbol_to_new_addr,new_addr_to_new_symbol = execute_mapping()
+    logger.info("[gen_address_mapping.py:gen_mapping]: new_symbol_to_new_addr and new_addr_to_new_symbol done!")
 
     # use for original transformation 
     new_symbol_to_seed_symbol = {}
@@ -141,7 +145,7 @@ def gen_mapping(mode):
             #     seed_symbol_to_new_symbol[old_symbol_tmp] = new_symbol_tmp
             #     new_symbol_to_old_addr[new_symbol_tmp] = old_addr_tmp
             #     old_addr_to_new_symbol[old_addr_tmp] = new_symbol_tmp
-
+        logger.info("[gen_address_mapping.py:gen_mapping]: new_symbol_to_seed_symbol is {}".format(new_symbol_to_seed_symbol))
         return [new_symbol_to_new_addr,new_addr_to_new_symbol,\
               new_symbol_to_seed_symbol,seed_symbol_to_new_symbol,\
               new_symbol_to_old_addr,old_addr_to_new_symbol]

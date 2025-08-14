@@ -21,7 +21,8 @@ from diversification.bb_opaque_diversify_gen2 import *
 from disasm import pre_process
 from disasm.disassemble_process import Disam
 from postprocess import post_process, post_process_lib, post_process_data
-
+import logging
+logger = logging.getLogger(__name__)
 
 class Ail(object):
     """

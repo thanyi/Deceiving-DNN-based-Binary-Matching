@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Process external symbols from shared libraries
 """

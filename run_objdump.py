@@ -2,6 +2,7 @@ import os
 import glob 
 import pandas as pd 
 import ast 
+from loguru import logger
 
 def disassembly(binary,output):
     os.system("objdump -M intel -d "+binary+" -j .text | cut -f3 > "+output)
@@ -64,6 +65,7 @@ def routine(binary):
     Input the path of the binary
     Return the parsed .s for the binary 
     '''
+    logger.info(f'routine start... binary ={binary} ')
     objdump_cache = binary+".tmp"
     output = binary+".s"
     disassembly(binary,objdump_cache)

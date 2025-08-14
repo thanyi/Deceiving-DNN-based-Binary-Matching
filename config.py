@@ -32,7 +32,7 @@ ARM_maxDoublemovDist = 40   # Maximum search distance between movw and movt
 ARM_maxAddPcDist = 8        # Maximum search distance for indirect PC relative loads
 
 # additional options
-gccoptions = ''
+gccoptions = ' -litm' 
 excludedata = ''
 
 # List of instrumentation modules (leave empty to apply all in alphabetic order)
@@ -107,7 +107,6 @@ def setup(filepath, gccopt='', exdata='', instrument=False):
     is_lib = ('LSB shared object' in elf_info) and ('interpreter' not in elf_info)
     is_dynamic = 'dynamically linked' in elf_info
     is_unstrip = 'not stripped' in elf_info
-    gccoptions = gccopt
     excludedata = exdata
     if ', ARM,' in elf_info:
         global arch

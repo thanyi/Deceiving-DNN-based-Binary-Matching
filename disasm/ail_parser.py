@@ -3,7 +3,8 @@ from func_slicer import func_slicer
 from utils.pp_print import pp_print_instr
 from disasm.Parser import InvalidOpException
 from utils.ail_utils import unify_funclist_by_name, unify_funclist_by_addr, int_of_string_opt
-
+import logging
+logger = logging.getLogger(__name__)
 
 class AilParser(object):
     """

@@ -5,7 +5,8 @@ Discover main function address
 import os
 import config
 from utils.ail_utils import ELF_utils
-
+import logging
+logger = logging.getLogger(__name__)
 
 def main_discover(filename):
     """
@@ -14,8 +15,9 @@ def main_discover(filename):
     """
     os.system('file ' + filename + ' > elf.info')
     if ELF_utils.elf_exe():
-
-        os.system(config.objdump + ' -Dr -j .text '+ filename + ' > ' + filename + '.temp')
+        objdmp_cmd = config.objdump + ' -Dr -j .text '+ filename + ' > ' + filename + '.temp'
+        logger.debug("[main_discover.py:main_discover]: objdmp cmd = {}".format(objdmp_cmd))
+        os.system(objdmp_cmd)
 
         with open(filename + '.temp') as f:
             lines = f.readlines()
@@ -82,6 +84,19 @@ def main_discover(filename):
                             break
                         j += 1
                     break
+        if not main_symbol: 
+            # find <main>: symbol
+            for i in xrange(ll):
+                l = lines[i]
+                if "<main>:" in l: 
+                    # i.e : "00000000000026f0"
+                    addr_str = l.split('<')[0].strip()
+                    # remove '0x' profix and uppercase
+                    main_symbol = addr_str.lstrip('0').upper() 
+                    if not main_symbol:     # if 0x00000000, lstrip('0') return 0
+                        main_symbol = '0'
+                    logger.debug("[main_discover.py:main_discover]: main_symbol = {}".format(main_symbol))
+                    break 
         else:
             raise Exception('Unknown arch')
 

@@ -11,8 +11,8 @@ import ail
 import config
 from disasm import pic_process, extern_symbol_process, arm_process
 from utils.ail_utils import ELF_utils
-
-
+import logging
+logger = logging.getLogger(__name__)
 class Init(object):
     """
     Processing initializer
@@ -117,12 +117,15 @@ class Init(object):
         Invoke processing skeleton
         :param instrument: True to apply instrumentations
         """
+        logger.info("[init.py:ailProcess]: start ailProcess ...")
+        logger.debug("[init.py:ailProcess]: self.file = {}".format(self.file))
         processor = ail.Ail(self.file)
         processor.sections()
         processor.userfuncs()
         processor.global_bss()
         # try to construct control flow graph and call graph
         # which can help to obfuscating process
+        logger.debug("[init.py:ailProcess]: instrument = {}, specific_function = {}".format(instrument, specific_function))
         processor.instrProcess(instrument, docfg=True,specific_function=specific_function)
 
     def checkret(self, ret, path):
@@ -141,6 +144,7 @@ def main(filepath, instrument=False,specific_function=None):
     :param filepath: path to executable
     :param instrument: True to apply instrumentation
     """
+    logger.info("[init.py:main]: start the init.main...")
     if ELF_utils.elf_strip() and ELF_utils.elf_exe():
         init = Init(filepath)
         init.disassemble()

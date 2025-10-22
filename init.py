@@ -127,6 +127,7 @@ class Init(object):
         # which can help to obfuscating process
         logger.debug("[init.py:ailProcess]: instrument = {}, specific_function = {}".format(instrument, specific_function))
         processor.instrProcess(instrument, docfg=True,specific_function=specific_function)
+        logger.info("[init.py:ailProcess]: processor.instrProcess function done ...")
 
     def checkret(self, ret, path):
         """
@@ -151,4 +152,7 @@ def main(filepath, instrument=False,specific_function=None):
         init.process()
         init.ailProcess(instrument,specific_function=specific_function)
     else:
+        logger.error("[init.py:main]: binary is not stripped or is a shared library")
         sys.stderr.write('Error: binary is not stripped or is a shared library\n')
+    
+    logger.info("[init.py:main]: end the init.main...")

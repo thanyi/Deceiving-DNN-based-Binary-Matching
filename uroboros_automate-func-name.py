@@ -57,7 +57,7 @@ def process(filepath, instrument=False, fexclude='',specific_function=None):
     import traceback
     from postprocess import compile_process
     from disasm import main_discover, func_addr
-
+    logger.info("[uroboros_automate-func-name.py:process]: process function start ... ")
     print "Starting to process binary '" + filepath + "'"
     try:
 
@@ -67,11 +67,15 @@ def process(filepath, instrument=False, fexclude='',specific_function=None):
         logger.debug("[uroboros_automate-func-name.py:process]: filepath = {}".format(filepath))
         
         main_discover.main_discover(filepath)
+        logger.info("[uroboros_automate-func-name.py:process]: main_discover function done ...")
         os.system(config.strip + ' ' + filepath)
         os.system('file ' + filepath + ' > elf.info')
 
         init.main(filepath, instrument,specific_function = specific_function)
-        if not os.path.isfile("final.s"): return False
+        logger.info("[uroboros_automate-func-name.py:process]: init.main function done ...")
+        if not os.path.isfile("final.s"): 
+            logger.info("[uroboros_automate-func-name.py:process]: write final_data.s failed!")
+            return False
 
         with open('final_data.s', 'a') as f:
             f.write('\n.section .eh_frame\n')
@@ -97,8 +101,9 @@ def process(filepath, instrument=False, fexclude='',specific_function=None):
     except Exception as e:
         print e
         traceback.print_exc()
+        logger.error("[uroboros_automate-func-name.py:process]: %s.", e)
         return False
-
+    logger.info("[uroboros_automate-func-name.py:process]: process function end ... ")
     return True
 
 
@@ -113,7 +118,7 @@ def check(filepath, assumptions, gccopt='', excludedata='', instrument=False):
     :return: True if everything ok
     """
     if not assumptions: assumptions = []
-    logger.debug('[uroboros_automate-func-name.py:check]:filepath = {}'.format(filepath))
+    logger.debug('[uroboros_automate-func-name.py:check]:filepath = {}'.format(filepath))   # the mutated bin path
     if not os.path.isfile(filepath):
         sys.stderr.write("Cannot find input binary\n")
         return False
@@ -132,11 +137,13 @@ def check(filepath, assumptions, gccopt='', excludedata='', instrument=False):
 
     if config.is_lib:
         sys.stderr.write("Uroboros doesn't support shared libraries\n")
+        logger.error('binary is stripped, function boundaries evaluation may not be precise')
         return False
 
     # if assumption three is utilized, then input binary should be unstripped.
     if ('3' in assumptions or instrument) and not config.is_unstrip:
-        print colored('Warning:', 'yellow'), 'binary is stripped, function boundaries evaluation may not be precise'
+        # print colored('Warning:', 'yellow'), 'binary is stripped, function boundaries evaluation may not be precise'
+        logger.warning('binary is stripped, function boundaries evaluation may not be precise')
 
     return True
 
@@ -232,7 +239,7 @@ a label or an address range of data section to exclude from symbol search""")
         workdir = abs_path + '/workdir_' + str(i)
         if not os.path.isdir(workdir):
             os.mkdir(workdir)
-
+        logger.debug("[uroboros_automate-func-name.py:main]: workdir= {}".format(workdir))
         # print colored(('iteration %d dir:' + workdir) % i, 'green')
         # logger.info(('iteration %d dir:' + workdir) % i, 'green')
         os.chdir(workdir)

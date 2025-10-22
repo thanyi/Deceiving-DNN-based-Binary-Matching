@@ -115,9 +115,12 @@ class Ail(object):
         :param instrument: True to apply instrumentations
         :param docfg: True to evaluate control flow graph
         """
+        logger.info("[ail.py:instrProcess]: in instrProcess .. ")
         self.pre_process()
+        logger.info("[ail.py:instrProcess]:  self.pre_process() done .. ")
+        logger.debug("[init.py:ailProcess]: self.file = {}, self.funcs = {}, self.secs = {}".format(self.file, self.funcs, self.secs))
         il, fl, re = Disam.disassemble(self.file, self.funcs, self.secs)
-
+        logger.info("[ail.py:instrProcess]: 3: ANALYSIS ... ")
         print colored('3: ANALYSIS', 'green')
         fbl, bbl, cfg_t, cg, il, re = Analysis.analyze(il, fl, re, docfg)  # @UnusedVariable
 
@@ -166,9 +169,11 @@ class Ail(object):
 
         if instrument:
             print colored('4: INSTRUMENTATION', 'green')
+            logger.info("[ail.py:instrProcess]: 4: INSTRUMENTATION ... ")
             for worker in config.instrumentors:
                 il = worker['main'].perform(il, fl)
 
         print colored(('5' if instrument else '4') + ': POST-PROCESSING', 'green')
+        logger.info("[ail.py:instrProcess]: %s: POST-PROCESSING ... ",('5' if instrument else '4'))
         Analysis.post_analyze(il_, re)
         self.post_process(instrument)

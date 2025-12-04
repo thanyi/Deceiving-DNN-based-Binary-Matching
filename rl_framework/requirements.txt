@@ -1,0 +1,12 @@
+# PPO Framework Requirements (Python 3)
+
+torch>=1.8.0
+numpy>=1.19.0
+pandas>=1.2.0
+loguru>=0.5.0
+
+# Optional: for advanced features
+# tensorboard>=2.5.0  # Training visualization
+gym>=0.18.0         # If using standard gym interface
+stable-baselines3   # Alternative: use pre-built PPO
+

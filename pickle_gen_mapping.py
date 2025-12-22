@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import pandas as pd 
 import pickle 
 import copy 
@@ -7,21 +8,39 @@ import os
 
 def gen_seed(s):
     '''
-    return [new_symbol_to_new_addr,new_addr_to_new_symbol,\
-      new_symbol_to_seed_symbol,seed_symbol_to_new_symbol,\
-      new_symbol_to_old_addr,old_addr_to_new_symbol]
-
+    s = mapping_dict = [new_symbol_to_new_addr,
+                        new_addr_to_new_symbol,
+                        new_symbol_to_seed_symbol,
+                        seed_symbol_to_new_symbol,
+                        new_symbol_to_old_addr,
+                        old_addr_to_new_symbol]
     '''
     sym_to_addr = {}
     sym_to_cur_sym = {}
+    logger.debug("[pickle_gen_mapping.py:gen_seed]: s[3] = {}".format(s[3]))
     for symbol in s[3].keys():
-        addr = s[0][s[3][symbol]].upper().replace('X','x').replace('0x0','0x')
+        addr = s[0][s[3][symbol]].upper().replace('X','x')
+        addr = normalize_addr(addr)  # ✅ 规范化地址格式
         sym_to_addr[symbol] = addr
         sym_to_cur_sym[symbol] = s[3][symbol]
     return sym_to_addr,sym_to_cur_sym
 
 def gen_mutated(sym_to_addr,sym_to_cur_sym,failure_seed,s):
+    """
+    正确的映射逻辑:
+    1. 从 sym_to_cur_sym 获取上一代的 cur_sym (如 'BB_179')
+    2. 在 s[2]  中查找对应的 seed_symbol (地址)
+    3. 在 s[3]  中查找新的 new_symbol
+    4. 在 s[0]  中查找新地址
+    """
     failure = []
+    logger.debug("[pickle_gen_mapping.py:gen_mutated]: sym_to_addr = {}".format(sym_to_addr))
+    logger.debug("[pickle_gen_mapping.py:gen_mutated]: sym_to_cur_sym = {}".format(sym_to_cur_sym))
+    logger.debug("[pickle_gen_mapping.py:gen_mutated]: failure_seed = {}".format(failure_seed))
+    logger.debug("[pickle_gen_mapping.py:gen_mutated]: s[0] sample = {}".format(list(s[0])))
+    logger.debug("[pickle_gen_mapping.py:gen_mutated]: s[3] sample = {}".format(list(s[3])))
+    logger.debug("[pickle_gen_mapping.py:gen_mutated]: s[3] total keys = {}".format(len(s[3])))
+    
     for symbol in sym_to_addr.keys():
         old_addr = sym_to_addr[symbol]
         try:
@@ -29,8 +48,10 @@ def gen_mutated(sym_to_addr,sym_to_cur_sym,failure_seed,s):
             addr = s[0][new_symbol].upper().replace('X','x').replace('0x0','0x')
             sym_to_addr[symbol] = addr
             sym_to_cur_sym[symbol] = new_symbol
-        except:
+            logger.debug("[pickle_gen_mapping.py:gen_mutated]: SUCCESS: {} => {} => {}".format(symbol, old_addr, new_symbol))
+        except Exception as e:
             failure.append(symbol)
+            logger.warning("[pickle_gen_mapping.py:gen_mutated]: FAILURE: {} (old_addr={}) - {}".format(symbol, old_addr, str(e)))
     for symbol in failure:
         tmp = sym_to_addr.pop(symbol, None)
         tmp = sym_to_cur_sym.pop(symbol, None)

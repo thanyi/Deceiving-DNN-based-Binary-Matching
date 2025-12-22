@@ -118,19 +118,24 @@ class Ail(object):
         logger.info("[ail.py:instrProcess]: in instrProcess .. ")
         self.pre_process()
         logger.info("[ail.py:instrProcess]:  self.pre_process() done .. ")
-        logger.debug("[init.py:ailProcess]: self.file = {}, self.funcs = {}, self.secs = {}".format(self.file, self.funcs, self.secs))
+        logger.debug("[ail.py:instrProcess]: self.file = {}, self.funcs = {}, self.secs = {}".format(self.file, self.funcs, self.secs))
         il, fl, re = Disam.disassemble(self.file, self.funcs, self.secs)
         logger.info("[ail.py:instrProcess]: 3: ANALYSIS ... ")
+        logger.debug("[ail.py:instrProcess]: fl = {}".format(fl))
         print colored('3: ANALYSIS', 'green')
         fbl, bbl, cfg_t, cg, il, re = Analysis.analyze(il, fl, re, docfg)  # @UnusedVariable
-
+        
         ####################################################
         u_funcs = filter(lambda f: f.is_lib is False, fl)
+        logger.info("[ail.py:instrProcess]: Available user functions (total {}): {}".format(
+            len(u_funcs), u_funcs))  
         il_ = il
         if specific_function != None :
             arr = []
-            # [function_name,addr_tmp]
+            logger.info("[ail.py:instrProcess]: Looking for specific functions: {}".format(specific_function))
+            # [['usage', 'S_0x000000000403071']]
             for specific in specific_function:
+                logger.info("[ail.py:instrProcess]: Looking for specific: {}".format(specific))
                 for xxx in u_funcs:
                     chk = str(xxx)
                     if chk.startswith(specific[0]+"@") or chk.startswith(specific[1]+"@"):
@@ -175,5 +180,6 @@ class Ail(object):
 
         print colored(('5' if instrument else '4') + ': POST-PROCESSING', 'green')
         logger.info("[ail.py:instrProcess]: %s: POST-PROCESSING ... ",('5' if instrument else '4'))
+        logger.debug("[ail.py:instrProcess]: il_ = {}".format(il_))
         Analysis.post_analyze(il_, re)
         self.post_process(instrument)

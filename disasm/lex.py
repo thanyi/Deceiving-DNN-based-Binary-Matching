@@ -119,7 +119,9 @@ def prefix_sub(instr):
     Remove x86 instruction prefix
     :param instr: instruction string
     """
-    return instr.replace('lock ', '') if 'lock ' in instr else instr
+    instr = instr.replace('lock ', '') if 'lock ' in instr else instr
+    instr = instr.replace('notrack ', '') if 'notrack ' in instr.lower() else instr
+    return instr
 
 def lexer(instr, location):
     """

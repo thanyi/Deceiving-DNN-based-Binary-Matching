@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import config
 import filter_nop
@@ -8,6 +9,8 @@ from analysis.reassemble_symbol_get import reassemble
 from analysis.disassemble_validator import dis_validator
 from utils.ail_utils import Time_Record as TR, read_file
 
+import logging
+logger = logging.getLogger(__name__)
 
 class Disam(object):
     """
@@ -39,6 +42,7 @@ class Disam(object):
         :param secs: list of sections
         :return: instruction list, updated function list, symbol reconstruction object
         """
+        logger.info("[disasm/disassemble_process.py:disassemble]: disassemble start .. ")
         ailpar = AilParser()
         re = reassemble()
         dis_valid = dis_validator()
@@ -48,24 +52,29 @@ class Disam(object):
         cond = False
         while not cond and total < 600.0:
             once = TR.get_utime()
-            ailpar.set_funcs(funcs)
-            ailpar.set_secs(secs)
-            ailpar.processInstrs(read_file('instrs.info'))
-            fl = ailpar.get_funcs()
-
+            ailpar.set_funcs(funcs)  # 设置函数列表
+            ailpar.set_secs(secs)  # 设置段列表
+            logger.info("[disasm/disassemble_process.py:disassemble]: ailpar.funcs = {}".format(ailpar.funcs))
+            ailpar.processInstrs(read_file('instrs.info'))  # 设置指令列表
+            logger.info("[disasm/disassemble_process.py:disassemble]: ailpar.funcs = {}".format(ailpar.funcs))
+            fl = ailpar.get_funcs()          
             il = re.visit_heuristic_analysis(ailpar.get_instrs())
             il = re.lib32_processing(il, fl)
             il = re.add_func_label(Disam.get_userfuncs(fl), il)
-
+            
             print colored('2: DISASSEMBLY VALIDATION', 'green')
+            logger.info("[disasm/disassemble_process.py:disassemble]: 2: DISASSEMBLY VALIDATION ")
             dis_valid.visit(il)
+            logger.info("[disasm/disassemble_process.py:disassemble]: dis_valid.visit(il) done ..")
             adjust_list = dis_valid.trim_results()
             if len(adjust_list) != 0:
+                logger.error("[disasm/disassemble_process.py:disassemble]: disassembly error found!'")
                 print '     disassembly error found!'
                 if config.arch == config.ARCH_ARMT: exit('Not implemented')
                 Disam.disasm_skip(filepath, adjust_list[0][0], adjust_list[0][1])
                 total += TR.elapsed(once)
             else:
                 cond = True
-
+        logger.info("[disasm/disassemble_process.py:disassemble]: fl = {}".format(fl))
+        logger.info("[disasm/disassemble_process.py:disassemble]: il = {}".format(il))
         return (il, fl, re)

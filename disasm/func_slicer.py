@@ -1,8 +1,10 @@
+# -*- coding: utf-8 -*-
 import Types
 import init_sec_adjust
 from Types import Func
 from utils.ail_utils import read_file, unify_int_list, get_loc, dec_hex
-
+import logging
+logger = logging.getLogger(__name__)
 
 class func_slicer(object):
     """
@@ -41,7 +43,7 @@ class func_slicer(object):
         """
         init_sec_adjust.main()
         with open('init_sec.info') as f:
-            l = f.readline()
+            l = f.readline()    # .init 0000000000004000 004000 00001b
         items = l.split()
         baddr = int(items[1], 16)
         eaddr = baddr + int(items[3], 16)
@@ -62,7 +64,9 @@ class func_slicer(object):
         Evaluate function boundaries
         """
         self.func_begins = unify_int_list(self.func_begins)
+        logger.info("[disasm/func_slicer.py:build_func_info]: self.func_begins = {}".format(self.func_begins))
         self.func_begins = self.filter_addr_by_secs(self.func_begins)
+        logger.info("[disasm/func_slicer.py:build_func_info]: self.func_begins_after_filter = {}".format(self.func_begins))
         for i in range(len(self.func_begins)-1):
             self.baddr = self.func_begins[i]
             self.eaddr = self.func_begins[i+1]
@@ -87,6 +91,8 @@ class func_slicer(object):
         """
         for e in self.funcs:
             self.func_set[e.func_name] = e
+        logger.info("[disasm/func_slicer.py:update_func]: self.funcs = {}".format(self.funcs))
+        logger.info("[disasm/func_slicer.py:update_func]: self.func_set = {}".format(self.func_set))
 
     def get_func_list(self):
         """
@@ -102,5 +108,6 @@ class func_slicer(object):
         self.func_begins += [f.func_begin_addr for f in self.funcs if f.func_begin_addr != 0]
         self.build_func_info()
         fl = self.get_func_list()
-        print '     Sliced', len(self.func_begins), 'functions'
+        logger.info("[disasm/func_slicer.py:get_funcs]: Sliced {} functions".format(len(self.func_begins)))
+        logger.info("[disasm/func_slicer.py:get_funcs]: fl = {}".format(fl))
         return fl

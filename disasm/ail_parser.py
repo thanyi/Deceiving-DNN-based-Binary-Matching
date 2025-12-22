@@ -1,3 +1,4 @@
+from math import log
 from Parser import parse
 from func_slicer import func_slicer
 from utils.pp_print import pp_print_instr
@@ -41,6 +42,7 @@ class AilParser(object):
         Get function list
         """
         fl = unify_funclist_by_name(self.func_slicing())
+        logger.info("[disasm/ail_parser.py:get_funcs]: fl = {}".format(fl))
         fl.sort(cmp=lambda f1, f2: f1.func_begin_addr - f2.func_begin_addr)
         fl = self.filter_func_by_name(fl)
         fl = self.update_func_info(fl)
@@ -75,9 +77,11 @@ class AilParser(object):
         """
         Evaluate function boundaries and get function list
         """
+        logger.info("[disasm/ail_parser.py:func_slicing]: self.funcs = {}".format(self.funcs))
         fs = func_slicer(self.instrs, self.funcs)
         fs.update_text_info()
         fs.update_func()
+        # logger.info("[disasm/ail_parser.py:func_slicing]: fs.get_funcs() = {}".format(fs.get_funcs()))
         return fs.get_funcs()
 
     def set_secs(self, secs):
@@ -98,8 +102,10 @@ class AilParser(object):
         p = parse()
         p.set_funclist(self.funcs)
         p.set_seclist(self.secs)
+        logger.info("[disasm/ail_parser.py:processInstrs]: p.funcs = {}".format(p.funcs))
+        logger.info("[disasm/ail_parser.py:processInstrs]: p.get_funclist() = {}".format(p.get_funclist()))
         for i in ilist:
-            items = filter(len, i.split(':'))
+            items = filter(len, i.split(':'))    
             if len(items) > 1:
                 loc = items[0]
                 instr = ':'.join(items[1:])
@@ -107,8 +113,11 @@ class AilParser(object):
                 except InvalidOpException as e: invalid.add(e.getop())
         if len(invalid) != 0:
             raise Exception('Some instructions are not known: ' + str(invalid))
+        
+        logger.info("[disasm/ail_parser.py:processInstrs]: p.get_funclist() = {}".format(p.get_funclist()))
         self.funcs = p.get_funclist()
-
+        logger.info("[disasm/ail_parser.py:processInstrs]: self.funcs = {}".format(self.funcs))
+   
     def p_instrs(self):
         """
         Print instructions

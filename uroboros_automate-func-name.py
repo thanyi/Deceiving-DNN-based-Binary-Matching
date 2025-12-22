@@ -118,7 +118,7 @@ def check(filepath, assumptions, gccopt='', excludedata='', instrument=False):
     :return: True if everything ok
     """
     if not assumptions: assumptions = []
-    logger.debug('[uroboros_automate-func-name.py:check]:filepath = {}'.format(filepath))   # the mutated bin path
+    logger.debug('[uroboros_automate-func-name.py:check]:filepath = {}, assumptions = {}, gccopt = {}'.format(filepath, assumptions, gccopt))   # the mutated bin path
     if not os.path.isfile(filepath):
         sys.stderr.write("Cannot find input binary\n")
         return False
@@ -221,6 +221,7 @@ a label or an address range of data section to exclude from symbol search""")
     exclude = os.path.realpath(args.exclude) if len(args.exclude) > 0 else ''
     fexclude = os.path.realpath(args.functionexclude) if len(args.functionexclude) > 0 else ''
 
+    logger.debug("[uroboros_automate-func-name.py:main]: outpath = {},".format(outpath))
     num_iteration = args.iteration
     if num_iteration is None or num_iteration <= 0:
         num_iteration = 1
@@ -230,7 +231,7 @@ a label or an address range of data section to exclude from symbol search""")
         diversifications = [0]
     while len(diversifications) < num_iteration:
         diversifications.append(diversifications[-1])
-
+    logger.info("[uroboros_automate-func-name.py:main]: diversifications = {}".format(diversifications))
     abs_path = os.path.dirname(os.path.abspath(__file__))
     open_path(args.folder)
     logger.debug("[uroboros_automate-func-name.py:main]: args.binary = {}," \
@@ -243,6 +244,7 @@ a label or an address range of data section to exclude from symbol search""")
         # print colored(('iteration %d dir:' + workdir) % i, 'green')
         # logger.info(('iteration %d dir:' + workdir) % i, 'green')
         os.chdir(workdir)
+
         # run after setting the work directory
         set_diversification(diversifications[i - 1], i)
         sym_to_addr = {}
@@ -268,6 +270,7 @@ a label or an address range of data section to exclude from symbol search""")
         if len(args.function) > 0 and args.mode=='mutated' :
             specific_function = []
             func_list = args.function
+            logger.info("[uroboros_automate-func-name.py:main]: sym_to_addr = {}".format(sym_to_addr))
             for function_name in func_list:
                 addr_tmp = ""
                 if function_name in sym_to_addr.keys():
@@ -275,7 +278,8 @@ a label or an address range of data section to exclude from symbol search""")
                     # name, address structure 
                     specific_function.append([function_name,addr_tmp])
             if len(specific_function) == 0:
-                raise Exception('Fail')
+                logger.error("[uroboros_automate-func-name.py:main]: No functions found in sym_to_addr and cannot find from binary. sym_to_addr keys: {}".format(list(sym_to_addr.keys())))
+                raise Exception('Fail: Cannot find function(s) {} in sym_to_addr or binary'.format(func_list))
 
         elif len(args.function) > 0 and args.mode=='original':
             specific_function = []
@@ -285,23 +289,32 @@ a label or an address range of data section to exclude from symbol search""")
                 specific_function.append([function_name,addr_tmp])
             if len(specific_function) == 0:
                 raise Exception('Fail')
+        logger.debug("[uroboros_automate-func-name.py:main]: specific_function = {},".format(specific_function))
 
         if check(filepath, args.assumption, args.gccopt, exclude, args.instrument) and set_assumption(args.assumption):
             # process(filepath, instrument=False, fexclude='',specific_function=None)
             if process(os.path.basename(filepath), args.instrument, fexclude = fexclude,specific_function=specific_function):
                 # this will parse and return the pickled object 
                 logger.info("[uroboros_automate-func-name.py:main]: process func returns True !")
+                '''
+                mapping_dict = [new_symbol_to_new_addr,
+                                new_addr_to_new_symbol,
+                                new_symbol_to_seed_symbol,
+                                seed_symbol_to_new_symbol,
+                                new_symbol_to_old_addr,
+                                old_addr_to_new_symbol]
+                '''
                 mapping_dict = gen_address_mapping.gen_mapping(args.mode)
-                # logger.debug("[uroboros_automate-func-name.py:main]]: mapping_dict is {}".format(mapping_dict))
                 logger.debug("[uroboros_automate-func-name.py:main]]: args.folder is {}".format(args.folder))
-                with open(args.folder+'mapping_dict.pickle', 'wb') as handle:
+                with open(args.folder+'/mapping_dict.pickle', 'wb') as handle:
                     pickle.dump(mapping_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                logger.info("[uroboros_automate-func-name.py:main]: write mapping_dict.pickle done !")
+                logger.info("[uroboros_automate-func-name.py:main]: write mapping_dict = {} in folder {}".format(mapping_dict, args.folder))
                 if args.mode == "original" :
                     sym_to_addr,sym_to_cur_sym = pickle_gen_mapping.gen_seed(mapping_dict)
                 else:
                     sym_to_addr,sym_to_cur_sym,failure = pickle_gen_mapping.gen_mutated(sym_to_addr,sym_to_cur_sym,failure_seed,mapping_dict)
-                    
+                
+                logger.debug("[uroboros_automate-func-name.py:main]: sym_to_addr is {}".format(sym_to_addr))
                 with open(args.folder+'/sym_to_addr.pickle', 'wb') as handle:
                     pickle.dump(sym_to_addr, handle, protocol=pickle.HIGHEST_PROTOCOL)
                 with open(args.folder+'/sym_to_cur_sym.pickle', 'wb') as handle:
@@ -325,5 +338,6 @@ a label or an address range of data section to exclude from symbol search""")
 
 
 if __name__ == "__main__":
-    logger.info('[uroboros_automate-func-name.main]: ========== uroboros start ==========')
+    logger.info('[uroboros_automate-func-name.main]: ============================================================ uroboros start ============================================================')
     main()
+    logger.info('[uroboros_automate-func-name.main]: ============================================================ uroboros end ============================================================')

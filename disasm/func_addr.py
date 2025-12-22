@@ -1,8 +1,11 @@
+# -*- coding: utf-8 -*-
+from math import log
 import os
 import re
 import shutil
 import config
-
+import logging
+logger = logging.getLogger(__name__)
 
 def func_addr(filename, count, fexclude=''):
     """
@@ -11,10 +14,16 @@ def func_addr(filename, count, fexclude=''):
     :param count: unused
     :param fexclude: path to file of function symbols to exclude from dump
     """
+    objdump_cmd = config.objdump + ' -Dr -j .text ' + filename + ' > dump.s'
+    os.system(objdump_cmd)
+    # os.system('pwd > dump.s.txt')
+    logger.debug("[func_addr.py:func_addr]: objdump cmd = {}".format(objdump_cmd))
+    grep_cmd = 'grep ">:" dump.s > fl'
+    os.system(grep_cmd)
+    logger.debug("[func_addr.py:func_addr]: grep cmd = {}".format(grep_cmd))
 
-    os.system(config.objdump + ' -Dr -j .text ' + filename + ' > dump.s')
-    os.system('grep ">:" dump.s > fl')
-
+    # useless_func_discover(filename)  # 生成useless_func.info
+    
     if len(fexclude) > 0 and os.path.isfile(fexclude):
         os.system('grep -v -f ' + fexclude + ' fl > fl.filtered')
         shutil.move('fl.filtered', 'fl')
@@ -26,7 +35,7 @@ def func_addr(filename, count, fexclude=''):
         with open('faddr_old.txt') as f:
             fnl_old = f.readlines()
 
-    fnl_old = map(lambda l : int(l.split()[0], 16), fnl_old)
+    fnl_old = map(lambda l : int(l.split()[0], 16), fnl_old)    
     #fnl_old = map(lambda l : l.split()[0], fnl_old)
     #print fnl_old
 
@@ -40,9 +49,9 @@ def func_addr(filename, count, fexclude=''):
         # ad-hoc solution, we don't consider basic block labels as functions
         if not "BB_" in fn:
             if "S_" in fn:
-                m = regex.search(fn)
+                m = regex.search(fn)    # "0000000000401160 <S_0x401160>:\n" --> S_0x401160
                 if m:
-                    d = m.groups()[0]
+                    d = m.groups()[0]   # '0x401160'
                     d1 = int(d,16)
                     if d1 in fnl_old:
                         addr = fn.split('<')[0].strip()
@@ -56,6 +65,8 @@ def func_addr(filename, count, fexclude=''):
                         addr = fn.split('<')[0].strip()
                         addrs.append("0x" + addr + '\n')
                         addrs_2.append(fn)
+                    else:
+                        logger.debug("[func_addr.py:func_addr]: fn = {}, d = {}, count = {}".format(fn, d, count))
             else:
                 addr = fn.split('<')[0].strip()
                 addrs.append("0x" + addr + '\n')

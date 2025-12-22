@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import glob
 import os 
 import logging
@@ -32,6 +33,7 @@ BB_63:   ->  errno_nonexisting :   ->  S_0x8049947 : push %ebp
 # create file 
 
 def execute_mapping():
+    os.system("objdump  -Dr -j .text  a.out > dump_full.s")
     os.system("objdump  -Dr -j .text  a.out |grep \">:\" > addr_map")
     fs = open('addr_map').read()
     fs = fs.split('\n')
@@ -47,6 +49,15 @@ def execute_mapping():
 
 
 def gen_mapping(mode):
+    '''
+    return [new_symbol_to_new_addr,
+            new_addr_to_new_symbol,\
+            new_symbol_to_seed_symbol,
+            seed_symbol_to_new_symbol,\
+            new_symbol_to_old_addr,
+            old_addr_to_new_symbol]
+
+    '''
     # original seed vs mutated seed 
     fs = open('final.s').read()
     fs = fs.split('\n')
@@ -60,19 +71,20 @@ def gen_mapping(mode):
     old_addr_to_new_symbol = {}
 
     new_symbol_to_new_addr,new_addr_to_new_symbol = execute_mapping()
-    logger.info("[gen_address_mapping.py:gen_mapping]: new_symbol_to_new_addr and new_addr_to_new_symbol done!")
-
+    logger.info("[gen_address_mapping.py:gen_mapping]: new_symbol_to_new_addr = {}".format(new_symbol_to_new_addr))
+    logger.info("[gen_address_mapping.py:gen_mapping]: new_addr_to_new_symbol = {}".format(new_addr_to_new_symbol))
     # use for original transformation 
     new_symbol_to_seed_symbol = {}
     seed_symbol_to_new_symbol = {}
 
     for gg in range(0, len(fs)):
         if fs[gg][:4] == "S_0x":
-            arr.append(gg)
+            arr.append(gg)      # 记录所有S_0x标签行的行号
     if mode =="original":
-        for pp in arr:
+        for pp in arr:  # 遍历所有S_0x标签行
             #if "BB_" in fs[pp-3] and "_merge:" in fs[pp-3] and "BB_" in fs[pp-2] and "BB_" not in fs[pp-1]:
-            if "BB_" in fs[pp-3]  and "BB_" in fs[pp-2] and "BB_" not in fs[pp-1]:
+            # if "BB_" in fs[pp-3]  and "BB_" in fs[pp-2] and "BB_" not in fs[pp-1]:
+            if "BB_" in fs[pp-3]  and "BB_" in fs[pp-2] and "BB_" not in fs[pp-1] and fs[pp-3][-1] == ':':  # 格式问题修改，保证格式正确
                 '''
                 Type A 
                 2. 

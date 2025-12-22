@@ -17,26 +17,48 @@ import os
 from collections import deque
 
 class PolicyNetwork(nn.Module):
-    """策略网络：输出每个动作的概率分布"""
+    """策略网络：输出每个动作的概率分布（改进版）"""
     
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(PolicyNetwork, self).__init__()
         
+        # Actor 网络（更深，带归一化）
         self.actor = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
+            
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
+            nn.Dropout(0.1),
+            
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            
+            nn.Linear(hidden_dim // 2, action_dim),
             nn.Softmax(dim=-1)
         )
         
+        # Critic 网络（独立架构）
         self.critic = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
+            
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Dropout(0.1),
+            
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            
+            nn.Linear(hidden_dim // 2, 1)
         )
     
     def forward(self, state):
@@ -49,13 +71,13 @@ class PolicyNetwork(nn.Module):
 class PPOAgent:
     """PPO 智能体"""
     
-    def __init__(self, state_dim, n_actions=8, lr=3e-4, gamma=0.99, 
+    def __init__(self, state_dim, n_actions=6, lr=1e-4, gamma=0.99, 
                  epsilon=0.2, epochs=10, device='cpu'):
         """
         参数:
             state_dim: 状态维度（特征向量长度）
-            n_actions: 动作数量（8种变异策略）
-            lr: 学习率
+            n_actions: 动作数量（6种变异策略）
+            lr: 学习率（降低到 1e-4）
             gamma: 折扣因子
             epsilon: PPO裁剪参数
             epochs: 每次更新的训练轮数
@@ -67,12 +89,15 @@ class PPOAgent:
         self.epochs = epochs
         
         # 动作映射：索引 -> 实际变异模式
-        self.action_map = [1, 2, 3, 5, 7, 8, 9, 11]
+        self.action_map = [1, 2, 7, 8, 9, 11]
         self.n_actions = n_actions
         
         # 初始化网络
         self.policy = PolicyNetwork(state_dim, n_actions).to(self.device)
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
+        
+        # 分离 Actor 和 Critic 优化器（降低学习率）
+        self.actor_optimizer = optim.Adam(self.policy.actor.parameters(), lr=lr)
+        self.critic_optimizer = optim.Adam(self.policy.critic.parameters(), lr=lr * 2)  # Critic 学习稍快
         
         # 经验缓冲
         self.memory = {
@@ -165,8 +190,11 @@ class PPOAgent:
         
         total_loss = 0
         
-        # PPO 多轮更新
-        for _ in range(self.epochs):
+        # PPO 多轮更新（分离 Actor 和 Critic 更新）
+        total_actor_loss = 0
+        total_critic_loss = 0
+        
+        for epoch in range(self.epochs):
             # 前向传播
             action_probs, state_values = self.policy(states)
             
@@ -188,19 +216,28 @@ class PPOAgent:
             surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
             actor_loss = -torch.min(surr1, surr2).mean()
             
-            # Critic 损失
-            critic_loss = 0.5 * (returns - state_values.squeeze()).pow(2).mean()
+            # 加入熵正则化鼓励探索
+            actor_loss = actor_loss - 0.02 * entropy  # 提高熵系数到 0.02
             
-            # 总损失（加入熵正则化鼓励探索）
-            loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+            # 更新 Actor
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward(retain_graph=True)  # 保留计算图供 Critic 使用
+            torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), 0.5)
+            self.actor_optimizer.step()
             
-            # 更新网络
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
-            self.optimizer.step()
+            # Critic 损失（使用 Huber Loss 更鲁棒）
+            critic_loss = nn.functional.smooth_l1_loss(state_values.squeeze(), returns)
             
-            total_loss += loss.item()
+            # 更新 Critic
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.critic.parameters(), 0.5)
+            self.critic_optimizer.step()
+            
+            total_actor_loss += actor_loss.item()
+            total_critic_loss += critic_loss.item()
+        
+        total_loss = total_actor_loss + total_critic_loss
         
         # 清空缓冲
         self.clear_memory()
@@ -218,19 +255,27 @@ class PPOAgent:
         }
     
     def save(self, path):
-        """保存模型"""
+        """保存模型（包含两个优化器）"""
         torch.save({
             'policy_state_dict': self.policy.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
         }, path)
         print(f"模型已保存到: {path}")
     
     def load(self, path):
-        """加载模型"""
+        """加载模型（兼容旧版本）"""
         if os.path.exists(path):
             checkpoint = torch.load(path, map_location=self.device)
             self.policy.load_state_dict(checkpoint['policy_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # 兼容旧版本（单优化器）
+            if 'actor_optimizer_state_dict' in checkpoint:
+                self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+                self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+            elif 'optimizer_state_dict' in checkpoint:
+                print("警告: 加载旧版本模型，优化器状态未完全恢复")
+            
             print(f"模型已从 {path} 加载")
         else:
             print(f"模型文件 {path} 不存在")
@@ -245,40 +290,41 @@ class RewardShaper:
     
     def compute_reward(self, score, grad, done, step_count):
         """
-        计算奖励（修复数值稳定性）
+        计算奖励（改进版：降低尺度，提高稳定性）
         
         参数:
-            score: 相似度分数（越低越好）
+            score: 相似度分数（越低越好，目标 < 0.40）
             grad: 梯度值
             done: 是否达到目标
             step_count: 当前步数
         
         返回:
-            reward: 奖励值（归一化到合理范围）
+            reward: 奖励值（归一化到 [-5, 10] 范围）
         """
-        # 基础奖励：归一化分数变化
-        reward = (1.0 - score) * 10.0  # 映射到 [0, 10]
+        # 基础奖励：使用对数缩放，降低极端值
+        # score 从 1.0 → 0.4，reward 从 0 → 6
+        reward = -np.log(score + 0.01) * 2.0  # 对数缩放，更平滑
         
-        # 成功奖励
+        # 成功奖励（降低到 10）
         if done and score < self.target_score:
-            reward += 50.0  # 大奖励
+            reward += 10.0
         
-        # 进步奖励（相比历史最优）
+        # 进步奖励（大幅降低系数）
         if score < self.best_score:
             improvement = self.best_score - score
-            reward += improvement * 100.0  # 放大进步信号
+            reward += improvement * 20.0  # 从 100 降低到 20
             self.best_score = score
+        else:
+            # 如果没有进步，小惩罚
+            reward -= 0.5
         
-        # 梯度引导奖励（归一化）
-        # grad 通常在 416~417，归一化到 [0, 1]
-        normalized_grad = (grad - 410) / 10.0  # 假设范围 [410, 420]
-        reward += normalized_grad * 2.0  # 贡献 [0, 2]
+        # 移除梯度奖励（前面分析表明梯度信息冗余）
         
-        # 步数惩罚（避免过长序列）
-        reward -= step_count * 0.05
+        # 步数惩罚（降低系数）
+        reward -= step_count * 0.02  # 从 0.05 降低到 0.02
         
-        # 裁剪奖励到合理范围，避免溢出
-        reward = max(-10.0, min(reward, 100.0))
+        # 裁剪奖励到合理范围（收窄范围）
+        reward = np.clip(reward, -5.0, 10.0)
         
         return reward
     
@@ -291,8 +337,8 @@ if __name__ == "__main__":
     # 测试代码
     print("PPO Agent 初始化测试...")
     
-    state_dim = 128  # 假设特征维度
-    agent = PPOAgent(state_dim=state_dim, n_actions=8)
+    state_dim = 64  # 特征维度（推荐 64）
+    agent = PPOAgent(state_dim=state_dim, n_actions=6)
     
     # 模拟一个状态
     dummy_state = np.random.randn(state_dim)

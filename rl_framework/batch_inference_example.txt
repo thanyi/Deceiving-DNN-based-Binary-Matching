@@ -1,0 +1,27 @@
+# 批量推理配置文件示例
+# 格式: binary_path,function_name,output_path
+# 
+# 说明:
+# - binary_path: 二进制文件路径（相对或绝对路径）
+# - function_name: 目标函数名
+# - output_path: 输出目录（可选，默认自动生成）
+#
+# 注意:
+# - 以 # 开头的行是注释，会被忽略
+# - 空行会被忽略
+# - 每行一个任务
+
+# 示例1: coreutils 工具
+workdir_1/ls,usage,inference_ls_usage
+workdir_1/pwd,usage,inference_pwd_usage
+workdir_1/cat,main,inference_cat_main
+workdir_1/echo,usage,inference_echo_usage
+
+# 示例2: 只指定二进制和函数，输出路径自动生成
+# workdir_1/grep,main
+# workdir_1/sed,process_args
+# workdir_1/awk,main
+
+# 示例3: 绝对路径
+# /home/ycy/ours/binary_function_similarity/workdir_1/chmod,usage,inference_chmod
+

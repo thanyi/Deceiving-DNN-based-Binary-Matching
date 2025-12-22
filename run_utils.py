@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""
+二进制匹配系统的运行时工具函数
+包含用于评估二进制文件相似度的核心功能
+"""
+
+import os
+import sys
+import pickle
+import numpy as np
+import pandas as pd
+import ast
+import subprocess
+from loguru import logger
+import random
+import hashlib
+import time
+
+# 添加 asm2vec-pytorch 路径到 sys.path
+_asm2vec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                             'detection_model', 'asm2vec-pytorch')
+if _asm2vec_path not in sys.path:
+    sys.path.insert(0, _asm2vec_path)
+
+# 导入 compare_functions
+from scripts.compare_util import *
+from scripts.bin2asm_util import *
+
+def run_one(original_binary, mutated_binary, model_original, checkdict, function_name, detection_method = "asm2vec"):
+    """
+    评估原始二进制文件和变异二进制文件之间的相似度
+    
+    这是一个关键函数，用于计算变异二进制文件与原始文件的相似度分数和梯度值。
+    分数越低表示相似度越高，梯度值用于指导优化方向。
+    
+    参数:
+        original_binary: 原始二进制文件路径
+        mutated_binary: 变异二进制文件路径  
+        model_original: 预训练的模型对象
+        checkdict: 函数映射字典，包含符号到地址的映射关系
+        function_name: 目标函数名
+    
+    返回:
+        score: 相似度分数 (float) - 越低表示越相似，目标是< 0.40
+        grad: 梯度值 (float) - 用于指导变异方向的优化指标
+    """
+    try:
+        logger.debug(f'run_one开始: 原始={original_binary}, 变异={mutated_binary}, 函数={function_name}')
+        
+        # 1. 检查输入文件是否存在
+        if not os.path.exists(original_binary):
+            logger.error(f"原始二进制文件不存在: {original_binary}")
+            return None, None
+        
+        if not os.path.exists(mutated_binary):
+            logger.error(f"变异二进制文件不存在: {mutated_binary}")
+            return None, None
+        
+        # 2. 获取汇编文件路径
+        if detection_method == "asm2vec":
+            logger.info(f"[*] detection_method: {detection_method}")
+            mutated_folder = os.path.dirname(mutated_binary)
+            checkdict = pickle.load(open(os.path.join(mutated_folder, "sym_to_addr.pickle"), "rb")) # 原始函数的符号到地址的映射
+            ori_sym_addr = checkdict[function_name]  # 原始函数的符号在现在的地址
+            new_sym_name = 'func_' + ori_sym_addr[2:].lower()
+            logger.info(f"[*] new_sym_name: {new_sym_name}")
+            # 生成变异文件的汇编文件
+            mutate_output_file = binfunc2asm(ipath = mutated_binary,
+                                    target_func_name = new_sym_name,    # 变异文件的函数名
+                                    opath='/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/changed_asm/', verbose= False)
+            original_output_file = binfunc2asm(ipath = original_binary,
+                                    target_func_name = function_name,    # 原始文件的函数名
+                                    opath='/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/original_asm/', verbose= False)
+            if not mutate_output_file or not original_output_file:
+                logger.error(f"无法提取函数 {function_name} 的汇编文件")
+                return None, None
+            mutated_asm = mutate_output_file
+            original_asm = original_output_file
+            score = compare_functions(original_asm, mutated_asm)
+            # asm2vec 方法不提供 grad，使用 score 的变化作为近似
+            grad = 0.0  # 或者可以计算 score 的变化率
+            return abs(score), abs(grad)
+            
+    except Exception as e:
+        logger.error(f"run_one函数出错: {e}")
+        return None, None
+
+
+# def train_pickle(asm_file):
+    # TODO
+
+
+# if __name__ == '__main__':
+#     # compare_functions(ipath1="/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/changed_asm/0092b83bfab97f48a5e10cb3830436481e33baa977c175dbe0c63dbe9b5575fc",
+#                 # ipath2='/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/original_asm/1c359ba4755040359222334bb638b769f9f58a6fd6ca9a312914f67ea70fb5b6')
+#     run_one(original_binary="/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd",
+#             mutated_binary="/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/function_container_usage_pwd/f906ab2da901dbb8d4ecabd3f95409b1_container/f906ab2da901dbb8d4ecabd3f95409b1",
+#             model_original=None,
+#             checkdict=None,
+#             function_name="usage",
+#             detection_method="asm2vec")

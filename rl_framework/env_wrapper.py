@@ -24,7 +24,7 @@ from loguru import logger
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 导入现有模块
-from run_utils import run_one, train_pickle
+from run_utils import run_one
 import run_objdump
 
 class BinaryPerturbationEnv:
@@ -49,40 +49,311 @@ class BinaryPerturbationEnv:
         # 项目根目录（uroboros 所在目录）
         self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         
-        # 加载模型
-        logger.info("Loading model...")
-        model_path = "/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/gnu.pickle"
-        with open(model_path, 'rb') as f:
-            self.model_original = pickle.load(f)
+        # 不再需要加载模型（使用 asm2vec 方法）
+        self.model_original = None
+        logger.info("Using asm2vec detection method (no model loading required)")
         
         # 变异历史
         self.mutation_history = []
         self.current_binary = original_binary
         self.step_count = 0
         self.target_score = 0.40
+        self.state_dim = 64  # 默认状态维度（推荐 64），可以通过参数修改
         
         logger.info("Environment initialized successfully")
     
+    def set_state_dim(self, state_dim):
+        """
+        设置状态维度（用于与 PPO Agent 保持一致）
+        
+        参数:
+            state_dim: 状态维度
+        """
+        self.state_dim = state_dim
+        logger.info(f"状态维度设置为: {state_dim}")
+    
     def extract_features(self, binary_path):
         """
-        提取二进制文件的特征向量
+        提取二进制文件的特征向量（函数级别特征）
         
         返回:
-            features: numpy array, 特征向量
+            features: list, 特征向量 (state_dim维)
         """
         try:
-            # 这里需要根据实际情况实现特征提取
-            # 可以使用 run_objdump + 特征工程
-            # 简化版：返回固定维度的随机特征（需要替换为真实实现）
+            if not os.path.exists(binary_path):
+                logger.warning(f"二进制文件不存在: {binary_path}")
+                return [0.0] * self.state_dim
             
-            # TODO: 实现真实的特征提取
-            # 1. 运行 objdump 获取汇编代码
-            # 2. 提取指令序列、控制流图等特征
-            # 3. 使用模型嵌入层编码
+            features = []
             
-            # 临时实现：返回128维特征
-            features = np.random.randn(128).astype(np.float32)
-            return features.tolist()
+            # ========== 第一部分：变异历史和相似度特征 (约10维) ==========
+            
+            # 1. 当前相似度分数（最重要的特征）
+            if self.mutation_history:
+                last_score = self.mutation_history[-1].get('score', 1.0)
+                features.append(min(last_score, 1.0))
+            else:
+                features.append(1.0)  # 初始状态
+            
+            # 2. 相似度变化趋势（最近3步）
+            if len(self.mutation_history) >= 2:
+                recent_scores = [m.get('score', 1.0) for m in self.mutation_history[-3:]]
+                # 计算趋势：是在改善还是变差
+                score_delta = recent_scores[-1] - recent_scores[0]
+                features.append(max(-1.0, min(1.0, score_delta)))  # 归一化到 [-1, 1]
+                # 最近的最好分数
+                features.append(min(recent_scores))
+            else:
+                features.extend([0.0, 1.0])
+            
+            # 3. 变异历史统计
+            mutation_count = len(self.mutation_history)
+            step_count = self.step_count
+            features.extend([
+                min(mutation_count / 50.0, 1.0),  # 归一化
+                min(step_count / 50.0, 1.0),
+            ])
+            
+            # 4. 已应用的变异类型统计（one-hot 编码）
+            # 动作集: [1, 2, 7, 8, 9, 11]
+            action_counts = {1: 0, 2: 0, 7: 0, 8: 0, 9: 0, 11: 0}
+            for m in self.mutation_history:
+                action = m.get('action')
+                if action in action_counts:
+                    action_counts[action] += 1
+            # 归一化为频率
+            total_actions = sum(action_counts.values()) if mutation_count > 0 else 1
+            for action in [1, 2, 7, 8, 9, 11]:
+                features.append(action_counts[action] / total_actions)
+            
+            # ========== 第二部分：函数级别的特征 (约20维) ==========
+            
+            # 5. 提取目标函数的汇编代码统计特征
+            func_features = self._extract_function_features(binary_path)
+            features.extend(func_features)
+            
+            # ========== 第三部分：函数内容哈希（提供唯一性）(剩余维度) ==========
+            
+            # 6. 函数内容的哈希值（确保不同函数有不同特征）
+            func_hash = self._get_function_hash(binary_path)
+            features.extend(func_hash)
+            
+            # ========== 填充和截断 ==========
+            
+            # 填充到 state_dim 维
+            if len(features) < self.state_dim:
+                features.extend([0.0] * (self.state_dim - len(features)))
+            
+            # 截断到 state_dim 维
+            features = features[:self.state_dim]
+            
+            # 确保所有值在合理范围内
+            features = [max(0.0, min(1.0, f)) for f in features]
+            
+            return features
+            
+        except Exception as e:
+            logger.error(f"特征提取失败: {e}, 使用零向量")
+            # 降级方案：返回零向量（但至少是确定性的）
+            return [0.0] * self.state_dim
+    
+    def _extract_function_features(self, binary_path):
+        """
+        提取函数级别的统计特征（约20维）
+        
+        返回:
+            features: list, 函数特征向量
+        """
+        try:
+            from scripts.bin2asm_util import binfunc2asm
+            
+            # 获取函数名（处理变异后的函数名变化）
+            mutated_folder = os.path.dirname(binary_path)
+            checkdict_path = os.path.join(mutated_folder, "sym_to_addr.pickle")
+            
+            target_func_name = self.function_name
+            if os.path.exists(checkdict_path):
+                try:
+                    with open(checkdict_path, 'rb') as f:
+                        checkdict = pickle.load(f)
+                    ori_sym_addr = checkdict.get(self.function_name)
+                    if ori_sym_addr:
+                        target_func_name = 'func_' + ori_sym_addr[2:].lower()
+                except:
+                    pass
+            
+            # 提取汇编代码
+            asm_file = binfunc2asm(
+                ipath=binary_path,
+                target_func_name=target_func_name,
+                opath='/tmp/rl_func_features/',
+                verbose=False
+            )
+            
+            if not asm_file or not os.path.exists(asm_file):
+                logger.debug(f"无法提取函数汇编: {binary_path}")
+                return self._default_function_features()
+            
+            # 读取汇编代码并提取统计特征
+            with open(asm_file, 'r') as f:
+                asm_lines = f.readlines()
+            
+            # 过滤掉注释和空行
+            code_lines = [l.strip() for l in asm_lines if l.strip() and not l.strip().startswith('#')]
+            
+            # 1. 函数长度（指令数量）
+            num_instructions = len(code_lines)
+            features = [min(num_instructions / 1000.0, 1.0)]  # 归一化，假设最多1000条指令
+            
+            # 2. 基本块数量（通过标签估算）
+            num_labels = sum(1 for l in code_lines if ':' in l and not l.startswith('\t'))
+            features.append(min(num_labels / 100.0, 1.0))  # 归一化
+            
+            # 3. 跳转指令数量（控制流复杂度）
+            jump_instrs = ['jmp', 'je', 'jne', 'jg', 'jl', 'jge', 'jle', 'ja', 'jb', 'jae', 'jbe', 'call', 'ret']
+            num_jumps = sum(1 for l in code_lines for j in jump_instrs if j in l.lower())
+            features.append(min(num_jumps / 100.0, 1.0))  # 归一化
+            
+            # 4. 调用指令数量
+            num_calls = sum(1 for l in code_lines if 'call' in l.lower())
+            features.append(min(num_calls / 50.0, 1.0))  # 归一化
+            
+            # 5. 返回指令数量
+            num_rets = sum(1 for l in code_lines if 'ret' in l.lower())
+            features.append(min(num_rets / 10.0, 1.0))  # 归一化
+            
+            # 6. 内存访问指令数量
+            mem_instrs = ['mov', 'lea', 'push', 'pop', 'load', 'store']
+            num_mem = sum(1 for l in code_lines for m in mem_instrs if m in l.lower())
+            features.append(min(num_mem / 500.0, 1.0))  # 归一化
+            
+            # 7. 算术指令数量
+            arith_instrs = ['add', 'sub', 'mul', 'div', 'inc', 'dec', 'neg']
+            num_arith = sum(1 for l in code_lines for a in arith_instrs if a in l.lower())
+            features.append(min(num_arith / 200.0, 1.0))  # 归一化
+            
+            # 8. 逻辑指令数量
+            logic_instrs = ['and', 'or', 'xor', 'not', 'shl', 'shr']
+            num_logic = sum(1 for l in code_lines for lg in logic_instrs if lg in l.lower())
+            features.append(min(num_logic / 100.0, 1.0))  # 归一化
+            
+            # 9. 比较指令数量
+            num_cmp = sum(1 for l in code_lines if 'cmp' in l.lower() or 'test' in l.lower())
+            features.append(min(num_cmp / 100.0, 1.0))  # 归一化
+            
+            # 10. 函数复杂度：指令/基本块比例（指令密度）
+            if num_labels > 0:
+                instr_per_bb = num_instructions / num_labels
+                features.append(min(instr_per_bb / 50.0, 1.0))  # 归一化
+            else:
+                features.append(0.5)  # 默认值
+            
+            # 11. 控制流复杂度：跳转/指令比例
+            if num_instructions > 0:
+                jump_ratio = num_jumps / num_instructions
+                features.append(min(jump_ratio, 1.0))
+            else:
+                features.append(0.0)
+            
+            # 12-20. 函数长度变化率（相对于原始函数）
+            if binary_path != self.original_binary:
+                # 获取原始函数的指令数量
+                original_asm = binfunc2asm(
+                    ipath=self.original_binary,
+                    target_func_name=self.function_name,
+                    opath='/tmp/rl_func_features/',
+                    verbose=False
+                )
+                if original_asm and os.path.exists(original_asm):
+                    with open(original_asm, 'r') as f:
+                        orig_lines = [l.strip() for l in f.readlines() if l.strip() and not l.strip().startswith('#')]
+                    orig_count = len(orig_lines)
+                    if orig_count > 0:
+                        length_ratio = num_instructions / orig_count
+                        features.append(min(length_ratio, 2.0) / 2.0)  # 归一化到 [0, 1]
+                    else:
+                        features.append(1.0)
+                else:
+                    features.append(1.0)
+            else:
+                features.append(1.0)  # 原始文件，比例为1
+            
+            # 填充到20维
+            while len(features) < 20:
+                features.append(0.0)
+            
+            return features[:20]
+            
+        except Exception as e:
+            logger.debug(f"提取函数特征失败: {e}")
+            return self._default_function_features()
+    
+    def _default_function_features(self):
+        """返回默认的函数特征（20维零向量）"""
+        return [0.0] * 20
+    
+    def _get_function_hash(self, binary_path):
+        """
+        获取函数内容的哈希值（提供唯一性）
+        针对 64 维优化：返回约 33 维
+        
+        返回:
+            features: list, 哈希特征向量
+        """
+        try:
+            from scripts.bin2asm_util import binfunc2asm
+            
+            # 获取函数名
+            mutated_folder = os.path.dirname(binary_path)
+            checkdict_path = os.path.join(mutated_folder, "sym_to_addr.pickle")
+            
+            target_func_name = self.function_name
+            if os.path.exists(checkdict_path):
+                try:
+                    with open(checkdict_path, 'rb') as f:
+                        checkdict = pickle.load(f)
+                    ori_sym_addr = checkdict.get(self.function_name)
+                    if ori_sym_addr:
+                        target_func_name = 'func_' + ori_sym_addr[2:].lower()
+                except:
+                    pass
+            
+            # 提取汇编代码
+            asm_file = binfunc2asm(
+                ipath=binary_path,
+                target_func_name=target_func_name,
+                opath='/tmp/rl_func_features/',
+                verbose=False
+            )
+            
+            if not asm_file or not os.path.exists(asm_file):
+                # 降级：使用文件哈希
+                with open(binary_path, 'rb') as f:
+                    file_hash = hashlib.md5(f.read()).digest()
+                return [b / 255.0 for b in file_hash]  # 16 维
+            
+            # 计算函数内容的哈希
+            with open(asm_file, 'r') as f:
+                func_content = f.read()
+            
+            # 针对 64 维优化：MD5(16) + SHA256前半部分(16) = 32 维
+            md5_hash = hashlib.md5(func_content.encode()).digest()  # 16 bytes
+            sha256_hash = hashlib.sha256(func_content.encode()).digest()[:16]  # 取前 16 bytes
+            
+            # 组合哈希值，总共 32 维（适合 64 维特征空间）
+            combined_hash = md5_hash + sha256_hash  # 32 bytes = 32 维
+            
+            return [b / 255.0 for b in combined_hash]
+            
+        except Exception as e:
+            logger.debug(f"提取函数哈希失败: {e}")
+            # 降级：使用文件哈希
+            try:
+                with open(binary_path, 'rb') as f:
+                    file_hash = hashlib.md5(f.read()).digest()
+                return [b / 255.0 for b in file_hash]
+            except:
+                return [0.0] * 16
             
         except Exception as e:
             logger.error("Feature extraction failed: {}".format(e))
@@ -127,7 +398,7 @@ class BinaryPerturbationEnv:
                 '--function', self.function_name
             ]
             
-            logger.debug("Command: " + " ".join(cmd))
+            # logger.debug("Command: " + " ".join(cmd))
             
             # 在项目根目录执行命令
             output = subprocess.check_output(

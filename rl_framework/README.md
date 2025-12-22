@@ -141,6 +141,48 @@ python3 rl_framework/ppo_trainer.py \
 | `--save-interval` | 保存间隔 | 10 |
 | `--use-gpu` | 使用 GPU | False |
 
+---
+
+## 使用训练好的模型
+
+### 推理命令
+
+训练完成后，使用最佳模型对新的二进制文件进行变异：
+
+```bash
+# 方式1: 使用快速推理脚本（推荐）
+cd /home/ycy/ours/Deceiving-DNN-based-Binary-Matching
+
+./rl_framework/quick_inference.sh workdir_1/pwd usage
+
+# 方式2: 直接调用推理脚本
+python3 rl_framework/ppo_inference.py \
+    --model-path rl_models/ppo_model_best.pt \
+    --binary workdir_1/pwd \
+    --function usage \
+    --save-path inference_pwd_usage \
+    --max-steps 30 \
+    --target-score 0.40
+
+# 方式3: 批量推理多个二进制文件
+# 首先创建批量配置文件 batch.txt:
+# workdir_1/ls,usage,output_ls
+# workdir_1/pwd,usage,output_pwd
+
+python3 rl_framework/ppo_inference.py \
+    --model-path rl_models/ppo_model_best.pt \
+    --batch \
+    --batch-file batch.txt
+```
+
+### 推理输出
+
+推理完成后会生成：
+- `inference_log.txt` - 详细的推理日志（每步的动作、分数、奖励等）
+- `<hash>_container/` - 变异后的二进制文件目录
+
+**详细使用说明请参考：[推理使用指南](INFERENCE_GUIDE.md)**
+
 ## 输出文件
 
 ```

@@ -245,6 +245,7 @@ def train_ppo(args):
             last_binary_info = None  # 追踪本回合最后一个二进制
             
             for step in range(args.max_steps):
+                # input(f"In step {step + 1}, Press Enter to continue...")
                 # 选择动作
                 action_idx, actual_action, log_prob, value = agent.select_action(state, explore=True)
                 

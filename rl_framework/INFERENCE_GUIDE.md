@@ -409,3 +409,24 @@ chmod +x quick_inference.sh
 
 Happy hacking! 🎉
 
+---
+
+## 📚 完整文档
+
+**本文档已被合并到统一文档中，请查看：**
+
+👉 **[COMPLETE_DOCUMENTATION.md](COMPLETE_DOCUMENTATION.md)** 👈
+
+包含以下所有内容：
+- ✅ 快速开始
+- ✅ 架构设计  
+- ✅ 核心模块详解
+- ✅ **训练与推理指南（本文档内容）**
+- ✅ 特征提取说明
+- ✅ 训练可视化
+- ✅ 改进日志
+- ✅ 故障排除
+- ✅ 开发参考
+
+**一份文档，全部内容！**
+

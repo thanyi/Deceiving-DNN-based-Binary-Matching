@@ -33,6 +33,10 @@ BB_63:   ->  errno_nonexisting :   ->  S_0x8049947 : push %ebp
 # create file 
 
 def execute_mapping():
+    '''
+    生成 new_symbol_to_new_addr 和 new_addr_to_new_symbol 的映射
+    通过用objdump来反汇编二进制文件，然后解析出新的符号和地址的映射
+    '''
     os.system("objdump  -Dr -j .text  a.out > dump_full.s")
     os.system("objdump  -Dr -j .text  a.out |grep \">:\" > addr_map")
     fs = open('addr_map').read()
@@ -55,7 +59,12 @@ def gen_mapping(mode):
             new_symbol_to_seed_symbol,
             seed_symbol_to_new_symbol,\
             new_symbol_to_old_addr,
-            old_addr_to_new_symbol]
+            old_addr_to_new_symbol]  original version 
+
+    return [new_symbol_to_new_addr,
+            new_addr_to_new_symbol,\
+            new_symbol_to_old_addr,
+            old_addr_to_new_symbol]  mutated version 
 
     '''
     # original seed vs mutated seed 
@@ -79,7 +88,7 @@ def gen_mapping(mode):
 
     for gg in range(0, len(fs)):
         if fs[gg][:4] == "S_0x":
-            arr.append(gg)      # 记录所有S_0x标签行的行号
+            arr.append(gg)      # 记录所有S_0x标签行的行索引
     if mode =="original":
         for pp in arr:  # 遍历所有S_0x标签行
             #if "BB_" in fs[pp-3] and "_merge:" in fs[pp-3] and "BB_" in fs[pp-2] and "BB_" not in fs[pp-1]:
@@ -163,9 +172,9 @@ def gen_mapping(mode):
               new_symbol_to_old_addr,old_addr_to_new_symbol]
 
     elif mode =="mutated":
-        for pp in arr:
+        for pp in arr:  # 遍历所有S_0x标签行，pp是索引号，从0开始
             #if "BB_" in fs[pp-2] and "_merge:" in fs[pp-2] and "BB_" in fs[pp-1] :
-            if "BB_" in fs[pp-2] and "BB_" in fs[pp-1] :
+            if "BB_" in fs[pp-2] and "BB_" in fs[pp-1] and len(fs[pp-2].split("_")) > 2: # 排除两个普通BB_连续的情况
                 '''
                 BB_21_merge: < pp-2 
                 BB_22: < pp-1 

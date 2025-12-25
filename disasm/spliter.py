@@ -21,6 +21,7 @@ def dosplit(name):
 def main():
     dosplit('rodata')
     dosplit('data')
+    dosplit('data.rel.ro')
     dosplit('got')
     dosplit('eh_frame')
     dosplit('eh_frame_hdr')

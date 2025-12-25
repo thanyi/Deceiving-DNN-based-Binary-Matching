@@ -81,7 +81,6 @@ class AilParser(object):
         fs = func_slicer(self.instrs, self.funcs)
         fs.update_text_info()
         fs.update_func()
-        # logger.info("[disasm/ail_parser.py:func_slicing]: fs.get_funcs() = {}".format(fs.get_funcs()))
         return fs.get_funcs()
 
     def set_secs(self, secs):

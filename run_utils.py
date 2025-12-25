@@ -25,7 +25,7 @@ if _asm2vec_path not in sys.path:
 # 导入 compare_functions
 from scripts.compare_util import *
 from scripts.bin2asm_util import *
-
+ 
 def run_one(original_binary, mutated_binary, model_original, checkdict, function_name, detection_method = "asm2vec"):
     """
     评估原始二进制文件和变异二进制文件之间的相似度
@@ -79,6 +79,7 @@ def run_one(original_binary, mutated_binary, model_original, checkdict, function
             score = compare_functions(original_asm, mutated_asm)
             # asm2vec 方法不提供 grad，使用 score 的变化作为近似
             grad = 0.0  # 或者可以计算 score 的变化率
+            os.remove(mutated_asm)
             return abs(score), abs(grad)
             
     except Exception as e:

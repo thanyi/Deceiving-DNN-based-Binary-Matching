@@ -9,6 +9,10 @@ bin_bk/
 uroboro_testing/
 uroboro_testing.bak/
 log/
-
+function_container_usage_cat/
+model_processing/
+rl_framework/rl_output/
+rl_models/
 
 *.csv
+*/__pycache__/

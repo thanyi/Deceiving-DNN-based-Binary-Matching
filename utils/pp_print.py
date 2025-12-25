@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Pretty print to string
 """
@@ -326,10 +327,15 @@ def p_location(loc):
 def p_prefix(pre):
     """
     Get instruction prefix string
-    :param pre: True if prefix present
+    :param pre: True if prefix present, or string for specific prefix
     :return: prefix string
     """
-    return ' lock ' if pre else ''
+    if pre is True:
+        return ' lock '  # 默认为 lock（向后兼容）
+    elif isinstance(pre, str):
+        return ' ' + pre + ' '  # 支持具体的前缀字符串
+    else:
+        return ''
 
 def pp_print_instr(i):
     """

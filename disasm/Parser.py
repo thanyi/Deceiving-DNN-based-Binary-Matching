@@ -8,6 +8,9 @@ import config
 from utils.ail_utils import Opcode_utils
 from lex import Lloc, Lop, Lexp, prefix_sub, lexer
 
+import logging
+logger = logging.getLogger(__name__)
+
 class InvalidOpException(Exception):
     def getop(self):
         return self.message.split(':')[1].strip()
@@ -78,7 +81,7 @@ class parseX86(base_parser):
     def __init__(self):
         super(parseX86, self).__init__()
         # Add support for new x86 instructions
-        self.nop_instructions = {'ENDBR64', 'NOTRACK'}
+        self.nop_instructions = {'ENDBR64'}
 
     def unptr_symb(self, s):
         """
@@ -250,7 +253,10 @@ class parseX86(base_parser):
         if s[0] == '*':
             return Types.StarDes(self.stardes_symb(s))
         elif self.call_des:
-            return Types.CallDes(self.calldes_symb(s))
+            func = self.calldes_symb(s)
+            if func is None:
+                return self.jumpdes_symb(s)
+            return Types.CallDes(func)
         return self.jumpdes_symb(s)
 
     def reg_symb(self, s):
@@ -296,7 +302,7 @@ class parseX86(base_parser):
         Parse operator
         :param sym: lexeme
         """
-        # Handle NOP-like instructions
+        # Handle NOP-like instructions (but not NOTRACK which is a prefix)
         if sym.upper() in self.nop_instructions:
             return sym
         if sym not in Types.Op: raise InvalidOpException('Invalid operator: ' + sym.upper())
@@ -304,7 +310,12 @@ class parseX86(base_parser):
         return sym
 
     def prefix_identify(self, instr):
-        return 'lock ' in instr
+        if 'lock ' in instr:
+            return 'lock'
+        elif 'notrack ' in instr.lower():
+            return 'notrack'
+        else:
+            return False
 
 
 class parseARM(base_parser):

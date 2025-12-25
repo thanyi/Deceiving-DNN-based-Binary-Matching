@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import config
 from visit import ailVisitor
@@ -39,6 +40,7 @@ class datahandler:
         self.rodata_list = []
         self.got_list = []
         self.bss_list = []
+        self.data_rel_ro_list = []
 
         self.text_sec = (0, 0)
         self.locations = []
@@ -151,7 +153,7 @@ class datahandler:
                 if self.assumption_two:
                     self.in_jmptable = False
                 else:
-                    if s.sec_name == '.plt' and val in self.plt_symbols:
+                    if s.sec_name in ['.plt', '.plt.sec'] and val in self.plt_symbols:
                         l[i] = (l[i][0], '.quad ' + self.plt_symbols[val])
                         l[i+1:i+8] = [('', '')] * 7
                     else:
@@ -185,6 +187,7 @@ class datahandler:
         self.traverse64(self.data_list, self.section_addr('.data'))
         self.traverse64(self.rodata_list, self.section_addr('.rodata'))
         self.traverse64(self.got_list, self.section_addr('.got'))
+        self.traverse64(self.data_rel_ro_list, self.section_addr('.data.rel.ro'))
 
     def checkifprobd2dARM(self, val):
         """
@@ -213,7 +216,7 @@ class datahandler:
                 if self.assumption_two:
                     self.in_jmptable = False
                 elif not ELF_utils.elf_arm() or self.checkifprobd2dARM(val):
-                    if s.sec_name == '.plt' and val in self.plt_symbols:
+                    if s.sec_name in ['.plt', '.plt.sec'] and val in self.plt_symbols:
                         l[i] = (l[i][0], '.long ' + self.plt_symbols[val])
                         l[i+1:i+4] = [('', '')] * 3
                     else:
@@ -277,6 +280,7 @@ class datahandler:
     def section_collect(self):
         """
         Load sections info
+        只包括对sections的收集还有对plt的收集
         """
         def secmapper(l):
             items = l.split()
@@ -286,6 +290,7 @@ class datahandler:
         with open('plt_sec.info') as f:
             n, s = secmapper(f.readline())
             self.sec[n] = s
+        # print "self.sec" + str(self.sec)
         with open('plts.info') as f:
             for l in f:
                 items = l.split()
@@ -319,10 +324,19 @@ class datahandler:
         Load data sections .byte declarations
         """
         spliter.main()
-        self.data_list = self.collect('data_split.info')
+        self.data_list = self.collect('data_split.info')    # [('', '.byte 0x00'), ('', '.byte 0x00'), ('', '.byte 0x00') ... ]
         self.rodata_list = self.collect('rodata_split.info')
         self.got_list = self.collect('got_split.info')
+        # print "self.got_list" + str(self.got_list)
         self.bss_list = self.collect('bss.info')
+        # 支持其他数据段（如 .data.rel.ro）
+        if '.data.rel.ro' in self.sec:
+            self.data_rel_ro_list = self.collect('data.rel.ro_split.info')
+            if not self.data_rel_ro_list:
+                # 如果没有单独的文件，使用空列表（标签仍会被添加）
+                addr = self.sec['.data.rel.ro'].sec_begin_addr
+                size = self.sec['.data.rel.ro'].sec_size
+                self.data_rel_ro_list = [('', '')] * size
 
     def collect(self, name):
         """
@@ -372,7 +386,8 @@ class datahandler:
         :param withoff: if True lbs contains absolute addresses
         """
         ds = {'.data': self.data_list, '.rodata': self.rodata_list,
-              '.got': self.got_list, '.bss': self.bss_list}
+              '.got': self.got_list, '.bss': self.bss_list,
+              '.data.rel.ro': self.data_rel_ro_list}
         for i in xrange(len(lbs)):
             n, l = lbs[i]
             if n in ds:
@@ -381,6 +396,9 @@ class datahandler:
                 else:
                     off = l
                     l += self.section_addr(n)
+                # 确保列表足够长
+                while len(ds[n]) <= off:
+                    ds[n].append(('', ''))
                 ds[n][off] = ('S_' + dec_hex(l) + ': ', ds[n][off][1])
 
     def gotexternals(self):
@@ -405,6 +423,7 @@ class datahandler:
         """
         Save data sections to files
         """
+        # print "self.locations" + str(self.locations)
         self.process(self.locations)
         self.process(self.data_labels, True)
         self.gotexternals()
@@ -418,12 +437,16 @@ class datahandler:
         self.got_list.insert(0, ('.section .got', ''))
         self.data_list.insert(0, ('.section .data' + dataalign, ''))
         self.bss_list.insert(0, ('.section .bss' + dataalign, ''))
+        if len(self.data_rel_ro_list) > 0:
+            self.data_rel_ro_list.insert(0, ('.section .data.rel.ro' + dataalign, ''))
         def createout(l):
             l = filter(lambda e: len(e[0]) + len(e[1]) > 0, l)
             return '\n'.join(map(lambda e: e[0] + e[1], l))
         with open('final_data.s', 'a') as f:
             f.write(createout(self.rodata_list) + '\n')
             f.write('\n' + createout(self.data_list) + '\n')
+            if len(self.data_rel_ro_list) > 0:
+                f.write('\n' + createout(self.data_rel_ro_list) + '\n')
             f.write('\n' + createout(self.got_list) + '\n')
             f.write('\n' + createout(self.bss_list) + '\n')
 
@@ -691,6 +714,13 @@ class reassemble(ailVisitor):
                 if s is not None:
                     s_label = 'S_' + dec_hex(addr)
                     self.insert_data(s.sec_name, addr)
+                    return Types.BinOP_PLUS_S((r, s_label)) \
+                        if isinstance(exp, Types.BinOP_PLUS) \
+                        else Types.BinOP_MINUS_S((r, s_label))
+                # 如果不在数据节，检查是否在 .text 节
+                if self.check_text(addr):
+                    s_label = 'S_' + dec_hex(addr)
+                    self.insert_text(s_label, addr)
                     return Types.BinOP_PLUS_S((r, s_label)) \
                         if isinstance(exp, Types.BinOP_PLUS) \
                         else Types.BinOP_MINUS_S((r, s_label))

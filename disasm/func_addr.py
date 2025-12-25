@@ -121,9 +121,14 @@ def useless_func_discover(filename):
                 last_addr = l.split()[0]
 
     res_list = []
+    key_list = []
     for key, value in res.items():
         res_list.append(key + " " + value[0] + " " + value[1] +'\n')
+        key_list.append(key + '\n')
 
     with open("useless_func.info", 'w') as f:
         f.writelines(res_list)
 
+    if len(key_list) > 0:
+        with open("useless_func_key.info", 'w') as f:   # 用于剔除黑名单中的函数，防止在反汇编过程中出现
+            f.writelines(key_list)

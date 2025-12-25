@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Compile assembly source
 """
@@ -6,7 +7,8 @@ import os
 import re
 import config
 from utils.ail_utils import ELF_utils
-
+import logging
+logger = logging.getLogger(__name__)
 
 def inferlibflags():
     """
@@ -14,7 +16,7 @@ def inferlibflags():
     """
     try:
         with open('linkedlibs.info') as f:
-            return map(lambda l: '-l' + l.split('.')[0].lstrip('lib'), f)
+            return map(lambda l: '-l' + l.split('.')[0].replace('lib', '', 1) if l.split('.')[0].startswith('lib') else l.split('.')[0], f)
     except: return []
 
 
@@ -26,17 +28,18 @@ def reassemble(saveerr=False, libs=[], debug=False):
     :param debug: True to compile with debug symbols
     """
     if len(libs) == 0: libs = inferlibflags()
-    return os.system(config.compiler + ' final.s '
-              + ('-g ' if debug else '')
-              + ('-mthumb' if ELF_utils.elf_arm() else (' -Wa,-mindex-reg' + (' -m32' if ELF_utils.elf_32() else '')))
-              + ' ' + config.gccoptions + ' ' + ' '.join(libs)
-              + (' 2> final.error' if saveerr else ''))
+    command_str = config.compiler + ' final.s ' + ('-g ' if debug else '') + ('-mthumb' if ELF_utils.elf_arm() else (' -Wa,-mindex-reg' + (' -m32' if ELF_utils.elf_32() else ''))) + ' ' + config.gccoptions + ' ' + ' '.join(libs) + ' -lselinux' + (' 2> final.error' if saveerr else '')           
+    # extra_options = ' -fno-asynchronous-unwind-tables -fno-pic -lgcc_s'
+    # command_str = config.compiler + ' final.s ' + ('-g ' if debug else '') + ('-mthumb' if ELF_utils.elf_arm() else (' -Wa,-mindex-reg' + (' -m32' if ELF_utils.elf_32() else ''))) + ' ' + config.gccoptions + extra_options + ' ' + ' '.join(libs)+ (' 2> final.error' if saveerr else '')
+    logger.info("[compile_process.py:reassemble]: command_str = {}".format(command_str))
+    return os.system(command_str)
 
 
 def parse_error():
     """
     Find undefined label errors
     """
+    # raw_input("...")
     if os.path.isfile('final.error'):
         addrs = []
         with open("final.error") as ferror:
@@ -62,6 +65,7 @@ def modify(errors):
             l = l.replace(e[0], addr)
         return l
     lines = map(help_err, lines)
+    # logger.debug("[compile_process.py:modify]: lines in modify = {}".format(lines))
     with open("final.s", 'w') as f:
         f.writelines(lines)
 
@@ -181,11 +185,13 @@ def main(filepath='', libs=[], debug=False):
     """
     if filepath:
         # Dump linked shared libraries
-        os.system('readelf -d ' + filepath + ' | awk \'/Shared/{match($0, /\[([^\]]*)\]/, arr); print arr[1]}\' | grep -i -v "libc\\." > linkedlibs.info')
-        print "     Applying adjustments for compilation"
+        cmd_str= 'readelf -d ' + filepath + ' | awk \'/Shared/{match($0, /\[([^\]]*)\]/, arr); print arr[1]}\' | grep -i -v "libc\\." > linkedlibs.info'
+        os.system(cmd_str)
+        logger.debug("[compile_process.py:main]: cmd_str in main = {}".format(cmd_str))
     if ELF_utils.elf_arm():
         i = 0
         while not modifyARM() and i < 10: i += 1
     reassemble(True, libs, debug)
     errors = parse_error()
+    logger.debug("[compile_process.py:main]: errors in main = {}".format(errors))
     modify(errors)

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Processing skeleton
 """
@@ -63,12 +64,28 @@ class Ail(object):
         """
         Load function symbols
         """
+        # 系统生成的函数列表，不应视为用户函数
+        system_funcs = [
+            '__libc_csu_init', '__libc_csu_fini', 
+            '_init', '_fini', '_start',
+            'deregister_tm_clones', 'register_tm_clones',
+            '__do_global_dtors_aux', 'frame_dummy'
+        ]
         def func_mapper(line):
             items = line.split()
             return Func(items[1][1:-2].split('@')[0], int(items[0], 16), 0, False)
+
+        def is_user_function(line):
+            # 过滤PLT偏移
+            if '-0x' in line or '+0x' in line:
+                return False
+            # 过滤系统生成的函数
+            func_name = line.split()[1][1:-2].split('@')[0]
+            return func_name not in system_funcs
+
         with open('userfuncs.info') as f:
             self.funcs += map(func_mapper,
-                filter(lambda line: not ('-0x' in line or '+0x' in line), f))
+                filter(is_user_function, f))
 
     def get_userfuncs(self):
         """
@@ -137,9 +154,12 @@ class Ail(object):
             for specific in specific_function:
                 logger.info("[ail.py:instrProcess]: Looking for specific: {}".format(specific))
                 for xxx in u_funcs:
-                    chk = str(xxx)
-                    if chk.startswith(specific[0]+"@") or chk.startswith(specific[1]+"@"):
+                    chk = str(xxx)  # 'S_0x402370@0x402370-0x4023B0'
+                    if chk.startswith(specific[0]+"@") or chk.startswith(specific[1]+"@"):  
                         arr.append(xxx)
+                    elif specific[1].startswith("S_"):  # 确保S_0x000000000403071这种情况能和地址对齐
+                        if int(chk.split("@")[1].split("-")[0], 16) == int(specific[1][2:], 16):
+                            arr.append(xxx)
             if len(arr)!=0:
                 u_funcs = list(set(arr))
             else:

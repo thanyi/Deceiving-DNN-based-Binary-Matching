@@ -7,7 +7,8 @@ import re
 import os
 import config
 from subprocess import check_output
-
+import logging
+logger = logging.getLogger(__name__)
 
 def globalvar(filepath):
     """
@@ -45,35 +46,45 @@ def pltgot(filepath):
     Handle library functions linked through .plt.got and substitute them with correct symbols
     :param filepath: path to target executable
     """
-    lastplt = None 
-    with open('plts.info', 'r') as f:
-        lines = f.readlines() 
-        if lines: 
-            lastplt = lines[-1].strip().split() 
- 
-    if lastplt is None: 
-        print "Warning: plts.info is empty or malformed, cannot determine lastplt."
-        return 
+    with open('plts.info') as f:
+        f.seek(-2, os.SEEK_END)
+        while f.read(1) != '\n': f.seek(-2, os.SEEK_CUR)
+        lastplt = f.readline().split()
     
     lastplt = (int(lastplt[0],16), re.escape(lastplt[1].rstrip('>:')))
 
-    pltgotsym = check_output('readelf -r ' + filepath + ' | awk \'/_GLOB_DAT/ {print $1,$5}\' | grep -v __gmon_start__ | cat', shell=True).strip()
+    pltgotsym_cmd = 'readelf -r ' + filepath + ' | awk \'/_GLOB_DAT/ {print $1,$5}\' | grep -v __gmon_start__ | cat'
+    logger.debug("[extern_symbol_process.py:pltgot]: pltgotsym_cmd = {}".format(pltgotsym_cmd))
+    pltgotsym = check_output(pltgotsym_cmd, shell=True).strip()
     if len(pltgotsym) == 0: return
     def pltsymmapper(l):
         items = l.strip().split()
         return (int(items[0], 16), items[1].split('@')[0])
-    pltgotsym = dict(map(pltsymmapper, pltgotsym.split('\n')))
-
-    pltgottargets = check_output(config.objdump + ' -Dr -j .plt.got ' + filepath + ' | grep jmp | cut -f1,3', shell=True)
-    def pltgotmapper(l):
+    pltgotsym = dict(map(pltsymmapper, pltgotsym.split('\n')))  # 结果如：{0x601018: 'malloc', 0x601020: 'free'}
+    logger.debug("[extern_symbol_process.py:pltgot]: pltgotsym = {}".format(pltgotsym))
+    pltgottargets_cmd = config.objdump + ' -Dr -j .plt.got ' + filepath + ' | grep jmp | cut -f1,3'
+    logger.debug("[extern_symbol_process.py:pltgot]: pltgottargets_cmd = {}".format(pltgottargets_cmd)) 
+    pltgottargets = check_output(pltgottargets_cmd, shell=True)   # 结果如：['0x401018 <malloc@plt>', '0x401020 <free@plt>']
+    def pltgotmapper(l):            # 需添加如下判断，目的是判断objdump的输出格式问题
         items = l.strip().split()
-        dest = int(items[items.index('#') + 1] if '#' in items else items[2].lstrip('*'), 16)
-        return (int(items[0].rstrip(':'), 16), dest)
-    pltgottargets = dict(map(pltgotmapper, pltgottargets.strip().split('\n')))
-    pltgottargets = {e[0]: '<' + pltgotsym[e[1]] + '@plt>' for e in pltgottargets.iteritems() if e[1] in pltgotsym}
-    if len(pltgottargets) == 0: return
+        if len(items) == 0:
+            return None
+        try:
+            dest = int(items[items.index('#') + 1] if '#' in items else items[2].lstrip('*'), 16)
+            return (int(items[0].rstrip(':'), 16), dest)
+        except (ValueError, IndexError):
+            return None
+    pltgottargets = dict(filter(None, map(pltgotmapper, pltgottargets.strip().split('\n'))))
+    pltgottargets = {e[0]: '<' + pltgotsym[e[1]] + '@plt>' for e in pltgottargets.iteritems() if e[1] in pltgotsym}  # 结果如：{0x401018: '<malloc@plt>', 0x401020: '<free@plt>'}
+    logger.debug("[extern_symbol_process.py:pltgot]: pltgottargets = {}".format(pltgottargets))
+    logger.debug("[extern_symbol_process.py:pltgot]: Found {} PLT.GOT mappings".format(len(pltgottargets)))
+    if len(pltgottargets) == 0: 
+        logger.info("[extern_symbol_process.py:pltgot]: No PLT.GOT mappings found for {}, skipping symbol replacement".format(filepath))
+        return
 
     pltgotre = re.compile(lastplt[1] + '\+(0x[0-9a-f]+)\>', re.I)
+    logger.debug("[extern_symbol_process.py:pltgot]: Looking for pattern: {}".format(pltgotre.pattern))
+    logger.info("[extern_symbol_process.py:pltgot]: Proceeding with {} PLT.GOT mappings for symbol replacement".format(len(pltgottargets)))
     def calldesmapper(l):
         m = pltgotre.search(l)
         if m:

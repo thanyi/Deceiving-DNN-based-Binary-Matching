@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Discover main function address
 """
@@ -96,10 +97,34 @@ def main_discover(filename):
                     if not main_symbol:     # if 0x00000000, lstrip('0') return 0
                         main_symbol = '0'
                     logger.debug("[main_discover.py:main_discover]: main_symbol = {}".format(main_symbol))
-                    break 
-        else:
+                    break
+        
+        # 如果仍然找不到，尝试从args.folder下的unstriped.out中查找
+        if not main_symbol:
+            folder = os.environ.get('UROBOROS_FOLDER', '')
+            logger.info("[main_discover.py:main_discover]: folder = {}".format(folder))
+            if folder:
+                unstriped_path = os.path.join(folder, 'unstriped.out')
+                logger.info("[main_discover.py:main_discover]: unstriped_path = {}".format(unstriped_path))
+                if os.path.isfile(unstriped_path):
+                    logger.info("[main_discover.py:main_discover]: unstriped_path is file")
+                    os.system(config.objdump + ' -Dr -j .text ' + unstriped_path + ' > ' + unstriped_path + '.temp')
+                    try:
+                        with open(unstriped_path + '.temp') as f:
+                            for l in f:
+                                if "<main>:" in l:
+                                    addr_str = l.split('<')[0].strip()
+                                    main_symbol = addr_str.lstrip('0').upper()
+                                    if not main_symbol:
+                                        main_symbol = '0'
+                                    break
+                    except:
+                        pass
+                    if os.path.isfile(unstriped_path + '.temp'):
+                        os.remove(unstriped_path + '.temp')
+        
+        if config.arch != config.ARCH_X86 and config.arch != config.ARCH_ARMT:
             raise Exception('Unknown arch')
-
 
         with open("main.info", 'w') as f:
             f.write('S_0x' + main_symbol.upper() + '\n')

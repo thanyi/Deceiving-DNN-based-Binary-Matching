@@ -3,6 +3,8 @@ from disasm import Types
 from termcolor import colored
 from utils.ail_utils import get_loc, Opcode_utils
 
+import logging
+logger = logging.getLogger(__name__)
 
 class stack_of_loc(object):
     def __init__(self):
@@ -106,6 +108,7 @@ class dis_validator(object):
                 print '     ' + str(map(hex, self.locs))
             else:
                 print map(hex, self.locs)
+                logger.info("[analysis/disassemble_validator.py:visit]: error : %s",map(hex, self.locs))
                 exit()
                 self.validate(instrlist)
 

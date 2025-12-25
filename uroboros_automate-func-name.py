@@ -32,12 +32,12 @@ def open_path(path):
 def fix_final_s(filepath):
     _main_globl_added = False
     for line in fileinput.input(filepath, inplace=True):
-        line = line.replace(' w ', ' nopw ') 
-        line = line.replace(' l ', ' nopl ') 
-        line = line.replace('notrack %ra', 'notrack jmpq *%rax')
-        line = line.replace('notrack %rb', 'notrack jmpq *%rbx')
-        line = line.replace('notrack %rc', 'notrack jmpq *%rcx')
-        line = line.replace('notrack %rd', 'notrack jmpq *%rdx')
+        # line = line.replace(' w ', ' nopw ') 
+        # line = line.replace(' l ', ' nopl ') 
+        # line = line.replace('notrack %ra', 'notrack jmpq *%rax')
+        # line = line.replace('notrack %rb', 'notrack jmpq *%rbx')
+        # line = line.replace('notrack %rc', 'notrack jmpq *%rcx')
+        # line = line.replace('notrack %rd', 'notrack jmpq *%rdx')
 
         if "main :" in line and not _main_globl_added:
             sys.stdout.write(".globl main\n")
@@ -60,8 +60,8 @@ def process(filepath, instrument=False, fexclude='',specific_function=None):
     logger.info("[uroboros_automate-func-name.py:process]: process function start ... ")
     print "Starting to process binary '" + filepath + "'"
     try:
-
-        func_addr.func_addr(filepath, 0, fexclude)
+        
+        func_addr.func_addr(filepath, 1, fexclude = "useless_func_key.info")  # count = 1可以开启黑名单
 
         logger.info("[uroboros_automate-func-name.py:process]: finished dump.s, faddr.txt, faddr_old.txt")
         logger.debug("[uroboros_automate-func-name.py:process]: filepath = {}".format(filepath))
@@ -86,7 +86,6 @@ def process(filepath, instrument=False, fexclude='',specific_function=None):
             with open('final_data.s', 'r') as fd: f.write(fd.read())
             if instrument: f.write('\n\n'.join(map(lambda e: e['plain'].instrdata, config.instrumentors)))
         logger.info("[uroboros_automate-func-name.py:process]: write final_data.s done!")
-        fix_final_s('final.s')  # fix the final.s
         logger.info("[uroboros_automate-func-name.py:process]: compile_process.main start!")
 
         compile_process.main(filepath)
@@ -255,6 +254,10 @@ a label or an address range of data section to exclude from symbol search""")
             # resolve the folder
             gg = args.binary
             gg = "/".join(gg.split("/")[:-1])
+            # 设置环境变量，让main_discover能够找到unstriped.out
+            os.environ['UROBOROS_FOLDER'] = gg
+            logger.debug("[uroboros_automate-func-name.py:main]: gg+'/sym_to_addr.pickle' = {},".format(gg+'/sym_to_addr.pickle'))
+
             sym_to_addr = pickle.load(open(gg+'/sym_to_addr.pickle','rb'))
             sym_to_cur_sym = pickle.load(open(gg+'/sym_to_cur_sym.pickle','rb'))
             failure_seed = pickle.load(open(gg+'/failure.pickle','rb'))

@@ -5,6 +5,14 @@ import copy
 import ast 
 import glob 
 import os 
+import logging
+logger = logging.getLogger(__name__)
+
+def normalize_addr(addr):
+    """规范化地址格式：去除前导零 (0x0000000004049D6 -> 0x4049D6)"""
+    if isinstance(addr, str) and addr.startswith('0x'):
+        return '0x' + hex(int(addr, 16))[2:].upper()
+    return addr
 
 def gen_seed(s):
     '''
@@ -43,9 +51,13 @@ def gen_mutated(sym_to_addr,sym_to_cur_sym,failure_seed,s):
     
     for symbol in sym_to_addr.keys():
         old_addr = sym_to_addr[symbol]
+        # ✅ 规范化地址格式：去除前导零 (0x0000000004049D6 -> 0x4049D6)
+        old_addr = normalize_addr(old_addr)
+        logger.debug("[pickle_gen_mapping.py:gen_mutated]: old_addr = {} (normalized)".format(old_addr))
         try:
             new_symbol = s[3][old_addr]
-            addr = s[0][new_symbol].upper().replace('X','x').replace('0x0','0x')
+            addr = s[0][new_symbol].upper().replace('X','x')
+            addr = normalize_addr(addr)  # ✅ 规范化新地址格式
             sym_to_addr[symbol] = addr
             sym_to_cur_sym[symbol] = new_symbol
             logger.debug("[pickle_gen_mapping.py:gen_mutated]: SUCCESS: {} => {} => {}".format(symbol, old_addr, new_symbol))

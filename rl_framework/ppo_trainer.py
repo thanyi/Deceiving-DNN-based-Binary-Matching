@@ -4,7 +4,6 @@
 PPO Trainer for Binary Code Perturbation
 PPO 训练器（直接调用环境）
 """
-
 import os
 import numpy as np
 import torch
@@ -223,6 +222,8 @@ def train_ppo(args):
     
     # 训练日志
     log_file = os.path.join(args.model_dir, 'training_log.txt')
+    if os.path.exists(log_file):
+        os.remove(log_file) # 删除旧的日志文件
     best_score = float('inf')
     success_count = 0
     
@@ -398,13 +399,13 @@ if __name__ == "__main__":
     
     # 训练参数
     parser.add_argument('--episodes', type=int, default=50, help='训练回合数（减少但更稳定）')
-    parser.add_argument('--max-steps', type=int, default=30, help='每回合最大步数（减少以加快迭代）')
+    parser.add_argument('--max-steps', type=int, default=50, help='每回合最大步数（减少以加快迭代）')
     parser.add_argument('--save-interval', type=int, default=10, help='保存间隔')
     parser.add_argument('--model-dir', default='./rl_models', help='模型保存目录')
     parser.add_argument('--resume', default=None, help='恢复训练的模型路径')
     parser.add_argument('--use-gpu', action='store_true', help='使用 GPU')
     
     args = parser.parse_args()
-    
+    os.remove(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log/uroboro.log'))
     train_ppo(args)
 

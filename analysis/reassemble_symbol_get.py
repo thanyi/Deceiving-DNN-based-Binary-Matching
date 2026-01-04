@@ -187,7 +187,9 @@ class datahandler:
         self.traverse64(self.data_list, self.section_addr('.data'))
         self.traverse64(self.rodata_list, self.section_addr('.rodata'))
         self.traverse64(self.got_list, self.section_addr('.got'))
-        self.traverse64(self.data_rel_ro_list, self.section_addr('.data.rel.ro'))
+        # .data.rel.ro 节可能不存在，需要检查
+        if '.data.rel.ro' in self.sec:
+            self.traverse64(self.data_rel_ro_list, self.section_addr('.data.rel.ro'))
 
     def checkifprobd2dARM(self, val):
         """
@@ -391,6 +393,9 @@ class datahandler:
         for i in xrange(len(lbs)):
             n, l = lbs[i]
             if n in ds:
+                # 检查节是否存在（.data.rel.ro 可能不存在）
+                if n not in self.sec:
+                    continue
                 if withoff:
                     off = l - self.section_addr(n)
                 else:

@@ -15,6 +15,7 @@ from torch.distributions import Categorical
 import json
 import os
 from collections import deque
+from loguru import logger
 
 class PolicyNetwork(nn.Module):
     """策略网络：输出每个动作的概率分布（改进版）"""
@@ -164,6 +165,14 @@ class PPOAgent:
         for i in reversed(range(len(rewards))):
             delta = rewards[i] + self.gamma * values[i + 1] - values[i]
             gae = delta + self.gamma * 0.95 * gae  # lambda=0.95
+            
+            # 检查计算结果
+            if np.isnan(gae) or np.isinf(gae):
+                logger.error(f"[ppo_agent.py:compute_returns]: NaN/Inf in gae at step {i}")
+                logger.error(f"  delta={delta}, gae={gae}, rewards[{i}]={rewards[i]}, values[{i}]={values[i]}, values[{i+1}]={values[i+1]}")
+                # 使用 0 作为后备
+                gae = 0.0
+            
             returns.insert(0, gae + values[i])
             advantages.insert(0, gae)
         
@@ -185,8 +194,23 @@ class PPOAgent:
         advantages = torch.FloatTensor(advantages).to(self.device)
         
         # 标准化优势（增强数值稳定性）
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        advantages = torch.clamp(advantages, -10.0, 10.0)  # 裁剪防止极端值
+        # 检查 advantages 是否包含 NaN
+        if torch.isnan(advantages).any():
+            logger.error(f"[ppo_agent.py:update]: NaN in advantages before normalization: {advantages}")
+            logger.error(f"  returns: {returns}, memory values: {self.memory['values']}")
+        
+        adv_mean = advantages.mean()
+        adv_std = advantages.std()
+        
+        # 检查统计量
+        if torch.isnan(adv_mean) or torch.isnan(adv_std):
+            logger.error(f"[ppo_agent.py:update]: NaN in advantages statistics: mean={adv_mean}, std={adv_std}")
+            logger.error(f"  advantages: {advantages}")
+            # 使用零均值单位方差作为后备
+            advantages = torch.zeros_like(advantages)
+        else:
+            advantages = (advantages - adv_mean) / (adv_std + 1e-8)
+            advantages = torch.clamp(advantages, -10.0, 10.0)  # 裁剪防止极端值
         
         total_loss = 0
         
@@ -200,8 +224,12 @@ class PPOAgent:
             
             # 数值稳定性检查
             action_probs = torch.clamp(action_probs, min=1e-8, max=1.0)
-            action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)  # 重新归一化
-            
+            prob_sum = action_probs.sum(dim=-1, keepdim=True)
+            if (prob_sum == 0).any() or torch.isnan(prob_sum).any():
+                logger.warning("[ppo_agent.py:update]: prob_sum is zero or NaN, skipping this epoch")
+                continue
+            action_probs = action_probs / prob_sum  # 重新归一化
+            # logger.info(f"[ppo_agent.py:update]: action_probs: {action_probs}")
             dist = Categorical(action_probs)
             new_log_probs = dist.log_prob(actions)
             entropy = dist.entropy().mean()
@@ -226,7 +254,27 @@ class PPOAgent:
             self.actor_optimizer.step()
             
             # Critic 损失（使用 Huber Loss 更鲁棒）
-            critic_loss = nn.functional.smooth_l1_loss(state_values.squeeze(), returns)
+            # 修复尺寸不匹配问题
+            state_values_squeezed = state_values.squeeze()
+            if state_values_squeezed.dim() == 0:
+                state_values_squeezed = state_values_squeezed.unsqueeze(0)
+            if state_values_squeezed.shape != returns.shape:
+                # 如果形状不匹配，调整 returns
+                if returns.dim() == 0:
+                    returns = returns.unsqueeze(0)
+                if state_values_squeezed.shape[0] != returns.shape[0]:
+                    # 取较小的长度
+                    min_len = min(state_values_squeezed.shape[0], returns.shape[0])
+                    state_values_squeezed = state_values_squeezed[:min_len]
+                    returns = returns[:min_len]
+            
+            critic_loss = nn.functional.smooth_l1_loss(state_values_squeezed, returns)
+            
+            # 检查 critic_loss 是否包含 NaN
+            if torch.isnan(critic_loss):
+                logger.error("[ppo_agent.py:update]: NaN in critic_loss!")
+                logger.error(f"  state_values: {state_values}, returns: {returns}")
+                continue
             
             # 更新 Critic
             self.critic_optimizer.zero_grad()

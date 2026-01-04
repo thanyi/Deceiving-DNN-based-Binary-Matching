@@ -171,12 +171,10 @@ def train_ppo(args):
     """
     PPO 训练主函数
     """
-    logger.info("PPO 训练启动")
-    logger.info(f"原始二进制: {args.binary}")
-    logger.info(f"目标函数: {args.function}")
+    logger.info("PPO 训练启动 (Multi-Sample Mode)")
+    logger.info(f"数据集: {args.dataset}")
     logger.info(f"保存路径: {args.save_path}")
     logger.info(f"最大回合数: {args.episodes}")
-    logger.info(f"最大步数/回合: {args.max_steps}")
     
     # 创建保存目录
     os.makedirs(args.save_path, exist_ok=True)
@@ -192,9 +190,9 @@ def train_ppo(args):
     # 初始化环境（直接创建，无需进程通信）
     logger.info("初始化变异环境...")
     env = BinaryPerturbationEnv(
-        original_binary=args.binary,
-        function_name=args.function,
-        save_path=args.save_path
+        save_path=args.save_path,
+        dataset_path=args.dataset,
+        sample_hold_interval=20
     )
     # 设置状态维度，与环境保持一致
     env.set_state_dim(args.state_dim)
@@ -244,6 +242,7 @@ def train_ppo(args):
             episode_loss = 0
             global_step = episode * args.max_steps  # 全局步数计数器
             last_binary_info = None  # 追踪本回合最后一个二进制
+            should_skip_update = False  # 标记是否因错误需要跳过更新
             
             for step in range(args.max_steps):
                 # input(f"In step {step + 1}, Press Enter to continue...")
@@ -297,17 +296,29 @@ def train_ppo(args):
                         'score': info.get('score', 1.0)
                     }
                 
+                # 检查是否需要重置环境（错误发生时）
+                if done and info.get('should_reset', False):
+                    logger.warning("⚠️ 检测到错误，重置环境并切换到新文件")
+                    # 标记需要跳过当前 episode 的更新（因为错误导致提前结束）
+                    should_skip_update = True
+                    # 重置环境，切换到新文件
+                    state = env.reset()
+                    reward_shaper.reset()
+                    logger.info(f"✓ 环境已重置，切换到新文件: {os.path.basename(env.original_binary)}::{env.function_name}")
+                    break
+                
                 # 检查成功
                 if done:
                     if 'score' in info and info['score'] < 0.40:
                         success_count += 1
-                        logger.success(f"🎉 成功绕过检测! 分数: {info['score']:.4f}")
+                        logger.success(f"🎉 成功攻破! 目标: {info.get('target_func')} | 分数: {info['score']:.4f}")
                         
                         # 保存成功样本信息
                         success_log = os.path.join(args.save_path, 'success.log')
                         with open(success_log, 'a') as f:
                             f.write(f"Episode {episode}, Step {step}, Score: {info['score']:.4f}\n")
                             f.write(f"Binary: {info.get('binary', 'unknown')}\n\n")
+                            f.write(f"Func: {info.get('target_func')}\n")
                     
                     logger.info(f"回合结束 (步数: {step + 1})")
                     break
@@ -316,6 +327,11 @@ def train_ppo(args):
             if last_binary_info is not None:
                 episode_binaries.append(last_binary_info)
                 logger.debug(f"✓ 记录回合 {episode} 的最终二进制: {os.path.basename(last_binary_info['binary'])} (分数: {last_binary_info['score']:.4f})")
+            
+            # 如果因错误提前结束，跳过 PPO 更新（环境已重置，下一个 episode 会从新文件开始）
+            if should_skip_update:
+                logger.info("跳过当前 episode 的 PPO 更新（因错误提前结束）")
+                continue
             
             # PPO 更新
             loss = agent.update()
@@ -338,7 +354,7 @@ def train_ppo(args):
             
             # 保存到日志
             with open(log_file, 'a') as f:
-                f.write(f"{episode},{step+1},{episode_reward:.4f},{avg_reward:.4f},{loss:.4f}\n")
+                f.write(f"{episode},{step+1},{episode_reward:.4f},{avg_reward:.4f},{loss:.4f},{best_score:.4f},\n")
             
             # 定期保存模型
             if (episode + 1) % args.save_interval == 0:
@@ -351,6 +367,10 @@ def train_ppo(args):
                 best_model_path = os.path.join(args.model_dir, 'ppo_model_best.pt')
                 agent.save(best_model_path)
                 logger.success(f"💾 保存最佳模型 (分数: {best_score:.4f})")
+
+
+            if episode % 40 == 0:   
+                cleanup_intermediate_files(args.save_path, episode_binaries)
     
     except KeyboardInterrupt:
         logger.warning("训练被用户中断")
@@ -370,8 +390,7 @@ def train_ppo(args):
         logger.info("=" * 80)
         
         # 清理中间文件（保留 success.log 和每个回合的最终二进制）
-        logger.info("")
-        cleanup_intermediate_files(args.save_path, episode_binaries)
+        # cleanup_intermediate_files(args.save_path, episode_binaries)
         
         # 保存回合二进制文件清单
         manifest_path = os.path.join(args.model_dir, 'episode_binaries.txt')
@@ -387,9 +406,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='PPO Trainer for Binary Perturbation')
     
     # 环境参数
-    parser.add_argument('--binary', required=True, help='原始二进制文件路径')
-    parser.add_argument('--function', required=True, help='目标函数名')
+    parser.add_argument('--dataset', required=True, help='训练数据集 JSON 路径')
     parser.add_argument('--save-path', required=True, help='变异结果保存路径')
+
     
     # PPO 参数
     parser.add_argument('--state-dim', type=int, default=64, help='状态维度（推荐 64）')
@@ -398,14 +417,16 @@ if __name__ == "__main__":
     parser.add_argument('--epsilon', type=float, default=0.2, help='PPO 裁剪参数')
     
     # 训练参数
-    parser.add_argument('--episodes', type=int, default=50, help='训练回合数（减少但更稳定）')
-    parser.add_argument('--max-steps', type=int, default=50, help='每回合最大步数（减少以加快迭代）')
+    parser.add_argument('--episodes', type=int, default=1000, help='训练回合数（减少但更稳定）')
+    parser.add_argument('--max-steps', type=int, default=40, help='每回合最大步数（减少以加快迭代）')
     parser.add_argument('--save-interval', type=int, default=10, help='保存间隔')
     parser.add_argument('--model-dir', default='./rl_models', help='模型保存目录')
     parser.add_argument('--resume', default=None, help='恢复训练的模型路径')
     parser.add_argument('--use-gpu', action='store_true', help='使用 GPU')
     
     args = parser.parse_args()
-    os.remove(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log/uroboro.log'))
+    log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log/uroboro.log')
+    if os.path.exists(log_path):
+        os.remove(log_path)
     train_ppo(args)
 

@@ -13,6 +13,7 @@ function_container_usage_cat/
 model_processing/
 rl_framework/rl_output/
 rl_models/
+datasets/
 
 *.csv
 */__pycache__/

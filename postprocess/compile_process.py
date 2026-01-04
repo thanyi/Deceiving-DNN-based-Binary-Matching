@@ -47,6 +47,12 @@ def parse_error():
                 if 'In function' in l: pass
                 elif 'undefined reference' in l and 'S_0x' in l:
                     addrs.append(l.split()[-1][1:-1])
+                elif "can't resolve" in l and 'S_0x' in l:
+                    # 处理 "can't resolve `0' {*UND* section} - `S_0x8000' {*UND* section}" 格式
+                    # 提取 S_0x... 符号
+                    import re
+                    matches = re.findall(r'S_0x[0-9A-Fa-f]+', l)
+                    addrs.extend(matches)
         return set(addrs)
 
 

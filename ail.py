@@ -163,8 +163,12 @@ class Ail(object):
             if len(arr)!=0:
                 u_funcs = list(set(arr))
             else:
-                # right now, we will crash directly if the symbol isn't exist 
-                raise Exception('Fail') 
+                # 函数未找到，提供详细的错误信息
+                available_funcs = [str(f) for f in u_funcs[:10]]  # 只显示前10个
+                error_msg = 'Function not found: {}. Available functions (showing first 10): {}'.format(
+                    specific_function, available_funcs)
+                logger.error("[ail.py:instrProcess]: " + error_msg)
+                raise Exception('Fail: Function not found: {}'.format(specific_function)) 
 
         #print(u_funcs)
         # u_funcs = [S_0x80499A6@0x80499A6-0x8049BEF] OR [set_suffix_length@0x804985D-0x8049A4A]

@@ -62,15 +62,19 @@ def run_one(original_binary, mutated_binary, model_original, checkdict, function
             mutated_folder = os.path.dirname(mutated_binary)
             checkdict = pickle.load(open(os.path.join(mutated_folder, "sym_to_addr.pickle"), "rb")) # 原始函数的符号到地址的映射
             ori_sym_addr = checkdict[function_name]  # 原始函数的符号在现在的地址
-            new_sym_name = 'func_' + ori_sym_addr[2:].lower()
-            logger.info(f"[*] new_sym_name: {new_sym_name}")
+            
+            logger.info(f"[*] ori_sym_addr: {ori_sym_addr}")
             # 生成变异文件的汇编文件
             mutate_output_file = binfunc2asm(ipath = mutated_binary,
-                                    target_func_name = new_sym_name,    # 变异文件的函数名
-                                    opath='/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/changed_asm/', verbose= False)
+                                    target_func_name = function_name,    # 变异文件的函数名
+                                    opath='/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/changed_asm/', 
+                                    verbose= False, 
+                                    current_sym_addr = ori_sym_addr)
             original_output_file = binfunc2asm(ipath = original_binary,
                                     target_func_name = function_name,    # 原始文件的函数名
-                                    opath='/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/original_asm/', verbose= False)
+                                    opath='/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/original_asm/', 
+                                    verbose= False,
+                                    current_sym_addr = ori_sym_addr)
             if not mutate_output_file or not original_output_file:
                 logger.error(f"无法提取函数 {function_name} 的汇编文件")
                 return None, None

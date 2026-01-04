@@ -27,10 +27,21 @@ def gen_seed(s):
     sym_to_cur_sym = {}
     logger.debug("[pickle_gen_mapping.py:gen_seed]: s[3] = {}".format(s[3]))
     for symbol in s[3].keys():
-        addr = s[0][s[3][symbol]].upper().replace('X','x')
-        addr = normalize_addr(addr)  # ✅ 规范化地址格式
-        sym_to_addr[symbol] = addr
-        sym_to_cur_sym[symbol] = s[3][symbol]
+        try:
+            new_symbol = s[3][symbol]
+            if new_symbol not in s[0]:
+                logger.warning("[pickle_gen_mapping.py:gen_seed]: Symbol '{}' maps to '{}' but not found in s[0]. Skipping.".format(symbol, new_symbol))
+                continue
+            addr = s[0][new_symbol].upper().replace('X','x')
+            addr = normalize_addr(addr)  # ✅ 规范化地址格式
+            sym_to_addr[symbol] = addr
+            sym_to_cur_sym[symbol] = new_symbol
+        except KeyError as e:
+            logger.warning("[pickle_gen_mapping.py:gen_seed]: KeyError for symbol '{}': {}. Skipping.".format(symbol, str(e)))
+            continue
+        except Exception as e:
+            logger.warning("[pickle_gen_mapping.py:gen_seed]: Exception for symbol '{}': {}. Skipping.".format(symbol, str(e)))
+            continue
     return sym_to_addr,sym_to_cur_sym
 
 def gen_mutated(sym_to_addr,sym_to_cur_sym,failure_seed,s):
@@ -95,9 +106,20 @@ def run_pickle(folder,step_size = None):
                 sym_to_addr = {}
                 sym_to_cur_sym = {}
                 for symbol in s[3].keys():
-                    addr = s[0][s[3][symbol]].upper().replace('X','x').replace('0x0','0x')
-                    sym_to_addr[symbol] = addr
-                    sym_to_cur_sym[symbol] = s[3][symbol]
+                    try:
+                        new_symbol = s[3][symbol]
+                        if new_symbol not in s[0]:
+                            logger.warning("[pickle_gen_mapping.py:run_pickle]: Symbol '{}' maps to '{}' but not found in s[0]. Skipping.".format(symbol, new_symbol))
+                            continue
+                        addr = s[0][new_symbol].upper().replace('X','x').replace('0x0','0x')
+                        sym_to_addr[symbol] = addr
+                        sym_to_cur_sym[symbol] = new_symbol
+                    except KeyError as e:
+                        logger.warning("[pickle_gen_mapping.py:run_pickle]: KeyError for symbol '{}': {}. Skipping.".format(symbol, str(e)))
+                        continue
+                    except Exception as e:
+                        logger.warning("[pickle_gen_mapping.py:run_pickle]: Exception for symbol '{}': {}. Skipping.".format(symbol, str(e)))
+                        continue
                 df['mapping_addr'].iloc[damaged_index[i]] = str(sym_to_addr)
                 df['mapping_symm'].iloc[damaged_index[i]] = str(sym_to_cur_sym)
                 df['failure'].iloc[damaged_index[i]] = str([])

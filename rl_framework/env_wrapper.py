@@ -128,7 +128,7 @@ class BinaryPerturbationEnv:
 
         if not os.path.exists(pickle_path):
             # 如果找不到映射，只能返回 None，后续逻辑会尝试盲猜入口点
-            logger.warning(f"Map file missing for {binary_path}")
+            # logger.warning(f"Map file missing for {binary_path}")
             return None, None
 
         try:
@@ -264,15 +264,11 @@ class BinaryPerturbationEnv:
         n_edges = data.get('num_edges', 0)
         complexity = data.get('cyclomatic_complexity', 0)
         bbs = list(data.get('basic_blocks', {}).values())
-        
-        # 获取 Top-5 关键块 (之前是 Top-3)
         top_critical_addrs = data.get('top_critical_blocks', [])
         
-        # 计算全局统计量
+        # 全局统计
         total_instr = sum(b['n_instructions'] for b in bbs)
         safe_total = max(total_instr, 1.0)
-        
-        # 辅助函数：安全除法
         def safe_div(a, b): return a / b if b > 0 else 0
 
         # =========================================================
@@ -285,114 +281,96 @@ class BinaryPerturbationEnv:
         vec.append(np.log1p(total_instr))
         
         # 2. 图拓扑密度 (4维)
-        vec.append(safe_div(n_edges, n_nodes))       # 边点比
-        vec.append(safe_div(total_instr, n_nodes))   # 平均块大小
-        vec.append(safe_div(complexity, n_nodes))    # 平均复杂度
-        # 悬挂节点比例 (Leaf Nodes Ratio) - 反映控制流深度
-        leaf_nodes = sum(1 for b in bbs if b.get('n_transfer', 0) == 0 and b.get('n_branch', 0) == 0) # 简化估算
+        vec.append(safe_div(n_edges, n_nodes))
+        vec.append(safe_div(total_instr, n_nodes))
+        vec.append(safe_div(complexity, n_nodes))
+        leaf_nodes = sum(1 for b in bbs if b.get('n_transfer', 0) == 0 and b.get('n_branch', 0) == 0)
         vec.append(safe_div(leaf_nodes, n_nodes))
 
         # 3. 全局指令分布 (6维)
-        global_keys = ['n_arith', 'n_logic', 'n_branch', 'n_transfer', 
-                       'n_mem_write', 'n_regs_used']
+        global_keys = ['n_arith', 'n_logic', 'n_branch', 'n_transfer', 'n_mem_write', 'n_regs_used']
         global_sums = {k: sum(b.get(k, 0) for b in bbs) for k in global_keys}
-        
         for k in global_keys:
             vec.append(safe_div(global_sums[k], safe_total))
             
-        # 4. 统计异质性 (4维) - 论文加分项
-        # 反映代码是否均匀，还是有巨大的核心块
+        # 4. 统计异质性 (4维)
         instr_counts = [b['n_instructions'] for b in bbs]
         if instr_counts:
-            vec.append(np.std(instr_counts))           # 标准差
-            vec.append(np.max(instr_counts))           # 最大块大小
-            vec.append(safe_div(np.max(instr_counts), safe_total)) # 最大块占比
-            vec.append(np.min(instr_counts))           # 最小块大小
+            vec.append(np.std(instr_counts))
+            vec.append(np.max(instr_counts))
+            vec.append(safe_div(np.max(instr_counts), safe_total))
+            vec.append(np.min(instr_counts))
         else:
             vec.extend([0.0] * 4)
             
-        # 补齐 Section A (确保是 20 维)
-        current_A_len = 4 + 4 + 6 + 4
-        if current_A_len < 20:
-            vec.extend([0.0] * (20 - current_A_len))
+        # 5. 【新增】支配与关键性概览 (2维，补齐到 20维)
+        # 对应论文 3.3.2 和 3.3.3 的全局体现
+        dom_scores = [b.get('dominator_score', 0) for b in bbs]
+        crit_scores = [b.get('critical_score', 0) for b in bbs]
+        vec.append(np.max(dom_scores) if dom_scores else 0) # 最大支配力
+        vec.append(np.mean(crit_scores) if crit_scores else 0) # 平均关键性
 
         # =========================================================
         # Section B: 关键区域感知 (Top-5 Blocks) (80维) [Index 30-109]
-        # 核心创新：深入感知 5 个最重要的节点，每个节点 16 维特征
         # =========================================================
-        # 特征列表 (16维/块):
-        # [0] Size(Log)
-        # [1-6] 6类指令占比 (Arith, Logic, Branch, Transfer, Mem, Regs)
-        # [7-8] 中心性 (Betweenness, Degree)
-        # [9]   是否是 Leaf Node (出度估算)
-        # [10]  是否是 Entry Node (入度估算)
-        # [11-15] 预留/扩展 (使用数据流强度填充)
-        
-        for i in range(5): # 扩大到 Top-5
+        for i in range(5):
             if i < len(top_critical_addrs):
                 addr = top_critical_addrs[i]
-                # 保护：检查地址是否存在于 basic_blocks 中
                 if addr not in data.get('basic_blocks', {}):
-                    # 如果地址不存在，填充0并继续下一个
                     vec.extend([0.0] * 16)
                     continue
                 bb = data['basic_blocks'][addr]
                 
-                # --- 基础特征 (7维) ---
                 safe_bb_total = max(bb['n_instructions'], 1.0)
-                vec.append(np.log1p(bb['n_instructions'])) # Size
                 
+                # [0] Size
+                vec.append(np.log1p(bb['n_instructions']))
+                
+                # [1-6] 指令占比
                 vec.append(safe_div(bb['n_arith'], safe_bb_total))
                 vec.append(safe_div(bb['n_logic'], safe_bb_total))
                 vec.append(safe_div(bb['n_branch'], safe_bb_total))
                 vec.append(safe_div(bb['n_transfer'], safe_bb_total))
                 vec.append(safe_div(bb['n_mem_write'], safe_bb_total))
-                vec.append(safe_div(bb['n_regs_used'], 16.0)) # 归一化寄存器数
+                vec.append(safe_div(bb['n_regs_used'], 16.0))
                 
-                # --- 拓扑特征 (2维) ---
+                # [7-9] 3.3节核心指标 (拓扑、逻辑、权重)
                 vec.append(bb.get('centrality_betweenness', 0))
-                vec.append(bb.get('centrality_degree', 0))
+                vec.append(bb.get('dominator_score', 0)) # 3.3.2 支配力
+                vec.append(bb.get('critical_score', 0))  # 3.3.3 综合得分
                 
-                # --- 高级结构特征 (3维) ---
-                # 假设 r2_acfg_features 里我们没法直接拿到出入度，用指令估算
+                # [10-12] 结构特征
                 is_branch = 1.0 if bb['n_branch'] > 0 else 0.0
                 is_mem_heavy = 1.0 if bb['n_mem_write'] > 2 else 0.0
                 is_compute_heavy = 1.0 if (bb['n_arith'] + bb['n_logic']) > 5 else 0.0
-                
                 vec.append(is_branch)
                 vec.append(is_mem_heavy)
                 vec.append(is_compute_heavy)
                 
-                # --- 补齐到 16 维 (4维) ---
-                vec.extend([0.0] * 4) 
+                # [13-15] Padding (补齐到16维)
+                vec.extend([0.0] * 3) 
                 
             else:
-                # 填充 0 (Padding)
                 vec.extend([0.0] * 16)
 
         # =========================================================
         # Section C: 数据流与上下文 (18维) [Index 110-127]
         # =========================================================
-        # 1. 寄存器压力详情
-        vec.append(safe_div(global_sums['n_regs_used'], 16.0)) # 通用寄存器使用率
+        # 1. 寄存器压力
+        vec.append(safe_div(global_sums['n_regs_used'], 16.0))
         
-        # 2. 内存交互强度
+        # 2. 内存交互
         mem_ops = global_sums['n_mem_write'] + global_sums.get('n_mem_read', 0)
         vec.append(safe_div(mem_ops, safe_total))
         
-        # 3. 算术逻辑密度 (ALU Density) - 反映混淆潜能
+        # 3. 算术密度
         alu_ops = global_sums['n_arith'] + global_sums['n_logic']
         vec.append(safe_div(alu_ops, safe_total))
         
-        # 计算剩余 needed
-        # 当前 vec 长度 = 20(A) + 80(B) + 3(C) = 103
-        # 目标总长度 = 118 (128 - 10个历史特征)
+        # 补齐到 118
         needed = 118 - len(vec)
-        
-        if needed > 0:
-            vec.extend([0.0] * needed)
-        elif needed < 0:
-            vec = vec[:118]
+        if needed > 0: vec.extend([0.0] * needed)
+        elif needed < 0: vec = vec[:118]
             
         return vec
 

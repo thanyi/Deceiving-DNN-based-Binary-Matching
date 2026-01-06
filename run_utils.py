@@ -15,6 +15,8 @@ from loguru import logger
 import random
 import hashlib
 import time
+import tempfile
+import shutil
 
 # 添加 asm2vec-pytorch 路径到 sys.path
 _asm2vec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
@@ -26,7 +28,7 @@ if _asm2vec_path not in sys.path:
 from scripts.compare_util import *
 from scripts.bin2asm_util import *
  
-def run_one(original_binary, mutated_binary, model_original, checkdict, function_name, detection_method = "asm2vec"):
+def run_one(original_binary, mutated_binary, model_original, checkdict, function_name, detection_method = "asm2vec", asm_work_dir=None, original_asm_cache=None):
     """
     评估原始二进制文件和变异二进制文件之间的相似度
     
@@ -64,27 +66,65 @@ def run_one(original_binary, mutated_binary, model_original, checkdict, function
             ori_sym_addr = checkdict[function_name]  # 原始函数的符号在现在的地址
             
             logger.info(f"[*] ori_sym_addr: {ori_sym_addr}")
-            # 生成变异文件的汇编文件
-            mutate_output_file = binfunc2asm(ipath = mutated_binary,
-                                    target_func_name = function_name,    # 变异文件的函数名
-                                    opath='/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/changed_asm/', 
-                                    verbose= False, 
-                                    current_sym_addr = ori_sym_addr)
-            original_output_file = binfunc2asm(ipath = original_binary,
-                                    target_func_name = function_name,    # 原始文件的函数名
-                                    opath='/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/original_asm/', 
-                                    verbose= False,
-                                    current_sym_addr = ori_sym_addr)
-            if not mutate_output_file or not original_output_file:
-                logger.error(f"无法提取函数 {function_name} 的汇编文件")
-                return None, None
-            mutated_asm = mutate_output_file
-            original_asm = original_output_file
-            score = compare_functions(original_asm, mutated_asm)
-            # asm2vec 方法不提供 grad，使用 score 的变化作为近似
-            grad = 0.0  # 或者可以计算 score 的变化率
-            os.remove(mutated_asm)
-            return abs(score), abs(grad)
+            
+            # 【性能优化】使用固定工作目录，避免频繁创建删除
+            if asm_work_dir is None:
+                asm_work_dir = tempfile.mkdtemp(prefix='asm2vec_', suffix='_tmp')
+                need_cleanup = True
+            else:
+                need_cleanup = False
+                os.makedirs(os.path.join(asm_work_dir, 'mutated'), exist_ok=True)
+                os.makedirs(os.path.join(asm_work_dir, 'original'), exist_ok=True)
+            
+            try:
+                # 【性能优化】缓存原始文件汇编（原始文件不变）
+                cache_key = (os.path.abspath(original_binary), function_name, ori_sym_addr)
+                if original_asm_cache is not None and cache_key in original_asm_cache:
+                    original_asm = original_asm_cache[cache_key]
+                    logger.debug(f"使用缓存的原始文件汇编: {original_asm}")
+                else:
+                    original_output_file = binfunc2asm(ipath = original_binary,
+                                            target_func_name = function_name,    # 原始文件的函数名
+                                            opath=os.path.join(asm_work_dir, 'original'), 
+                                            verbose= False,
+                                            current_sym_addr = ori_sym_addr)
+                    if not original_output_file:
+                        logger.error(f"无法提取原始函数 {function_name} 的汇编文件")
+                        return None, None
+                    original_asm = original_output_file
+                    # 存入缓存
+                    if original_asm_cache is not None:
+                        original_asm_cache[cache_key] = original_asm
+                
+                # 生成变异文件的汇编文件（每次都需要重新提取）
+                mutate_output_file = binfunc2asm(ipath = mutated_binary,
+                                        target_func_name = function_name,    # 变异文件的函数名
+                                        opath=os.path.join(asm_work_dir, 'mutated'), 
+                                        verbose= False, 
+                                        current_sym_addr = ori_sym_addr)
+                if not mutate_output_file:
+                    logger.error(f"无法提取变异函数 {function_name} 的汇编文件")
+                    return None, None
+                
+                mutated_asm = mutate_output_file
+                score = compare_functions(original_asm, mutated_asm)
+                # asm2vec 方法不提供 grad，使用 score 的变化作为近似
+                grad = 0.0  # 或者可以计算 score 的变化率
+                
+                # 清理变异文件（原始文件保留在缓存中）
+                try:
+                    os.remove(mutated_asm)
+                except Exception as e:
+                    logger.debug(f"清理变异汇编文件失败: {mutated_asm}, {e}")
+                
+                return abs(score), abs(grad)
+            finally:
+                # 只在需要时清理临时目录（固定工作目录不清理）
+                if need_cleanup:
+                    try:
+                        shutil.rmtree(asm_work_dir)
+                    except Exception as e:
+                        logger.warning(f"清理临时目录失败: {asm_work_dir}, {e}")
             
     except Exception as e:
         logger.error(f"run_one函数出错: {e}")

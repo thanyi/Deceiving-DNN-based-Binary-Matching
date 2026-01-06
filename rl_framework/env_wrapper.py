@@ -76,7 +76,24 @@ class BinaryPerturbationEnv:
         self.mutation_history = []
         self.step_count = 0
         self.target_score = 0.40
-        self.state_dim = 64  # 默认状态维度（推荐 64），可以通过参数修改
+        self.state_dim = 128  # 默认状态维度（128维），可以通过参数修改
+        
+        # 【性能优化】Radare2 特征提取缓存
+        # 缓存键: (binary_path, function_name, function_addr)
+        # 缓存值: acfg_data (dict)
+        self._acfg_cache = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+        
+        # 【性能优化】原始文件汇编缓存（原始文件不变，可复用）
+        # 缓存键: (original_binary, function_name, ori_sym_addr)
+        # 缓存值: 汇编文件路径
+        self._original_asm_cache = {}
+        
+        # 【性能优化】复用临时目录，避免频繁创建删除
+        # 在 save_path 下创建固定工作目录
+        self._asm_work_dir = os.path.join(self.save_path, '_asm_work')
+        os.makedirs(self._asm_work_dir, exist_ok=True)
         
         logger.info(f"Environment initialized (Hold Strategy: {self.sample_hold_interval} eps)")
     
@@ -136,8 +153,8 @@ class BinaryPerturbationEnv:
     
     def extract_features(self, binary_path):
         """
-        全新的特征提取函数 (64维)
-        组成: [历史特征(10)] + [ACFG结构(6)] + [指令统计(16)] + [关键指令(10)] + [Padding(22)]
+        特征提取函数 (128维)
+        组成: [历史特征(10)] + [ACFG特征(118)]
         """
         features = []
         
@@ -182,25 +199,38 @@ class BinaryPerturbationEnv:
             # 1. 解析地址
             target_addr, target_name = self._resolve_mutated_address(binary_path)
             
-            # 2. 调用 R2 提取
-            # 注意：这里每次实例化会有开销，但在 env.step 频率下是可以接受的
-            # 如果追求极致性能，可以在 __init__ 维护 r2 实例，但这涉及文件句柄切换
-            r2_ext = RadareACFGExtractor(binary_path)
+            # 2. 【性能优化】检查缓存
+            cache_key = (os.path.abspath(binary_path), target_name, target_addr)
+            acfg_data = self._acfg_cache.get(cache_key)
             
-            # 提取数据
-            acfg_data = r2_ext.get_acfg_features(function_name=target_name, function_addr=target_addr)
-            r2_ext.close() # 记得关闭
+            if acfg_data is None:
+                # 缓存未命中：调用 R2 提取
+                self._cache_misses += 1
+                r2_ext = RadareACFGExtractor(binary_path)
+                acfg_data = r2_ext.get_acfg_features(function_name=target_name, function_addr=target_addr)
+                r2_ext.close()
+                
+                # 存入缓存（只缓存成功提取的数据）
+                if acfg_data:
+                    self._acfg_cache[cache_key] = acfg_data
+            else:
+                # 缓存命中
+                self._cache_hits += 1
+                if self._cache_hits % 100 == 0:
+                    total = self._cache_hits + self._cache_misses
+                    hit_rate = self._cache_hits / total if total > 0 else 0.0
+                    logger.debug(f"ACFG 缓存统计: 命中率={hit_rate:.2%} (命中={self._cache_hits}, 未命中={self._cache_misses})")
             
             if acfg_data:
                 acfg_vec = self._vectorize_acfg(acfg_data)
                 
-        except Exception as e:
+        except (FileNotFoundError, KeyError, ValueError, AttributeError) as e:
             logger.warning(f"Feature extraction failed for {binary_path}: {e}")
             # 保持全0
         
         features.extend(acfg_vec)
         
-        # 最终截断或补齐到 64 维
+        # 最终截断或补齐到 128 维
         if len(features) > self.state_dim:
             features = features[:self.state_dim]
         elif len(features) < self.state_dim:
@@ -224,87 +254,145 @@ class BinaryPerturbationEnv:
 
     def _vectorize_acfg(self, data):
         """
-        将 r2_acfg_features 返回的字典数据转换为向量
-        目标长度: 54维 (因为 Part 1 占了 10 维)
+        【128维 增强版】全景式关键区域感知特征提取
+        Part 1 (10维) 由 extract_features 填充，这里生成剩下的 118 维
         """
         vec = []
         
-        n_nodes = data.get('num_nodes', 0)
-        n_nodes = max(n_nodes, 1.0) # 分母至少是 1.0
-
+        # 基础数据准备
+        n_nodes = max(data.get('num_nodes', 0), 1.0)
         n_edges = data.get('num_edges', 0)
-        bbs = data.get('basic_blocks', {}).values()
+        complexity = data.get('cyclomatic_complexity', 0)
+        bbs = list(data.get('basic_blocks', {}).values())
         
-        # --- A. 全局图结构 (6维) ---
-        # 1. 节点数 (Log缩放)
-        vec.append(np.log1p(n_nodes))
-        # 2. 边数 (Log缩放)
-        vec.append(np.log1p(n_edges))
-        # 3. 圈复杂度 (E - N + 2)
-        complexity = max(0, n_edges - n_nodes + 2)
-        vec.append(np.log1p(complexity))
-        # 4. 密度 (E / N)
-        vec.append(n_edges / n_nodes if n_nodes > 0 else 0)
-        # 5. 平均指令数 per Block
+        # 获取 Top-5 关键块 (之前是 Top-3)
+        top_critical_addrs = data.get('top_critical_blocks', [])
+        
+        # 计算全局统计量
         total_instr = sum(b['n_instructions'] for b in bbs)
-        total_instr = max(total_instr, 1.0) # 分母至少是 1.0
-        vec.append(total_instr / n_nodes if n_nodes > 0 else 0)
-        # 6. 总指令数 (Log缩放)
+        safe_total = max(total_instr, 1.0)
+        
+        # 辅助函数：安全除法
+        def safe_div(a, b): return a / b if b > 0 else 0
+
+        # =========================================================
+        # Section A: 全局宏观特征 (20维) [Index 10-29]
+        # =========================================================
+        # 1. 基础规模 (4维)
+        vec.append(np.log1p(n_nodes))
+        vec.append(np.log1p(n_edges))
+        vec.append(np.log1p(complexity))
         vec.append(np.log1p(total_instr))
         
-        # --- B. 指令类型统计 (16维) ---
-        # 包含 8 种类型的：总量(Log) 和 占比(Ratio)
-        # 类型: arith, logic, transfer, redirect, call, numeric, string, total
-        
-        keys = ['n_arith_instrs', 'n_logic_instrs', 'n_transfer_instrs', 
-                'n_redirect_instrs', 'n_call_instrs', 'n_numeric_consts', 
-                'n_string_consts']
-        
-        # 统计总和
-        sums = {k: sum(b.get(k, 0) for b in bbs) for k in keys}
-        
-        # B1. 总量特征 (7维)
-        for k in keys:
-            vec.append(np.log1p(sums[k]))
-            
-        # B2. 密度特征 (7维，该类型指令占总指令的比例)
-        for k in keys:
-            vec.append(sums[k] / total_instr if total_instr > 0 else 0)
-            
-        # 补齐 B 部分剩余维度 (16 - 14 = 2维)
-        # 比如：逻辑指令 / 算术指令 (混淆度量)
-        vec.append(sums['n_logic_instrs'] / (sums['n_arith_instrs'] + 1))
-        # 比如：转移指令 / 节点数
-        vec.append(sums['n_transfer_instrs'] / n_nodes if n_nodes > 0 else 0)
+        # 2. 图拓扑密度 (4维)
+        vec.append(safe_div(n_edges, n_nodes))       # 边点比
+        vec.append(safe_div(total_instr, n_nodes))   # 平均块大小
+        vec.append(safe_div(complexity, n_nodes))    # 平均复杂度
+        # 悬挂节点比例 (Leaf Nodes Ratio) - 反映控制流深度
+        leaf_nodes = sum(1 for b in bbs if b.get('n_transfer', 0) == 0 and b.get('n_branch', 0) == 0) # 简化估算
+        vec.append(safe_div(leaf_nodes, n_nodes))
 
-        # --- C. 关键特征 & 变异敏感度 (10维) ---
-        # 统计每个 Block 的平均特征
+        # 3. 全局指令分布 (6维)
+        global_keys = ['n_arith', 'n_logic', 'n_branch', 'n_transfer', 
+                       'n_mem_write', 'n_regs_used']
+        global_sums = {k: sum(b.get(k, 0) for b in bbs) for k in global_keys}
         
-        # C1-C7: 平均每个块有多少个某类指令
-        for k in keys:
-             vec.append(sums[k] / n_nodes if n_nodes > 0 else 0)
-             
-        # C8: 包含字符串引用的 Block 比例 (数据流特征)
-        blocks_with_str = sum(1 for b in bbs if b.get('n_string_consts', 0) > 0)
-        vec.append(blocks_with_str / n_nodes if n_nodes > 0 else 0)
-        
-        # C9: 包含 Call 的 Block 比例 (函数调用密集度)
-        blocks_with_call = sum(1 for b in bbs if b.get('n_call_instrs', 0) > 0)
-        vec.append(blocks_with_call / n_nodes if n_nodes > 0 else 0)
-        
-        # C10: 包含 Logic 的 Block 比例 (加密/混淆块比例)
-        blocks_with_logic = sum(1 for b in bbs if b.get('n_logic_instrs', 0) > 0)
-        vec.append(blocks_with_logic / n_nodes if n_nodes > 0 else 0)
+        for k in global_keys:
+            vec.append(safe_div(global_sums[k], safe_total))
+            
+        # 4. 统计异质性 (4维) - 论文加分项
+        # 反映代码是否均匀，还是有巨大的核心块
+        instr_counts = [b['n_instructions'] for b in bbs]
+        if instr_counts:
+            vec.append(np.std(instr_counts))           # 标准差
+            vec.append(np.max(instr_counts))           # 最大块大小
+            vec.append(safe_div(np.max(instr_counts), safe_total)) # 最大块占比
+            vec.append(np.min(instr_counts))           # 最小块大小
+        else:
+            vec.extend([0.0] * 4)
+            
+        # 补齐 Section A (确保是 20 维)
+        current_A_len = 4 + 4 + 6 + 4
+        if current_A_len < 20:
+            vec.extend([0.0] * (20 - current_A_len))
 
-        # --- D. Padding (剩余维度) ---
-        # 目前用到: 6 + 16 + 10 = 32维
-        # 需要补齐到 54维 (54 - 32 = 22)
+        # =========================================================
+        # Section B: 关键区域感知 (Top-5 Blocks) (80维) [Index 30-109]
+        # 核心创新：深入感知 5 个最重要的节点，每个节点 16 维特征
+        # =========================================================
+        # 特征列表 (16维/块):
+        # [0] Size(Log)
+        # [1-6] 6类指令占比 (Arith, Logic, Branch, Transfer, Mem, Regs)
+        # [7-8] 中心性 (Betweenness, Degree)
+        # [9]   是否是 Leaf Node (出度估算)
+        # [10]  是否是 Entry Node (入度估算)
+        # [11-15] 预留/扩展 (使用数据流强度填充)
         
-        current_len = len(vec)
-        needed = 54 - current_len # 54 + 10(History) = 64
+        for i in range(5): # 扩大到 Top-5
+            if i < len(top_critical_addrs):
+                addr = top_critical_addrs[i]
+                # 保护：检查地址是否存在于 basic_blocks 中
+                if addr not in data.get('basic_blocks', {}):
+                    # 如果地址不存在，填充0并继续下一个
+                    vec.extend([0.0] * 16)
+                    continue
+                bb = data['basic_blocks'][addr]
+                
+                # --- 基础特征 (7维) ---
+                safe_bb_total = max(bb['n_instructions'], 1.0)
+                vec.append(np.log1p(bb['n_instructions'])) # Size
+                
+                vec.append(safe_div(bb['n_arith'], safe_bb_total))
+                vec.append(safe_div(bb['n_logic'], safe_bb_total))
+                vec.append(safe_div(bb['n_branch'], safe_bb_total))
+                vec.append(safe_div(bb['n_transfer'], safe_bb_total))
+                vec.append(safe_div(bb['n_mem_write'], safe_bb_total))
+                vec.append(safe_div(bb['n_regs_used'], 16.0)) # 归一化寄存器数
+                
+                # --- 拓扑特征 (2维) ---
+                vec.append(bb.get('centrality_betweenness', 0))
+                vec.append(bb.get('centrality_degree', 0))
+                
+                # --- 高级结构特征 (3维) ---
+                # 假设 r2_acfg_features 里我们没法直接拿到出入度，用指令估算
+                is_branch = 1.0 if bb['n_branch'] > 0 else 0.0
+                is_mem_heavy = 1.0 if bb['n_mem_write'] > 2 else 0.0
+                is_compute_heavy = 1.0 if (bb['n_arith'] + bb['n_logic']) > 5 else 0.0
+                
+                vec.append(is_branch)
+                vec.append(is_mem_heavy)
+                vec.append(is_compute_heavy)
+                
+                # --- 补齐到 16 维 (4维) ---
+                vec.extend([0.0] * 4) 
+                
+            else:
+                # 填充 0 (Padding)
+                vec.extend([0.0] * 16)
+
+        # =========================================================
+        # Section C: 数据流与上下文 (18维) [Index 110-127]
+        # =========================================================
+        # 1. 寄存器压力详情
+        vec.append(safe_div(global_sums['n_regs_used'], 16.0)) # 通用寄存器使用率
+        
+        # 2. 内存交互强度
+        mem_ops = global_sums['n_mem_write'] + global_sums.get('n_mem_read', 0)
+        vec.append(safe_div(mem_ops, safe_total))
+        
+        # 3. 算术逻辑密度 (ALU Density) - 反映混淆潜能
+        alu_ops = global_sums['n_arith'] + global_sums['n_logic']
+        vec.append(safe_div(alu_ops, safe_total))
+        
+        # 计算剩余 needed
+        # 当前 vec 长度 = 20(A) + 80(B) + 3(C) = 103
+        # 目标总长度 = 118 (128 - 10个历史特征)
+        needed = 118 - len(vec)
         
         if needed > 0:
             vec.extend([0.0] * needed)
+        elif needed < 0:
+            vec = vec[:118]
             
         return vec
 
@@ -404,12 +492,15 @@ class BinaryPerturbationEnv:
             grad: 梯度值
         """
         try:
+            # 【性能优化】传递工作目录和缓存，避免每次创建临时目录
             score, grad = run_one(
                 self.original_binary,
                 mutated_binary,
                 self.model_original,
                 checkdict,
-                self.function_name
+                self.function_name,
+                asm_work_dir=self._asm_work_dir,
+                original_asm_cache=self._original_asm_cache
             )
             
             if score is None or grad is None:
@@ -510,7 +601,7 @@ class BinaryPerturbationEnv:
         
         # 3. 步数惩罚 (Time Penalty)
         reward -= 0.1
-
+        
         # 【修复】限制奖励范围，防止梯度爆炸
         reward = np.clip(reward, -20.0, 50.0) 
         return reward
@@ -545,12 +636,23 @@ class BinaryPerturbationEnv:
     #     state = self.extract_features(self.original_binary)
     #     return state
 
-    def reset(self):
+    def reset(self, force_switch=False):
         """
         重置环境：实现自动切换目标 (Hold-N Strategy)
+        
+        参数:
+            force_switch: 如果为 True，强制切换目标（用于错误恢复）
         """
-        # 检查是否需要切换目标
-        if self.current_sample_data is None or self.episodes_on_current >= self.sample_hold_interval:
+        # 强制切换（错误恢复）：忽略 Hold-N 策略，直接切换目标
+        if force_switch:
+            self.current_sample_data = random.choice(self.dataset)
+            self.episodes_on_current = 0
+            self.original_binary = self.current_sample_data['binary_path']
+            self.function_name = self.current_sample_data['func_name']
+            logger.warning(f"🔄 FORCE SWITCH (Error Recovery) -> {os.path.basename(self.original_binary)}::{self.function_name}")
+            logger.info(f"   Version: {self.current_sample_data.get('version')} | Opt: {self.current_sample_data.get('opt_level')}")
+        # 正常切换：检查是否需要切换目标
+        elif self.current_sample_data is None or self.episodes_on_current >= self.sample_hold_interval:
             # 随机抽取一个新样本
             self.current_sample_data = random.choice(self.dataset)
             self.episodes_on_current = 0
@@ -562,6 +664,7 @@ class BinaryPerturbationEnv:
             logger.success(f"🔄 SWITCH TARGET -> {os.path.basename(self.original_binary)}::{self.function_name}")
             logger.info(f"   Version: {self.current_sample_data.get('version')} | Opt: {self.current_sample_data.get('opt_level')}")
         else:
+            # 保持当前目标，增加计数
             self.episodes_on_current += 1
             logger.info(f"🔄 KEEP TARGET ({self.episodes_on_current}/{self.sample_hold_interval}) -> {self.function_name}")
 
@@ -573,6 +676,32 @@ class BinaryPerturbationEnv:
         # 提取初始特征
         state = self.extract_features(self.original_binary)
         return state
+    
+    def clear_acfg_cache(self):
+        """
+        清理 ACFG 特征缓存
+        
+        用于释放内存，通常在切换大量不同目标时调用
+        """
+        cache_size = len(self._acfg_cache)
+        self._acfg_cache.clear()
+        logger.info(f"已清理 ACFG 缓存: 释放 {cache_size} 个条目")
+    
+    def get_cache_stats(self):
+        """
+        获取缓存统计信息
+        
+        返回:
+            dict: 包含命中率、命中数、未命中数等统计信息
+        """
+        total = self._cache_hits + self._cache_misses
+        hit_rate = self._cache_hits / total if total > 0 else 0.0
+        return {
+            'cache_size': len(self._acfg_cache),
+            'cache_hits': self._cache_hits,
+            'cache_misses': self._cache_misses,
+            'hit_rate': hit_rate
+        }
 
 if __name__ == "__main__":
     # 测试用例

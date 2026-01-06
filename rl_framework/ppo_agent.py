@@ -20,7 +20,16 @@ from loguru import logger
 class PolicyNetwork(nn.Module):
     """策略网络：输出每个动作的概率分布（改进版）"""
     
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(self, state_dim, action_dim, hidden_dim=None):
+        # 根据输入维度自动调整隐藏层大小
+        if hidden_dim is None:
+            # 64维 → 256, 128维 → 384, 更大维度 → 512
+            if state_dim <= 64:
+                hidden_dim = 256
+            elif state_dim <= 128:
+                hidden_dim = 384
+            else:
+                hidden_dim = 512
         super(PolicyNetwork, self).__init__()
         
         # Actor 网络（更深，带归一化）

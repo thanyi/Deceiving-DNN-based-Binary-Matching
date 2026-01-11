@@ -3,231 +3,319 @@
 
 import r2pipe
 import json
-import sys
 import os
+import networkx as nx
+import re
+import numpy as np
+from loguru import logger
+
+# def print(message):
+#     pass
+
+# 全局寄存器定义
+X86_GP_REGS = {
+    'rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp', 'rsp', 'rip',
+    'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15',
+    'eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp', 'esp', 'eip',
+    'ax', 'bx', 'cx', 'dx', 'si', 'di', 'bp', 'sp',
+    'al', 'bl', 'cl', 'dl', 'sil', 'dil', 'bpl', 'spl',
+    'ah', 'bh', 'ch', 'dh',
+    'r8d', 'r9d', 'r10d', 'r11d', 'r12d', 'r13d', 'r14d', 'r15d',
+    'r8w', 'r9w', 'r10w', 'r11w', 'r12w', 'r13w', 'r14w', 'r15w',
+    'r8b', 'r9b', 'r10b', 'r11b', 'r12b', 'r13b', 'r14b', 'r15b'
+}
+
+X86_VEC_REGS = {
+    'xmm0', 'xmm1', 'xmm2', 'xmm3', 'xmm4', 'xmm5', 'xmm6', 'xmm7',
+    'xmm8', 'xmm9', 'xmm10', 'xmm11', 'xmm12', 'xmm13', 'xmm14', 'xmm15',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7',
+    'ymm8', 'ymm9', 'ymm10', 'ymm11', 'ymm12', 'ymm13', 'ymm14', 'ymm15'
+}
+
+# 【新增】只读指令白名单 (即使操作数是 [dst], src 也不算写)
+READ_ONLY_INSTRS = {'cmp', 'test', 'ucomisd', 'ucomiss', 'comisd', 'comiss'}
 
 class RadareACFGExtractor:
     """
-    使用 radare2 提取 ACFG 特征，替代 IDA Pro 脚本。
-    特点：速度快，无需保存文件，直接内存交互。
+    【第三章核心创新实现 - V3.0 优化版】
+    基于多粒度图中心性的 ACFG 特征提取器
+    修正：移除高复杂度计算，增强操作数统计
     """
 
     def __init__(self, binary_path):
-        """
-        初始化提取器。
-        :param binary_path: 二进制文件路径
-        """
         if not os.path.exists(binary_path):
             raise FileNotFoundError(f"Binary not found: {binary_path}")
-        
-        # 打开二进制文件，-2 参数禁止 stderr 输出
         self.r2 = r2pipe.open(binary_path, flags=['-2'])
-        
-        # 分析二进制 (aaa = analyze all)
-        # 这一步是必须的，否则无法识别函数和 CFG
-        # print(f"Analyzing {binary_path}...")
-        self.r2.cmd('aaa')
+        self.r2.cmd('e asm.arch=x86')
+        self.r2.cmd('e asm.bits=64')
+        self.r2.cmd('e anal.hasnext=1') 
+        self.r2.cmd('aaa') 
 
     def get_acfg_features(self, function_name=None, function_addr=None):
-        """
-        提取 ACFG。
-        注意：对于 Strip 的文件，强烈建议传入 function_addr (int)。
-        """
         seek_cmd = None
-        
-        # 1. 优先使用地址 (最靠谱)
         if function_addr is not None:
-            # 确保是十六进制字符串或整数
-            if isinstance(function_addr, int):
-                target_addr = hex(function_addr)
-            else:
-                target_addr = str(function_addr)
-            
+            target_addr = hex(function_addr) if isinstance(function_addr, int) else str(function_addr)
             seek_cmd = f's {target_addr}'
-            print(f"[+] Seeking to address: {target_addr}")
-            
-        # 2. 其次尝试名字 (Strip 后通常失效，除非是用 r2 的 fcn.xxx 格式)
         elif function_name:
-            # 尝试直接跳转
             seek_cmd = f's {function_name}'
-        
         else:
-            # 如果都没传，默认分析 Entrypoint (通常是 _start，不是 main)
             seek_cmd = 's entry0'
 
-        if seek_cmd:
-            self.r2.cmd(seek_cmd)
-            print(f"[+] Seeking to address: {seek_cmd}")
-        # === 新增关键逻辑：验证是否真的跳到了函数上 ===
-        # 有时候 s 0x123456 跳过去了，但 r2 没识别出那是函数起始点
-        # 我们用 afi (analyze function info) 检查一下
+        if seek_cmd: self.r2.cmd(seek_cmd)
+        print(f"seek_cmd: {seek_cmd}")
+
+        func_info = self.r2.cmdj('afij')
+        # 没有识别到函数，进入entry0
+        if func_info[0].get('name') == 'entry0':
+            # print(f"func_info.get('name') == 'entry0', function_name: {function_name}, function_addr: {function_addr}")
+            if function_name is not None and function_addr is None:
+                function_name = 'sym.' + function_name
+                print(f"[r2_acfg_features.py:RadareACFGExtractor:get_acfg_features] function_name: {function_name}")
+                seek_cmd = f's {function_name}'
+                if seek_cmd: self.r2.cmd(seek_cmd)
+                func_info = self.r2.cmdj('afij')
+            else:
+                return None
+
         
-        func_info = self.r2.cmdj('afij') # 返回当前位置的函数信息
+        print(f"[r2_acfg_features.py:RadareACFGExtractor:get_acfg_features] func_info: {func_info}")
         if not func_info:
-            # 如果当前位置没有识别出函数，尝试强行定义一个函数
-            # print(f"Warning: No function identified at current location. Trying 'af'...")
-            self.r2.cmd('af') # analyze function force
+            print(f"func_info is None, function_name: {function_name}, function_addr: {function_addr}")
+            self.r2.cmd('af')
             func_info = self.r2.cmdj('afij')
-            
-        if not func_info:
-            # 仍然无法识别，说明地址可能错了，或者是垃圾数据
+        
+        if not func_info or len(func_info) == 0: 
+            print(f"func_info is None or length is 0, function_name: {function_name}, function_addr: {function_addr}")
             return None
-            
-        # 此时 func_info 是一个列表，取第一个
-        # 真正的函数起始地址
-        real_addr = func_info[0]['addr']
-        print(f"[+] Real address: {real_addr}")
-        # 3. 获取基本块 (afbj)
+        
+        first_func = func_info[0]
+        real_addr = first_func.get('offset') or first_func.get('addr') or first_func.get('vaddr')
+        print(f"real_addr: {real_addr}")
+        if real_addr is None: 
+            print(f"real_addr is None, function_name: {function_name}, function_addr: {function_addr}")
+            return None
+        
         try:
-            # 确保我们在正确的函数起始位置获取 blocks
             blocks_json = self.r2.cmd(f'afbj @ {real_addr}')
-            # print(f"[+] Blocks json: {blocks_json}")
-            if not blocks_json:
+            if not blocks_json: 
+                print(f"blocks_json is None, function_name: {function_name}, function_addr: {function_addr}")
                 return None
             basic_blocks = json.loads(blocks_json)
-            # print(f"[+] Basic blocks: {basic_blocks}")
-        except Exception as e:
-            return None
+            # print(f"basic_blocks: {basic_blocks}, length: {len(basic_blocks)}")
+        except: return None
 
-        if not basic_blocks:
-            return None
+        if not basic_blocks: return None
 
-        # 4. 构建特征容器
-        nodes = []
-        edges = []
-        bbs_features = {}
-        
-        # 5. 遍历基本块提取局部特征
+        # --- 构建 NetworkX 图 ---
+        G = nx.DiGraph()
+        block_map = {}   
+        entry_node = None
+        min_addr = float('inf')
+
         for bb in basic_blocks:
-            bb_addr = bb['addr']
-            bb_size = bb['size']
-            
-            nodes.append(bb_addr)
-            
-            # 处理边 (Edge)
-            # radare2 的 afbj 输出包含 jump (true branch) 和 fail (false branch)
-            if 'jump' in bb and bb['jump'] != 0:
-                edges.append([bb_addr, bb['jump']])
-            if 'fail' in bb and bb['fail'] != 0:
-                edges.append([bb_addr, bb['fail']])
-                
-            # 提取块内的指令特征
-            features = self._extract_bb_features(bb_addr, bb_size)
-            bbs_features[bb_addr] = features
+            addr = bb['addr']
+            if addr < min_addr:
+                min_addr = addr
+                entry_node = addr
+            block_map[addr] = bb
+            G.add_node(addr, size=bb['size'])
+            if 'jump' in bb: G.add_edge(addr, bb['jump'])
+            if 'fail' in bb: G.add_edge(addr, bb['fail'])
 
-        # 6. 计算函数级统计特征 (Function Level Features)
-        # 这里为了保持和 ACFG 格式一致，返回类似的结构
-        # 但在 RL 中，你可能需要手动把这些字典压扁成向量
+        # --- 3.3.1 & 3.3.2 拓扑计算 ---
+        try:
+            betweenness = nx.betweenness_centrality(G)
+            degree = nx.degree_centrality(G)
+        except:
+            betweenness = {n: 0 for n in G.nodes()}
+            degree = {n: 0 for n in G.nodes()}
+
+        dominator_scores = {n: 0 for n in G.nodes()}
+        try:
+            if entry_node is not None:
+                idom = nx.immediate_dominators(G, entry_node)
+                dom_tree = nx.DiGraph()
+                for node, dom in idom.items():
+                    if node != dom: dom_tree.add_edge(dom, node)
+                for node in G.nodes():
+                    if node in dom_tree:
+                        dominator_scores[node] = len(nx.descendants(dom_tree, node))
+        except: pass
+
+        # --- 3.3.3 关键区域筛选 (仅用于排序，不作为特征输出) ---
+        def simple_norm(d):
+            vals = list(d.values())
+            if not vals: return d
+            mx = max(vals)
+            return {k: v/mx if mx>0 else 0 for k,v in d.items()}
+
+        n_bet = simple_norm(betweenness)
+        n_dom = simple_norm(dominator_scores)
+        n_deg = simple_norm(degree)
         
-        result = {
-            'nodes': nodes,
-            'edges': edges,
-            'num_nodes': len(nodes),
-            'num_edges': len(edges),
-            'basic_blocks': bbs_features
+        critical_scores = []
+        for addr in G.nodes():
+            # 权重聚合
+            score = 0.4*n_bet.get(addr,0) + 0.3*n_dom.get(addr,0) + 0.3*n_deg.get(addr,0)
+            critical_scores.append((addr, score))
+        
+        critical_scores.sort(key=lambda x: x[1], reverse=True)
+        top_k_blocks = [x[0] for x in critical_scores[:5]]
+
+        # --- B. 语义指纹提取 ---
+        fingerprints = {
+            'n_calls': 0, 'n_strings': 0, 'api_types': set(), 'consts': [],
+            # 新增：全局操作数分布统计
+            'n_ops_imm': 0, 'n_ops_reg': 0, 'n_ops_mem': 0
         }
-        # print(f"[+] Result: {result}")
+        
+        try:
+            xrefs = self.r2.cmdj(f'axfj @ {real_addr}')
+            if xrefs:
+                for ref in xrefs:
+                    ref_type = ref.get('type', '')
+                    ref_name = ref.get('name', '').lower()
+                    if ref_type == 'call':
+                        fingerprints['n_calls'] += 1
+                        if any(k in ref_name for k in ['print', 'write', 'read', 'open', 'close']): fingerprints['api_types'].add('io')
+                        elif any(k in ref_name for k in ['alloc', 'free', 'map']): fingerprints['api_types'].add('mem')
+                        elif any(k in ref_name for k in ['str', 'mem', 'cpy', 'cmp']): fingerprints['api_types'].add('str')
+                        elif any(k in ref_name for k in ['exit', 'abort', 'signal', 'fork']): fingerprints['api_types'].add('sys')
+                        elif any(k in ref_name for k in ['sock', 'connect', 'bind', 'recv']): fingerprints['api_types'].add('net')
+                        elif any(k in ref_name for k in ['crypt', 'hash', 'sha', 'md5', 'aes']): fingerprints['api_types'].add('crypto')
+                        elif any(k in ref_name for k in ['err', 'warn', 'fail']): fingerprints['api_types'].add('error')
+                        else: fingerprints['api_types'].add('other')
+                    if ref_type == 'data':
+                        fingerprints['n_strings'] += 1
+        except: pass
+
+        # --- C. 提取块特征 ---
+        bbs_features = {}
+        for bb_addr in block_map:
+            bb = block_map[bb_addr]
+            # 传入 fingerprints 以便累加全局操作数统计
+            feats = self._extract_bb_features(bb_addr, bb['size'], fingerprints)
+            
+            feats['centrality_betweenness'] = betweenness.get(bb_addr, 0)
+            feats['centrality_degree'] = degree.get(bb_addr, 0)
+            feats['dominator_score'] = dominator_scores.get(bb_addr, 0)
+            
+            bbs_features[bb_addr] = feats
+
+        result = {
+            'num_nodes': len(G.nodes()),
+            'num_edges': len(G.edges()),
+            'cyclomatic_complexity': len(G.edges()) - len(G.nodes()) + 2,
+            # 移除 graph_diameter
+            'basic_blocks': bbs_features,
+            'top_critical_blocks': top_k_blocks,
+            'fingerprints': fingerprints
+        }
         return result
 
-    def _extract_bb_features(self, addr, size):
+    def _extract_bb_features(self, addr, size, fingerprints):
         """
-        提取单个基本块的指令统计特征
+        提取微观特征，同时统计操作数类型
         """
-        # 反汇编该块的指令 (pDj = print disassembly json)
         try:
             instrs_json = self.r2.cmd(f'pDj {size} @ {addr}')
             instrs = json.loads(instrs_json)
-        except:
-            instrs = []
+        except: instrs = []
             
-        # 初始化计数器
         stats = {
             'n_instructions': len(instrs),
-            'n_arith_instrs': 0,
-            'n_logic_instrs': 0,
-            'n_transfer_instrs': 0, # mov, push, pop
-            'n_redirect_instrs': 0, # jmp, ret
-            'n_call_instrs': 0,
-            'n_numeric_consts': 0,
-            'n_string_consts': 0, # r2 较难直接精确提取字符串引用，这里暂用 numeric 代替或简化
+            'n_arith': 0, 'n_logic': 0, 'n_branch': 0, 'n_transfer': 0,
+            'n_xor': 0, 'n_shift': 0, 'n_cmp': 0,
+            'n_mem_write': 0, 'n_mem_read': 0, 
+            'n_regs_gp': 0, 'n_regs_vec': 0, 'n_consts': 0
         }
         
-        # 指令分类映射 (根据 radare2 的 type 字段)
-        # 这是一个 heuristic 映射，可能需要根据 r2 版本微调
-        type_arith = {'add', 'sub', 'mul', 'div', 'mod', 'inc', 'dec', 'abs', 'neg'}
-        type_logic = {'and', 'or', 'xor', 'not', 'shl', 'shr', 'sal', 'sar', 'rol', 'ror'}
-        type_trans = {'mov', 'lea', 'push', 'pop', 'xchg', 'cmov'} 
-        type_redirect = {'jmp', 'cjmp', 'ret', 'ujmp'}
-        type_call = {'call', 'ucall'}
+        type_arith = {'add', 'sub', 'mul', 'div', 'inc', 'dec', 'imul', 'idiv'}
+        type_logic = {'and', 'or', 'not'} # test 是 cmp 类
+        type_branch = {'jmp', 'cjmp', 'call', 'ret'}
+        type_trans = {'mov', 'lea', 'push', 'pop', 'movzx', 'movsx', 'cmov'}
         
         for ins in instrs:
             itype = ins.get('type', 'unk')
+            opcode = ins.get('opcode', '')
+            mnemonic = ins.get('mnemonic', '').lower()
+            val = ins.get('val')
             
-            # 1. 统计指令类型
-            if itype in type_arith:
-                stats['n_arith_instrs'] += 1
-            elif itype in type_logic:
-                stats['n_logic_instrs'] += 1
-            elif any(t in itype for t in type_trans): # 包含 mov, push 等
-                stats['n_transfer_instrs'] += 1
-            elif itype in type_redirect:
-                stats['n_redirect_instrs'] += 1
-            elif itype in type_call:
-                stats['n_call_instrs'] += 1
-                
-            # 2. 统计数值常量
-            # r2 的 ops 通常有 'val' 字段表示立即数
-            if 'val' in ins:
-                stats['n_numeric_consts'] += 1
-                
-            # 3. 字符串常量 (简化处理：如果 comment 里有字符串引用)
-            # 这是一个近似值
-            if 'string' in ins.get('opcode', '') or 'str' in ins.get('type', ''):
-                stats['n_string_consts'] += 1
+            # 1. 语义统计 (增强版)
+            # 支持向量指令 (vpxor, vxorps)
+            if 'xor' in mnemonic: stats['n_xor'] += 1
+            # 支持 cmp/test
+            elif mnemonic.startswith('cmp') or mnemonic == 'test' or mnemonic.startswith('ucom'): stats['n_cmp'] += 1
+            # 支持 sal/sar/shl/shr/rol/ror
+            elif mnemonic.startswith('sh') or mnemonic.startswith('sa') or mnemonic.startswith('ro'): stats['n_shift'] += 1
+            elif itype in type_arith: stats['n_arith'] += 1
+            elif itype in type_logic: stats['n_logic'] += 1
+            elif itype in type_branch: stats['n_branch'] += 1
+            elif any(t in itype for t in type_trans): stats['n_transfer'] += 1
+            
+            # 2. 数据流分析 (修复逻辑)
+            # 必须区分读写。CMP/TEST 是只读的。
+            is_read_only_instr = (mnemonic in READ_ONLY_INSTRS)
+            
+            operands = ins.get('operands', [])
+            if operands:
+                for idx, op in enumerate(operands):
+                    otype = op.get('type')
+                    if otype == 'imm': fingerprints['n_ops_imm'] += 1
+                    elif otype == 'reg': fingerprints['n_ops_reg'] += 1
+                    elif otype == 'mem': 
+                        fingerprints['n_ops_mem'] += 1
+                        # 内存读写细分
+                        if mnemonic == 'lea': pass # LEA 只是算地址
+                        elif is_read_only_instr:
+                            stats['n_mem_read'] += 1
+                        else:
+                            # 默认：第一个操作数如果是内存，且不是只读指令，通常是写
+                            # (Intel语法: op dest, src)
+                            if idx == 0: stats['n_mem_write'] += 1
+                            else: stats['n_mem_read'] += 1
+            
+            # 回退机制：字符串匹配 (当 R2 解析 operands 失败时)
+            else:
+                if '[' in opcode:
+                    if mnemonic == 'lea': pass
+                    elif mnemonic in {'push', 'call'}: stats['n_mem_write'] += 1 # Push/Call 写栈
+                    elif mnemonic in {'pop', 'ret'}:   stats['n_mem_read'] += 1  # Pop/Ret 读栈
+                    elif mnemonic.startswith('stos'):  stats['n_mem_write'] += 1
+                    elif mnemonic.startswith('lods'):  stats['n_mem_read'] += 1
+                    elif is_read_only_instr:
+                        stats['n_mem_read'] += 1 # cmp [rax], 1 是读
+                    else:
+                        # 简单启发式
+                        comma_pos = opcode.find(',')
+                        bracket_pos = opcode.find('[')
+                        if comma_pos == -1: # 单操作数 (如 inc [rax]) -> 读改写，算写
+                            stats['n_mem_write'] += 1
+                        elif bracket_pos < comma_pos: # [dst], src -> 写
+                            stats['n_mem_write'] += 1
+                        else: # dst, [src] -> 读
+                            stats['n_mem_read'] += 1
+            
+            # 3. 寄存器匹配 (Register Pressure)
+            # 使用预定义的全集进行匹配
+            words = re.findall(r'\b([a-z0-9]+)\b', opcode.lower())
+            for w in words:
+                if w in X86_GP_REGS: stats['n_regs_gp'] += 1
+                elif w in X86_VEC_REGS: stats['n_regs_vec'] += 1
+
+            # 4. 常量
+            if val is not None and abs(val) > 64:
+                stats['n_consts'] += 1
+                fingerprints['consts'].append(val)
 
         return stats
 
     def close(self):
-        """关闭 r2 管道"""
-        try:
-            self.r2.quit()
-        except:
-            pass
+        try: self.r2.quit()
+        except: pass
 
-# ==========================================
-# 单元测试 / 使用示例
-# ==========================================
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument('binary', help='Path to binary file')
-    parser.add_argument('function', help='Function name or address')
-    args = parser.parse_args()
-    
-    try:
-        extractor = RadareACFGExtractor(args.binary)
-        print(f"[+] Loaded {args.binary}")
-        print(f"[+] Function: {args.function}")
-        import time
-        t1 = time.time()
-        
-        # 提取特征
-        features = extractor.get_acfg_features(function_addr=int(args.function, 16))
-        # print(f"[+] Features: {features}")
-        t2 = time.time()
-        
-        if features:
-            print(f"[+] Extraction time: {t2 - t1:.4f}s")
-            print(f"[+] Nodes: {features['num_nodes']}, Edges: {features['num_edges']}")
-            # 打印第一个基本块的特征作为示例
-            first_bb = list(features['basic_blocks'].keys())[0]
-            print(f"[+] Features of BB {hex(first_bb)}:")
-            print(json.dumps(features['basic_blocks'][first_bb], indent=2))
-        else:
-            print("[-] Failed to extract features (function not found?)")
-            
-        extractor.close()
-        
-    except Exception as e:
-        print(f"[-] Error: {e}")
+
+if __name__ == '__main__':
+    extractor = RadareACFGExtractor('/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/coreutils/bin/coreutils-8.32-O0/pwd')
+    features = extractor.get_acfg_features(function_name='usage')
+    print(f"features: {features}")

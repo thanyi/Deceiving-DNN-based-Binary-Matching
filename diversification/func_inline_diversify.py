@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+【变异操作类型】函数内联 (Function Inlining)
+【框架序号】Action ID: 9
+【功能说明】将小函数内联到调用点，消除函数调用边界，改变代码结构，
+           使得基于函数粒度的特征提取失效，同时增加代码的局部性。
+"""
 from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *

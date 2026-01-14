@@ -1,3 +1,17 @@
+# -*- coding: utf-8 -*-
+"""
+【变异操作类型】基本块扁平化 (Basic Block Flattening)
+【框架序号】Action ID: 5
+【功能说明】将控制流图（CFG）扁平化，通过 switch-case 结构将所有基本块的跳转统一到一个分发器（dispatcher）。
+           将所有跳转指令替换为将目标地址存入 global_des，然后跳转到 switch_bb 分发器，
+           分发器根据 global_des 的值进行间接跳转。这样可以消除明显的控制流结构，
+           使逆向分析者难以理解程序的执行流程。
+           
+           处理流程：
+           1. 检查 CFG 是否可扁平化（is_flattenable_cfg）
+           2. 将所有跳转指令替换为 mov global_des + jmp switch_bb
+           3. 在代码中插入 switch_bb 分发器，执行 jmp *global_des
+"""
 from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *

@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+【变异操作类型】基本块合并 (Basic Block Merging)
+【框架序号】Action ID: 10
+【功能说明】将多个连续的基本块合并为单个基本块，减少基本块数量和控制流边，
+           改变控制流图的拓扑结构，但不在 RL 框架的动作空间中。
+"""
 from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *

@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+【变异操作类型】基本块分割 (Basic Block Splitting)
+【框架序号】Action ID: 4
+【功能说明】将较大的基本块分割成多个较小的基本块，通过插入无条件跳转和标签来
+           改变基本块粒度，影响基于基本块大小的特征提取，但不在 RL 框架的动作空间中。
+"""
 from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *

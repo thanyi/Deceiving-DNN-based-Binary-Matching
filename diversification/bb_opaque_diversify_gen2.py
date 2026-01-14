@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+【变异操作类型】基本块不透明谓词混淆（第二代）(Basic Block Opaque Predicate Gen2)
+【框架序号】Action ID: 11
+【功能说明】bb_opaque_diversify 的改进版本，使用更复杂的不透明谓词生成策略，
+           提供更强的混淆效果和更稳定的控制流伪装。
+"""
 from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *

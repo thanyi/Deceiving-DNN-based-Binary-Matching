@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+【变异操作类型】等价指令替换 (Equivalent Instruction Transformation)
+【框架序号】Action ID: 8
+【功能说明】将指令替换为语义等价的指令序列（如 XOR 替换、寄存器交换等），
+           改变指令模式但保持功能不变，用于对抗基于指令特征的模式匹配。
+"""
 from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *

@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+【变异操作类型】插入垃圾代码 (Insert Garbage Instructions)
+【框架序号】Action ID: 7
+【功能说明】在基本块中插入无用的指令（如 NOP、寄存器自赋值等），增加代码体积和复杂度，
+           干扰基于指令序列的特征提取，但不改变程序的实际执行逻辑。
+"""
 from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *

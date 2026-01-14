@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+【变异操作类型】函数重排序 (Function Reordering)
+【框架序号】Action ID: 6
+【功能说明】重新排列二进制文件中函数的顺序，改变函数的地址布局，
+           影响基于函数地址范围的特征匹配，但不在 RL 框架的动作空间中。
+"""
 from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *

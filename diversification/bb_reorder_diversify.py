@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+【变异操作类型】基本块重排序 (Basic Block Reordering)
+【框架序号】Action ID: 2
+【功能说明】重新排列函数内基本块的顺序，通过改变基本块的布局来破坏基于地址模式的
+           特征匹配，同时保持控制流图的逻辑等价性。
+"""
 from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *

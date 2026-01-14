@@ -1,3 +1,15 @@
+# -*- coding: utf-8 -*-
+"""
+【变异操作类型】分支函数化 (Branch Function Diversification)
+【框架序号】Action ID: 3
+【功能说明】将直接跳转指令（jmp/条件跳转）转换为通过分支函数（branch function）的间接跳转。
+           通过将跳转目标地址存储到变量中，然后调用统一的分支函数来执行跳转，
+           从而隐藏控制流结构，增加逆向分析难度。同时插入垃圾代码增强混淆效果。
+           
+           处理两种跳转类型：
+           1. 无条件跳转（jmp）：直接替换为分支函数调用
+           2. 条件跳转（je/jne/jl等）：使用条件移动指令（cmov）选择跳转目标，再调用分支函数
+"""
 from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *

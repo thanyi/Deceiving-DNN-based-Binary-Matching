@@ -374,10 +374,22 @@ class BinaryPerturbationEnv:
         top_critical_addrs = data.get('top_critical_blocks', [])
         fingerprints = data.get('fingerprints', {})
         
-        total_instr = sum(b['n_instructions'] for b in bbs)
-        safe_total = max(total_instr, 1.0)
+        # === 【核心修正1】计算“有效指令总数” (Effective Total) ===
+        # 我们不关心 MOV/PUSH/POP，只关心真正干活的指令
+        # 这样分母在 O0/O3 之间会相对稳定
+        effective_keys = ['n_arith', 'n_logic', 'n_branch', 'n_cmp', 'n_xor', 'n_shift', 'n_consts', 'n_call']
         
-        def safe_div(a, b): return a / b if b > 0 else 0
+        total_effective_instr = 0
+        for b in bbs:
+            for k in effective_keys:
+                total_effective_instr += b.get(k, 0)
+        # 加上 API 调用 (这也是有效逻辑)
+        total_effective_instr += fingerprints.get('n_calls', 0)
+        
+        safe_eff_total = max(total_effective_instr, 1.0)
+        
+        # 辅助函数：使用有效总数进行归一化
+        def safe_div_eff(a): return a / safe_eff_total
 
         # ==========================================
         # Section A: Macro Topology (40 dims)
@@ -385,15 +397,18 @@ class BinaryPerturbationEnv:
         # 1. Scale (8 dims)
         vec.append(np.log1p(n_nodes))
         vec.append(np.log1p(n_edges))
-        vec.append(safe_div(n_edges, n_nodes)) 
+        vec.append(n_edges / n_nodes if n_nodes > 0 else 0) 
         vec.append(np.log1p(complexity))
-        vec.append(safe_div(complexity, n_nodes))
+        vec.append(complexity / n_nodes if n_nodes > 0 else 0)
         
+        # Leaf / Branch nodes ratio
         leaf_cnt = sum(1 for b in bbs if b.get('n_branch', 0) == 0)
-        vec.append(safe_div(leaf_cnt, n_nodes))
-        # 汇聚节点(入度>1)估算: 简化为 edge-node+1
-        vec.append(safe_div(max(0, n_edges - n_nodes + 1), n_nodes))
-        vec.append(np.log1p(safe_total)) # 总指令数移到这里
+        branch_cnt = sum(1 for b in bbs if b.get('n_branch', 0) > 1)
+        vec.append(leaf_cnt / n_nodes)
+        vec.append(branch_cnt / n_nodes)
+
+        # Effective Size (Log) -> 替代原来的 Total Size
+        vec.append(np.log1p(total_effective_instr))
 
         # 2. Distributions (32 dims)
         # 【修正】统一使用 log1p 处理 Moments，防止数值爆炸
@@ -407,16 +422,18 @@ class BinaryPerturbationEnv:
         dist_bet = [b.get('centrality_betweenness', 0) for b in bbs]
         dist_deg = [b.get('centrality_degree', 0) for b in bbs]
         dist_dom = [b.get('dominator_score', 0) for b in bbs]
-        dist_size = [b.get('n_instructions', 0) for b in bbs]
+        dist_eff_size = []
 
-        for dist in [dist_bet, dist_deg, dist_dom, dist_size]:
-            # 4 moments (log scaled)
-            vec.extend(get_moments_log(dist))
-            # Top-4 values (raw values, but ratio based for bet/deg)
+        for b in bbs:
+            eff = sum(b.get(k, 0) for k in effective_keys)
+            dist_eff_size.append(eff)
+
+        for dist in [dist_bet, dist_deg, dist_dom, dist_eff_size]:
+            vec.extend(get_moments_log(dist)) # 4 dims
             s_dist = sorted(dist, reverse=True)
+            # Top-4 values
             top4 = s_dist[:4] + [0.0]*(4-len(s_dist))
-            # 只有 dominator 和 size 是绝对值，需要 log；bet/deg 是 0-1
-            if dist is dist_dom or dist is dist_size:
+            if dist is dist_dom or dist is dist_eff_size:
                 vec.extend([np.log1p(x) for x in top4])
             else:
                 vec.extend(top4)
@@ -430,70 +447,54 @@ class BinaryPerturbationEnv:
         for addr in top_critical_addrs:
             if addr not in data.get('basic_blocks', {}): continue
             bb = data['basic_blocks'][addr]
-            n_inst = max(bb.get('n_instructions', 0), 1.0)
             
-            # --- 32 Atomic Features per Block ---
+            # 计算该块的有效指令数
+            bb_eff = sum(bb.get(k, 0) for k in effective_keys)
+            safe_bb_eff = max(bb_eff, 1.0)
+            
             v = []
-            # [0] Scale
-            v.append(np.log1p(n_inst))
+            # [0] Effective Size
+            v.append(np.log1p(bb_eff))
             
-            # [1-10] Instruction Types
-            keys = ['n_arith', 'n_logic', 'n_branch', 'n_transfer', 
-                    'n_xor', 'n_shift', 'n_cmp', 
-                    'n_mem_write', 'n_mem_read', 'n_consts']
-            for k in keys: v.append(safe_div(bb.get(k, 0), n_inst))
+            # [1-7] Pure Logic Ratios (相对于有效指令)
+            # 这些比例在 O0/O3 下极其稳定！
+            v.append(bb.get('n_arith', 0) / safe_bb_eff)
+            v.append(bb.get('n_logic', 0) / safe_bb_eff)
+            v.append(bb.get('n_branch', 0) / safe_bb_eff)
+            v.append(bb.get('n_cmp', 0) / safe_bb_eff)
+            v.append(bb.get('n_xor', 0) / safe_bb_eff)
+            v.append(bb.get('n_shift', 0) / safe_bb_eff)
+            v.append(bb.get('n_consts', 0) / safe_bb_eff)
             
-            # [11-15] Data Flow
-            v.append(safe_div(bb.get('n_regs_gp', 0), 16.0))
-            v.append(safe_div(bb.get('n_regs_vec', 0), 16.0))
-            v.append(safe_div(bb.get('n_mem_write',0)+bb.get('n_mem_read',0), n_inst))
-            comp_ops = bb.get('n_arith', 0) + bb.get('n_logic', 0) + bb.get('n_xor', 0)
-            v.append(safe_div(comp_ops, n_inst))
-            v.append(1.0 if bb.get('n_consts', 0) > 0 else 0.0) # Has Constant
-            
-            # [16-19] Topology
+            # [8-11] Topology (不变)
             v.append(bb.get('centrality_betweenness', 0))
             v.append(bb.get('centrality_degree', 0))
-            v.append(np.log1p(bb.get('dominator_score', 0))) # Log
-            # Relative Centrality (Node / Max_in_Graph)
-            max_bet = max(dist_bet) if dist_bet else 1.0
-            v.append(safe_div(bb.get('centrality_betweenness', 0), max_bet))
+            v.append(np.log1p(bb.get('dominator_score', 0)))
+            v.append(bb.get('critical_score', 0))
             
-            # [20-23] Structure Flags
-            v.append(1.0 if bb.get('n_branch', 0) > 0 else 0.0)
-            v.append(1.0 if bb.get('n_branch', 0) > 2 else 0.0) # Multi-way
-            v.append(1.0 if bb.get('n_transfer', 0) == 0 else 0.0) # Pure Compute
-            v.append(1.0 if n_inst < 5 else 0.0)
+            # [12-15] Semantic Flags
+            v.append(1.0 if bb.get('n_consts', 0) > 0 else 0.0) # Has Constant?
+            v.append(1.0 if bb.get('n_branch', 0) > 1 else 0.0) # Is Branching?
+            v.append(1.0 if bb.get('n_arith', 0) > bb.get('n_transfer', 0) else 0.0) # Compute Heavy?
+            v.append(1.0 if bb_eff > 5 else 0.0) # Non-trivial?
             
-            # [24-31] Advanced Fillers (No more padding!)
-            # Opcode Entropy Proxy
-            uniq_types = sum(1 for k in keys if bb.get(k, 0) > 0)
-            v.append(uniq_types / 10.0)
-            # Stack Heavy
-            v.append(1.0 if bb.get('n_transfer', 0) > n_inst*0.4 else 0.0)
-            # Loop Header Heuristic
-            is_loop = 1.0 if (bb.get('n_branch', 0) > 0 and bb.get('centrality_betweenness', 0) > 0.2) else 0.0
-            v.append(is_loop)
-            # Logic Heavy
-            v.append(safe_div(bb.get('n_logic', 0) + bb.get('n_xor', 0), n_inst))
-            # Shift Heavy (Crypto indicator)
-            v.append(safe_div(bb.get('n_shift', 0), n_inst))
-            # Cmp Density
-            v.append(safe_div(bb.get('n_cmp', 0), n_inst))
-            # Mem Write vs Read Ratio
-            v.append(safe_div(bb.get('n_mem_write', 0), bb.get('n_mem_read', 0) + 1.0))
-            # Reg Diversity Proxy
-            v.append(safe_div(bb.get('n_regs_gp', 0) + bb.get('n_regs_vec', 0), 8.0))
-
+            # [16-31] Padding -> 填充更多逻辑组合
+            # Arith / (Logic + 1)
+            v.append(bb.get('n_arith', 0) / (bb.get('n_logic', 0) + 1.0))
+            # Branch / (Arith + 1)
+            v.append(bb.get('n_branch', 0) / (bb.get('n_arith', 0) + 1.0))
+            # 填满
+            v.extend([0.0] * 14)
+            
+            # 截断到 32 维
+            v = v[:32]
             crit_vectors.append(v)
 
-        # 聚合 (4 * 32 = 128)
         if crit_vectors:
             mat = np.array(crit_vectors)
             vec.extend(np.mean(mat, axis=0))
             vec.extend(np.max(mat, axis=0))
             vec.extend(np.std(mat, axis=0))
-            # Top-1 distinctiveness (Top1 - Mean)
             vec.extend(mat[0] - np.mean(mat, axis=0))
         else:
             vec.extend([0.0] * 128)
@@ -502,78 +503,50 @@ class BinaryPerturbationEnv:
         # === Section C: Global Semantics (72 dims) ===
         # ==========================================
         
-        # 1. Opcode Ratios (12 dims)
-        global_keys = ['n_arith', 'n_logic', 'n_branch', 'n_transfer', 
-                       'n_xor', 'n_shift', 'n_cmp', 'n_mem_write', 'n_mem_read', 
-                       'n_consts', 'n_regs_gp', 'n_regs_vec']
-        global_sums = {k: sum(b.get(k, 0) for b in bbs) for k in global_keys}
-        for k in global_keys:
-            vec.append(safe_div(global_sums[k], safe_total))
+        # 1. Global Logic Ratios (8 dims)
+        # 只统计逻辑指令，忽略数据搬运
+        global_sums = {k: sum(b.get(k, 0) for b in bbs) for k in effective_keys}
+        for k in effective_keys:
+            vec.append(global_sums[k] / safe_eff_total)
+        # 补 1 维
+        vec.append(0.0) 
             
-        # 2. API & Strings (22 dims) -> 增加 Internal
+        # 2. API & Strings (22 dims) - 这是最强的指纹，完全保留
         vec.append(np.log1p(fingerprints.get('n_calls', 0)))
         vec.append(np.log1p(fingerprints.get('n_strings', 0)))
-        vec.append(safe_div(fingerprints.get('n_calls', 0), safe_total))
-        vec.append(safe_div(fingerprints.get('n_strings', 0), safe_total))
+        # 相对于有效指令的密度
+        vec.append(fingerprints.get('n_calls', 0) / safe_eff_total)
+        vec.append(fingerprints.get('n_strings', 0) / safe_eff_total)
         
-        # 9 Categories (Added 'internal')
         api_cats = ['io', 'mem', 'str', 'sys', 'net', 'crypto', 'error', 'other', 'internal']
         apis = fingerprints.get('api_types', set())
         for cat in api_cats:
-            vec.append(1.0 if cat in apis else 0.0) # Exist
-            vec.append(0.0) # Count placeholder
+            vec.append(1.0 if cat in apis else 0.0)
+            vec.append(0.0) 
             
-        # 3. Block Size Dist (5 dims)
-        sizes = [b['n_instructions'] for b in bbs]
+        # 3. Block Size Dist (5 dims) - 基于 Effective Size
+        sizes = [sum(b.get(k, 0) for k in effective_keys) for b in bbs]
         if sizes:
-            vec.append(sum(1 for s in sizes if s < 5) / len(sizes))
-            vec.append(sum(1 for s in sizes if 5 <= s < 15) / len(sizes))
-            vec.append(sum(1 for s in sizes if 15 <= s < 50) / len(sizes))
-            vec.append(sum(1 for s in sizes if s >= 50) / len(sizes))
-            vec.append(np.max(sizes) / safe_total)
+            vec.append(sum(1 for s in sizes if s < 2) / len(sizes)) # Tiny logic
+            vec.append(sum(1 for s in sizes if 2 <= s < 10) / len(sizes)) 
+            vec.append(sum(1 for s in sizes if 10 <= s < 30) / len(sizes))
+            vec.append(sum(1 for s in sizes if s >= 30) / len(sizes))
+            vec.append(np.max(sizes) / safe_eff_total)
         else:
             vec.extend([0.0] * 5)
             
-        # 4. Operand Type Dist (5 dims)
-        n_imm = fingerprints.get('n_ops_imm', 0)
-        n_reg = fingerprints.get('n_ops_reg', 0)
-        n_mem = fingerprints.get('n_ops_mem', 0)
-        total_ops = n_imm + n_reg + n_mem
+        # 4. Global Logic Ratios (Logic/Arith etc.) (5 dims)
+        vec.append(global_sums['n_arith'] / (global_sums['n_logic'] + 1.0))
+        vec.append(global_sums['n_branch'] / (global_sums['n_arith'] + 1.0))
+        vec.append(global_sums['n_consts'] / safe_eff_total)
+        vec.append(1.0 if global_sums['n_consts'] > 3 else 0.0)
+        vec.append(1.0 if global_sums['n_shift'] > 0 else 0.0) # Crypto hint
         
-        vec.append(safe_div(n_imm, total_ops))
-        vec.append(safe_div(n_reg, total_ops))
-        vec.append(safe_div(n_mem, total_ops))
-        vec.append(safe_div(n_mem, n_reg + 1.0))
-        vec.append(safe_div(n_imm, n_reg + 1.0))
-        
-        # 5. Global Ratios (10 dims)
-        vec.append(safe_div(global_sums['n_mem_write'], global_sums['n_mem_read'] + 1.0))
-        vec.append(safe_div(global_sums['n_arith'], global_sums['n_logic'] + 1.0))
-        vec.append(safe_div(global_sums['n_regs_vec'], global_sums['n_regs_gp'] + 1.0))
-        vec.append(1.0 if global_sums['n_regs_vec'] > 0 else 0.0)
-        vec.append(1.0 if global_sums['n_consts'] > 5 else 0.0)
-        vec.append(safe_div(global_sums['n_branch'], safe_total))
-        vec.append(safe_div(global_sums['n_arith'] + global_sums['n_logic'], safe_total))
-        vec.append(safe_div(global_sums['n_transfer'], safe_total))
-        vec.extend([0.0] * 2) 
-
-        # 6. 【修复】移除凑数特征，填充有意义的统计 (18 dims)
-        # 用更多的分布信息填满
-        # 比如：关键块占总块数的比例 (Criticality Density)
-        crit_block_ratio = safe_div(len(top_critical_addrs), len(bbs))
-        vec.append(crit_block_ratio)
-        
-        # 比如：最大基本块的指令占比 (Dominant Block Influence)
-        max_bb_ratio = safe_div(max(sizes) if sizes else 0, safe_total)
-        vec.append(max_bb_ratio)
-        
-        # 剩下的补 0，或者你可以加更多业务相关的特征
-        needed = 256 - 16 - len(vec) # 注意：外部还有16维
-        # 这里 vec 包含 A, B, C。长度应为 40+128+72 = 240
-        # 实际 len(vec) 应该是 240
-        # 如果长度不够，补0
+        # 5. Padding / Future Use (32 dims left)
+        # 用 0 填充剩余空间，或者加入更多二阶特征
+        needed = 256 - 16 - len(vec)
         if needed > 0: vec.extend([0.0] * needed)
-        elif needed < 0: vec = vec[:256-16] # 截断
+        elif needed < 0: vec = vec[:240] # 256-16
             
         return vec
 

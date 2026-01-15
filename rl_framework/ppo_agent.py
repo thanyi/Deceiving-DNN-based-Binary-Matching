@@ -23,13 +23,16 @@ class PolicyNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=None):
         # 根据输入维度自动调整隐藏层大小
         if hidden_dim is None:
-            # 64维 → 256, 128维 → 384, 更大维度 → 512
+            # 【优化】根据输入维度合理缩放隐藏层
+            # 规则：hidden_dim ≈ state_dim * 2，但不超过 768（防止过大）
             if state_dim <= 64:
                 hidden_dim = 256
             elif state_dim <= 128:
                 hidden_dim = 384
+            elif state_dim <= 256:
+                hidden_dim = 640  # 256维 → 640 (原来512可能稍小，640更平衡)
             else:
-                hidden_dim = 512
+                hidden_dim = 768  # >256维 → 768 (上限，防止参数爆炸)
         super(PolicyNetwork, self).__init__()
         
         # Actor 网络（更深，带归一化）
@@ -81,12 +84,12 @@ class PolicyNetwork(nn.Module):
 class PPOAgent:
     """PPO 智能体"""
     
-    def __init__(self, state_dim, n_actions=6, lr=1e-4, gamma=0.99, 
+    def __init__(self, state_dim, n_actions=8, lr=1e-4, gamma=0.99, 
                  epsilon=0.2, epochs=10, device='cpu'):
         """
         参数:
             state_dim: 状态维度（特征向量长度）
-            n_actions: 动作数量（6种变异策略）
+            n_actions: 动作数量（8种变异策略）
             lr: 学习率（降低到 1e-4）
             gamma: 折扣因子
             epsilon: PPO裁剪参数
@@ -99,8 +102,8 @@ class PPOAgent:
         self.epochs = epochs
         
         # 动作映射：索引 -> 实际变异模式
-        self.action_map = [1, 2, 7, 8, 9, 11]
-        self.n_actions = n_actions
+        self.action_map = [1, 2, 4, 7, 8, 9, 11]
+        self.n_actions = len(self.action_map) 
         
         # 初始化网络
         self.policy = PolicyNetwork(state_dim, n_actions).to(self.device)

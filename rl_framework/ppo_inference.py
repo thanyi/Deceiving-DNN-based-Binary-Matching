@@ -344,7 +344,7 @@ if __name__ == "__main__":
     parser.add_argument('--save-path', help='变异结果保存路径')
     
     # 推理参数
-    parser.add_argument('--state-dim', type=int, default=64, help='状态维度（必须与训练时一致）')
+    parser.add_argument('--state-dim', type=int, default=256, help='状态维度（必须与训练时一致，默认 256）')
     parser.add_argument('--max-steps', type=int, default=30, help='最大步数')
     parser.add_argument('--target-score', type=float, default=0.40, help='目标相似度分数')
     parser.add_argument('--use-gpu', action='store_true', help='使用 GPU')

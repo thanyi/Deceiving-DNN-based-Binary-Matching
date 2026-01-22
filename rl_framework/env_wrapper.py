@@ -47,8 +47,9 @@ class BinaryPerturbationEnv:
         self.save_path = os.path.abspath(save_path)
         # 项目根目录（uroboros 所在目录）
         self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
-
+        # 用于存储当前二进制文件的 Top-K 关键块地址列表
+        # 格式: [0x401000, 0x401050, 0x401090]
+        self.current_critical_blocks = []
         # 加载数据集
         if not os.path.exists(dataset_path):
             raise FileNotFoundError(f"Dataset not found: {dataset_path}")
@@ -77,6 +78,12 @@ class BinaryPerturbationEnv:
         self.step_count = 0
         self.target_score = 0.40
         self.state_dim = 256  # 默认状态维度（256维），可以通过参数修改
+        # 记录当前目标下的历史最优分数，用于奖励塑形
+        self.best_score = 1.0
+        # 奖励塑形超参：显式惩罚“无变化/无效位置”
+        self.no_change_eps = 1e-4
+        self.no_change_penalty = 0.5
+        self.invalid_loc_penalty = 1.0
         
         # 【性能优化】Radare2 特征提取缓存
         # 缓存键: (binary_path, function_name, function_addr)
@@ -260,7 +267,7 @@ class BinaryPerturbationEnv:
 
     def extract_features(self, binary_path):
         """
-        特征提取函数 (256维)
+        特征提取函数
         组成: [历史特征(16)] + [ACFG特征(240)]
         """
         features = []
@@ -327,15 +334,18 @@ class BinaryPerturbationEnv:
                     logger.debug(f"ACFG 缓存统计: 命中率={hit_rate:.2%} (命中={self._cache_hits}, 未命中={self._cache_misses})")
             
             if acfg_data:
+                self.current_critical_blocks = acfg_data.get('top_critical_blocks', [])[:3]
                 acfg_vec = self._vectorize_acfg(acfg_data)
+                
                 
         except (FileNotFoundError, KeyError, ValueError, AttributeError) as e:
             logger.warning(f"Feature extraction failed for {binary_path}: {e}")
+            self.current_critical_blocks = []
             # 保持全0
         
         features.extend(acfg_vec)
         
-        # 最终截断或补齐到 256 维
+        # 最终截断或补齐
         if len(features) > self.state_dim:
             features = features[:self.state_dim]
         elif len(features) < self.state_dim:
@@ -357,13 +367,14 @@ class BinaryPerturbationEnv:
         return features
     
 
-    def _vectorize_acfg(self, data):
+    def _vectorize_acfg(self, data, state_dim=256):
         """
-        【256维 终极修复版】
+        【终极修复版】
         Part 1 (16维): RL History (已在外部填充)
         Part 2 (40维): Section A - Macro Topology
-        Part 3 (128维): Section B - Critical Semantics (Micro)
-        Part 4 (72维): Section C - Global Semantics (Macro & Fingerprints)
+        Part 3 (160维): Section B - Critical Semantics (Micro)
+        Part 4 (40维): Section C - Global Semantics (Macro & Fingerprints)
+        Total: 16 + 40 + 160 + 40 = 256 维
         """
         vec = []
         
@@ -441,66 +452,122 @@ class BinaryPerturbationEnv:
         # Section A Total: 8 + 4*8 = 40. Correct.
 
         # ==========================================
-        # Section B: Critical Semantics (128 dims)
+        # Section B: Critical Semantics (160 dims)
         # ==========================================
         crit_vectors = []
-        for addr in top_critical_addrs:
+        # print(f"top_critical_addrs: {top_critical_addrs}")
+        # === 定义安全除法辅助函数 ===
+        def safe_div(a, b):
+            """
+            安全除法：如果分母为0或非常小，返回0.0，否则返回 a/b。
+            """
+            # 使用一个极小值 epsilon (1e-9) 防止浮点数精度问题，或者直接判断 > 0
+            return a / b if abs(b) > 1e-9 else 0.0
+        # 定义有效指令集 (用于计算分母，剔除噪声)
+        effective_keys = ['n_arith', 'n_logic', 'n_branch', 'n_cmp', 'n_xor', 'n_shift', 'n_consts']
+        
+        # 遍历 Top-3 关键块 (如果不足3个，循环会自动结束)
+        for addr in top_critical_addrs[:3]:
             if addr not in data.get('basic_blocks', {}): continue
             bb = data['basic_blocks'][addr]
             
-            # 计算该块的有效指令数
+            # 计算该块的有效指令数 (分母)
             bb_eff = sum(bb.get(k, 0) for k in effective_keys)
             safe_bb_eff = max(bb_eff, 1.0)
+            n_inst = max(bb.get('n_instructions', 0), 1.0) # 物理指令数
             
             v = []
-            # [0] Effective Size
-            v.append(np.log1p(bb_eff))
             
-            # [1-7] Pure Logic Ratios (相对于有效指令)
-            # 这些比例在 O0/O3 下极其稳定！
-            v.append(bb.get('n_arith', 0) / safe_bb_eff)
-            v.append(bb.get('n_logic', 0) / safe_bb_eff)
-            v.append(bb.get('n_branch', 0) / safe_bb_eff)
-            v.append(bb.get('n_cmp', 0) / safe_bb_eff)
-            v.append(bb.get('n_xor', 0) / safe_bb_eff)
-            v.append(bb.get('n_shift', 0) / safe_bb_eff)
-            v.append(bb.get('n_consts', 0) / safe_bb_eff)
+            # --- [1] 规模与基础比率 (9 dims) ---
+            v.append(np.log1p(bb_eff))                         # 0. Effective Size (Log)
+            v.append(bb.get('n_arith', 0) / safe_bb_eff)       # 1. Arith Ratio
+            v.append(bb.get('n_logic', 0) / safe_bb_eff)       # 2. Logic Ratio
+            v.append(bb.get('n_branch', 0) / safe_bb_eff)      # 3. Branch Ratio
+            v.append(bb.get('n_cmp', 0) / safe_bb_eff)         # 4. Cmp Ratio
+            v.append(bb.get('n_xor', 0) / safe_bb_eff)         # 5. Xor Ratio (Crypto feature)
+            v.append(bb.get('n_shift', 0) / safe_bb_eff)       # 6. Shift Ratio (Crypto feature)
+            v.append(bb.get('n_consts', 0) / safe_bb_eff)      # 7. Constant Ratio
+            v.append(bb.get('n_transfer', 0) / n_inst)         # 8. Transfer Density (搬运指令占比)
+
+            # --- [2] 数据流与资源 (5 dims) ---
+            v.append(safe_div(bb.get('n_regs_gp', 0), 16.0))   # 9. GP Reg Pressure
+            v.append(safe_div(bb.get('n_regs_vec', 0), 16.0))  # 10. Vector Reg Pressure (SIMD)
+            v.append(safe_div(bb.get('n_mem_write', 0), n_inst)) # 11. Mem Write Intensity
+            v.append(safe_div(bb.get('n_mem_read', 0), n_inst))  # 12. Mem Read Intensity
+            # 13. Compute/Mem Ratio (计算密集度)
+            compute_ops = bb.get('n_arith', 0) + bb.get('n_logic', 0)
+            mem_ops = bb.get('n_mem_write', 0) + bb.get('n_mem_read', 0)
+            v.append(safe_div(compute_ops, mem_ops + 1.0))
             
-            # [8-11] Topology (不变)
-            v.append(bb.get('centrality_betweenness', 0))
-            v.append(bb.get('centrality_degree', 0))
-            v.append(np.log1p(bb.get('dominator_score', 0)))
-            v.append(bb.get('critical_score', 0))
+            # --- [3] 拓扑与中心性 (4 dims) ---
+            v.append(bb.get('centrality_betweenness', 0))      # 14. Betweenness
+            v.append(bb.get('centrality_degree', 0))           # 15. Degree
+            v.append(np.log1p(bb.get('dominator_score', 0)))   # 16. Dom Score
+            v.append(bb.get('critical_score', 0))              # 17. Aggregated Score
             
-            # [12-15] Semantic Flags
-            v.append(1.0 if bb.get('n_consts', 0) > 0 else 0.0) # Has Constant?
-            v.append(1.0 if bb.get('n_branch', 0) > 1 else 0.0) # Is Branching?
-            v.append(1.0 if bb.get('n_arith', 0) > bb.get('n_transfer', 0) else 0.0) # Compute Heavy?
-            v.append(1.0 if bb_eff > 5 else 0.0) # Non-trivial?
+            # --- [4] 结构标志位 (4 dims) ---
+            v.append(1.0 if bb.get('n_consts', 0) > 0 else 0.0)      # 18. Has Constant?
+            v.append(1.0 if bb.get('n_branch', 0) > 1 else 0.0)      # 19. Is Multi-Branch?
+            v.append(1.0 if compute_ops > mem_ops else 0.0)          # 20. Is Compute Heavy?
+            v.append(1.0 if bb.get('n_branch', 0) == 0 else 0.0)     # 21. Is Leaf Node?
             
-            # [16-31] Padding -> 填充更多逻辑组合
-            # Arith / (Logic + 1)
-            v.append(bb.get('n_arith', 0) / (bb.get('n_logic', 0) + 1.0))
-            # Branch / (Arith + 1)
-            v.append(bb.get('n_branch', 0) / (bb.get('n_arith', 0) + 1.0))
-            # 填满
-            v.extend([0.0] * 14)
+            # --- [5] 高级组合特征 (10 dims, 填满32) ---
+            # 22. Entropy Proxy (操作码种类丰富度)
+            uniq_types = sum(1 for k in effective_keys if bb.get(k, 0) > 0)
+            v.append(uniq_types / 7.0)
             
-            # 截断到 32 维
-            v = v[:32]
+            # 23. Stack Heaviness (是否主要是栈操作)
+            v.append(1.0 if bb.get('n_transfer', 0) > n_inst * 0.5 else 0.0)
+            
+            # 24. Loop Header Heuristic (有跳转且介数高)
+            is_loop = 1.0 if (bb.get('n_branch', 0) > 0 and bb.get('centrality_betweenness', 0) > 0.1) else 0.0
+            v.append(is_loop)
+            
+            # 25. Logic+Xor Density (混淆常见特征)
+            v.append(safe_div(bb.get('n_logic', 0) + bb.get('n_xor', 0), safe_bb_eff))
+            
+            # 26. Write/Read Ratio (写多读少可能是初始化)
+            v.append(safe_div(bb.get('n_mem_write', 0), bb.get('n_mem_read', 0) + 1.0))
+            
+            # 27. Arith/Logic Ratio
+            v.append(safe_div(bb.get('n_arith', 0), bb.get('n_logic', 0) + 1.0))
+            
+            # 28. Branch/Compute Ratio (控制流密集度)
+            v.append(safe_div(bb.get('n_branch', 0), compute_ops + 1.0))
+            
+            # 29. Reg Diversity (通用+向量寄存器总数归一化)
+            v.append(safe_div(bb.get('n_regs_gp', 0) + bb.get('n_regs_vec', 0), 16.0))
+            
+            # 30. Tiny Block Flag (是否极小块，如Trampoline)
+            v.append(1.0 if n_inst < 5 else 0.0)
+            
+            # 31. Large Block Flag (是否超大块，如展开的循环)
+            v.append(1.0 if n_inst > 50 else 0.0)
+
+            # 确保长度为 32
+            v = v[:32] 
             crit_vectors.append(v)
 
+        # === 扁平化填充 (Top-1, Top-2, Top-3) ===
+        # 占用 32 * 3 = 96 维
+        for i in range(3):
+            if i < len(crit_vectors):
+                vec.extend(crit_vectors[i])
+            else:
+                # 如果没有这个块（比如函数很小），补 0
+                vec.extend([0.0] * 32)
+        
+        # === 全局聚合上下文 (Context) ===
+        # 占用 32 * 2 = 64 维
         if crit_vectors:
             mat = np.array(crit_vectors)
-            vec.extend(np.mean(mat, axis=0))
-            vec.extend(np.max(mat, axis=0))
-            vec.extend(np.std(mat, axis=0))
-            vec.extend(mat[0] - np.mean(mat, axis=0))
+            vec.extend(np.mean(mat, axis=0)) # Global Mean of Critical Areas
+            vec.extend(np.max(mat, axis=0))  # Global Max of Critical Areas
         else:
-            vec.extend([0.0] * 128)
+            vec.extend([0.0] * 64)
 
         # ==========================================
-        # === Section C: Global Semantics (72 dims) ===
+        # === Section C: Global Semantics (40 dims) ===
         # ==========================================
         
         # 1. Global Logic Ratios (8 dims)
@@ -542,24 +609,21 @@ class BinaryPerturbationEnv:
         vec.append(1.0 if global_sums['n_consts'] > 3 else 0.0)
         vec.append(1.0 if global_sums['n_shift'] > 0 else 0.0) # Crypto hint
         
-        # 5. Padding / Future Use (32 dims left)
-        # 用 0 填充剩余空间，或者加入更多二阶特征
-        needed = 256 - 16 - len(vec)
-        if needed > 0: vec.extend([0.0] * needed)
-        elif needed < 0: vec = vec[:240] # 256-16
-            
+        # Section C Total: 8 + 22 + 5 + 5 = 40 dims
+        # ACFG Total: 40 + 160 + 40 = 240 dims
+        
         return vec
 
 
     
-    def apply_mutation(self, seed_binary, action):
+    def apply_mutation(self, seed_binary, action, target_addr):
         """
         应用变异操作
         
         参数:
             seed_binary: 种子二进制文件路径
             action: 变异模式 (1,2,3,5,7,8,9,11)
-        
+            target_addr: 攻击位置地址
         返回:
             mutated_binary: 变异后的二进制文件路径
         """
@@ -595,6 +659,12 @@ class BinaryPerturbationEnv:
                 '--function', self.function_name
             ]
             
+            if target_addr is not None:
+                # 确保转为 hex 字符串
+                hex_addr = hex(target_addr) if isinstance(target_addr, int) else str(target_addr)
+                cmd.extend(['--target_addr', hex_addr])
+                # logger.debug(f"🎯 Targeting specific block: {hex_addr}")
+
             logger.debug("Command: " + " ".join(cmd))
             
             # 在项目根目录执行命令
@@ -667,12 +737,13 @@ class BinaryPerturbationEnv:
             logger.error("Evaluation failed: {}".format(e))
             return 1.0, 0.0
     
-    def step(self, action):
+    def step(self, action, loc_idx):
         """
         执行一步环境交互
         
         参数:
             action: 变异模式
+            loc_idx: 攻击位置索引
         
         返回:
             state: 新状态特征
@@ -683,10 +754,24 @@ class BinaryPerturbationEnv:
         self.step_count += 1
         # 记录上一步分数，用于计算差分奖励
         prev_score = self.mutation_history[-1]['score'] if self.mutation_history else 1.0
-        
+        # === 【核心逻辑】解析攻击位置 ===
+        target_addr = None
+
+        # 检查索引是否有效 (比如提取出了5个关键块，Agent选了第2个，有效)
+        # 如果提取失败列表为空，或者 Agent 选的索引超出了列表范围，就退化为 None (随机)
+        loc_valid = bool(self.current_critical_blocks) and loc_idx < len(self.current_critical_blocks)
+        if loc_valid:
+            target_addr = self.current_critical_blocks[loc_idx]
+        else:
+            # 这种情况可能发生于：函数太小没有关键块，或者 Agent 刚初始化还在乱猜
+            logger.debug(f"Location index {loc_idx} invalid or no critical blocks ({len(self.current_critical_blocks) if self.current_critical_blocks else 0}), falling back to random.")
+            pass
+
+
+
         # 应用变异
-        mutated_binary, hash_val = self.apply_mutation(self.current_binary, action)
-        
+        mutated_binary, hash_val = self.apply_mutation(self.current_binary, action, target_addr)
+        # input("press enter to continue")
         if mutated_binary is None:
             # 变异失败：标记需要重置环境并切换文件
             logger.warning("Mutation failed, will reset environment and switch to new file")
@@ -718,7 +803,15 @@ class BinaryPerturbationEnv:
         state = self.extract_features(mutated_binary)
         
         # 计算奖励
-        reward = self.compute_reward_diff(prev_score, score, grad)
+        score_delta = prev_score - score
+        no_change = abs(score_delta) < self.no_change_eps
+        reward = self.compute_reward_diff(
+            prev_score,
+            score,
+            grad,
+            invalid_loc=not loc_valid,
+            no_change=no_change
+        )
         # reward = self.compute_reward(score, grad)
         
         # 判断是否完成
@@ -729,7 +822,10 @@ class BinaryPerturbationEnv:
             'grad': grad,
             'step': self.step_count,
             'binary': mutated_binary,
-            'target_func': self.function_name # 记录当前目标函数名
+            'target_func': self.function_name, # 记录当前目标函数名
+            'loc_valid': loc_valid,
+            'no_change': no_change,
+            'score_delta': score_delta
         }
         
         logger.info("Step {}: action={}, score={:.4f}, reward={:.4f}".format(
@@ -738,10 +834,14 @@ class BinaryPerturbationEnv:
         
         return state, reward, done, info
     
-    def compute_reward_diff(self, prev_score, current_score, grad):
+    def compute_reward_diff(self, prev_score, current_score, grad, invalid_loc=False, no_change=False):
         """
         差分奖励函数：适合多样本训练
         """
+        # 防御：确保 best_score 初始化
+        if self.best_score is None:
+            self.best_score = prev_score
+
         # 1. 进步奖励 (关键)：分数下降了多少
         improvement = prev_score - current_score
         
@@ -752,12 +852,29 @@ class BinaryPerturbationEnv:
         # 2. 成功奖励 (Jackpot)
         if current_score < self.target_score:
             reward += 50.0 
+
+        # 3. 历史最优奖励：鼓励持续突破，而不是只盯着上一步
+        if current_score < self.best_score:
+            best_improvement = self.best_score - current_score
+            reward += 5.0 + best_improvement * 30.0
+            self.best_score = current_score
+
+        # 4. 停滞惩罚：分数几乎不变时给额外负反馈，防止奖励塌缩
+        if no_change or abs(improvement) < self.no_change_eps:
+            reward -= self.no_change_penalty
+        elif improvement < 0:
+            # 小幅退步额外惩罚，拉开正负差距
+            reward -= 0.1
         
-        # 3. 步数惩罚 (Time Penalty)
+        # 4.5 无效位置惩罚：location 无效时显式惩罚
+        if invalid_loc:
+            reward -= self.invalid_loc_penalty
+        
+        # 5. 步数惩罚 (Time Penalty)
         reward -= 0.1
         
         # 【修复】限制奖励范围，防止梯度爆炸
-        reward = np.clip(reward, -20.0, 50.0) 
+        reward = np.clip(reward, -25.0, 60.0) 
         return reward
 
 
@@ -826,6 +943,7 @@ class BinaryPerturbationEnv:
         self.current_binary = self.original_binary
         self.mutation_history = []
         self.step_count = 0
+        self.best_score = 1.0
         
         # 提取初始特征
         state = self.extract_features(self.original_binary)
@@ -891,4 +1009,4 @@ if __name__ == '__main__':
     DATASET_PATH = '/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/utils/dataset_test.json'
     env = BinaryPerturbationEnv(save_path="/tmp/test_env", dataset_path=DATASET_PATH)
     state = env.extract_features_from_function(bin_path,'xstrtoumax')
-    print(state)
+    # print(len(state))

@@ -142,31 +142,47 @@ class DualHeadPolicyNetwork(nn.Module):
 class PPOAgent:
     """PPO 智能体"""
     
-    def __init__(self, state_dim, n_actions=8, n_locs=3, lr=1e-4, gamma=0.99, 
-                 epsilon=0.2, epochs=10, device='cpu'):
+    def __init__(self, state_dim, n_actions=None, n_locs=3, lr=1e-4, gamma=0.99, 
+                 epsilon=0.2, epochs=10, device='cpu', action_map=None):
         """
         参数:
             state_dim: 状态维度（特征向量长度）
-            n_actions: 动作数量（8种变异策略）
+            n_actions: 动作数量（默认使用 action_map 的长度）
             n_locs: 位置数量（3个候选块）
             lr: 学习率（降低到 1e-4）
             gamma: 折扣因子
             epsilon: PPO裁剪参数
             epochs: 每次更新的训练轮数
             device: 'cpu' 或 'cuda'
+            action_map: 动作映射列表（索引 -> 实际变异模式）
         """
         self.device = torch.device(device)
         self.gamma = gamma
         self.epsilon = epsilon
         self.epochs = epochs
         
-        # 动作映射：索引 -> 实际变异模式
-        self.action_map = [1, 2, 4, 7, 8, 9, 11]
+        # 动作映射：索引 -> 实际变异模式（保留原有选择顺序）
+        default_action_map = [1, 2, 4, 7, 8, 9, 11]
+        if action_map is None:
+            action_map = list(default_action_map)
+
+        if n_actions is not None:
+            if n_actions <= 0:
+                raise ValueError("n_actions must be positive")
+            if n_actions > len(action_map):
+                logger.warning(
+                    f"[ppo_agent.py:init]: n_actions ({n_actions}) > action_map size "
+                    f"({len(action_map)}), clamping to {len(action_map)}"
+                )
+                n_actions = len(action_map)
+            action_map = action_map[:n_actions]
+
+        self.action_map = action_map
         self.n_actions = len(self.action_map) 
         self.n_locs = n_locs
 
         # 初始化网络
-        self.policy = DualHeadPolicyNetwork(state_dim, n_actions, hidden_dim=512).to(self.device)
+        self.policy = DualHeadPolicyNetwork(state_dim, self.n_actions, hidden_dim=512).to(self.device)
         
         # 分离 Actor 和 Critic 优化器（降低学习率）
         # 优化器
@@ -199,8 +215,8 @@ class PPOAgent:
             explore: 是否探索（训练时为True，测试时为False）
         
         返回:
-            action_idx: 动作索引 (0-6)
-            actual_action: 实际变异模式 (1,2,4,7,8,9,11)
+            action_idx: 动作索引 (0 ~ n_actions-1)
+            actual_action: 实际变异模式 (action_map 中的值)
             loc_idx_val: 位置索引 (0-2)
             joint_log_prob: 联合对数概率
             state_value: 状态价值
@@ -239,6 +255,13 @@ class PPOAgent:
         loc_idx_val = loc_idx.item()
         
         return action_idx_val, actual_action, loc_idx_val, joint_log_prob.item(), state_value.item()
+
+    def estimate_value(self, state):
+        """估计单个状态的价值（用于截断回合的 bootstrap）"""
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            _, _, state_value = self.policy(state, sampled_loc_idx=None)
+        return state_value.item()
     
     def store_transition(self, state, action, location, reward, log_prob, value):
         """存储单步经验"""
@@ -277,13 +300,13 @@ class PPOAgent:
         
         return returns, advantages
     
-    def update(self):
+    def update(self, next_value=0.0):
         """PPO 更新策略"""
         if len(self.memory['states']) == 0:
             return 0.0
         
         # 计算回报和优势
-        returns, advantages = self.compute_returns()
+        returns, advantages = self.compute_returns(next_value=next_value)
         
         # 转换为 tensor
         states = torch.FloatTensor(np.array(self.memory['states'])).to(self.device)
@@ -357,7 +380,8 @@ class PPOAgent:
             actor_loss = -torch.min(surr1, surr2).mean()
             
             # 减去熵奖励 (Entropy Bonus)
-            actor_loss = actor_loss - 0.02 * entropy  # 提高熵系数到 0.02
+            # 提高探索强度，防止早期收敛导致训练停滞
+            actor_loss = actor_loss - 0.05 * entropy
             
             # 8. 更新 Actor
             self.actor_optimizer.zero_grad()
@@ -507,10 +531,11 @@ if __name__ == "__main__":
     
     # 模拟一个状态
     dummy_state = np.random.randn(state_dim)
-    action_idx, actual_action, log_prob, value = agent.select_action(dummy_state)
+    action_idx, actual_action, loc_idx_val, log_prob, value = agent.select_action(dummy_state)
     
     print(f"选择的动作索引: {action_idx}")
     print(f"实际变异模式: {actual_action}")
+    print(f"位置索引: {loc_idx_val}")
     print(f"对数概率: {log_prob:.4f}")
     print(f"状态价值: {value:.4f}")
     

@@ -117,7 +117,7 @@ def train_ppo(args):
     env = BinaryPerturbationEnv(
         save_path=args.save_path,
         dataset_path=args.dataset,
-        sample_hold_interval=30 # Hold-N 策略
+        sample_hold_interval=args.sample_hold_interval # Hold-N 策略
         
     )
     env.set_state_dim(args.state_dim)
@@ -178,7 +178,13 @@ def train_ppo(args):
                 # 奖励塑形：使用差分奖励函数
                 if 'score' in info:
                     current_score = info['score']
-                    shaped_reward = env.compute_reward_diff(prev_score, current_score, info.get('grad', 0))
+                    shaped_reward = env.compute_reward_diff(
+                        prev_score,
+                        current_score,
+                        info.get('grad', 0),
+                        invalid_loc=not info.get('loc_valid', True),
+                        no_change=info.get('no_change', False)
+                    )
                     prev_score = current_score  # 更新前一步分数
                 else:
                     shaped_reward = reward
@@ -242,10 +248,16 @@ def train_ppo(args):
                 episode_binaries.append(last_binary_info)
             
             if should_skip_update:
+                agent.clear_memory()
                 continue
             
+            # 截断回合时做 bootstrap
+            next_value = 0.0
+            if not episode_done:
+                next_value = agent.estimate_value(state)
+            
             # PPO 更新
-            loss = agent.update()
+            loss = agent.update(next_value=next_value)
             
             # === Episode 级别记录 (核心) ===
             current_success_rate = np.mean(success_window) if success_window else 0.0
@@ -305,6 +317,7 @@ if __name__ == "__main__":
     parser.add_argument('--episodes', type=int, default=2000)
     parser.add_argument('--max-steps', type=int, default=100)
     parser.add_argument('--save-interval', type=int, default=10)
+    parser.add_argument('--sample-hold-interval', type=int, default=10)
     parser.add_argument('--model-dir', default='./rl_models')
     parser.add_argument('--resume', default=None)
     parser.add_argument('--use-gpu', action='store_true')

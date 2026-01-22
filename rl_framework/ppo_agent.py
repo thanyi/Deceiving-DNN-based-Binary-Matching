@@ -93,12 +93,12 @@ class DualHeadPolicyNetwork(nn.Module):
         # 提取 Top-3 Raw Features: [Batch, 3, 32]
         flat_candidates = state[:, self.start_idx : self.start_idx + 96]
         candidates = flat_candidates.view(batch_size, 3, 32)
-        
+        print(f"candidates: {candidates.shape}")
         # 提取 Context: [Batch, Rest]
         ctx_part1 = state[:, :self.start_idx]
         ctx_part2 = state[:, self.start_idx + 96:]
         context_raw = torch.cat([ctx_part1, ctx_part2], dim=1)
-        
+        print(f"context_raw: {context_raw.shape}")
         # === 2. 编码 ===
         ctx_emb = self.context_net(context_raw) # [B, Hidden]
         # 对 3 个候选块分别编码
@@ -263,7 +263,7 @@ class PPOAgent:
             _, _, state_value = self.policy(state, sampled_loc_idx=None)
         return state_value.item()
     
-    def store_transition(self, state, action, location, reward, log_prob, value):
+    def store_transition(self, state, action, location, reward, log_prob, value, done):
         """存储单步经验"""
         self.memory['states'].append(state)
         self.memory['actions'].append(action)
@@ -271,6 +271,7 @@ class PPOAgent:
         self.memory['rewards'].append(reward)
         self.memory['log_probs'].append(log_prob)
         self.memory['values'].append(value)
+        self.memory['dones'].append(done)
     
     def compute_returns(self, next_value=0):
         """计算回报（使用 GAE - Generalized Advantage Estimation）"""
@@ -282,11 +283,13 @@ class PPOAgent:
         
         rewards = self.memory['rewards']
         values = self.memory['values'] + [next_value]
-        
+        dones = self.memory['dones']
+
         # 反向计算 GAE
         for i in reversed(range(len(rewards))):
-            delta = rewards[i] + self.gamma * values[i + 1] - values[i]
-            gae = delta + self.gamma * 0.95 * gae  # lambda=0.95
+            mask = 1.0 - float(dones[i])
+            delta = rewards[i] + self.gamma * mask * values[i + 1] - values[i]
+            gae = delta + self.gamma * 0.9 * mask * gae  # lambda=0.9
             
             # 检查计算结果
             if np.isnan(gae) or np.isinf(gae):
@@ -298,6 +301,9 @@ class PPOAgent:
             returns.insert(0, gae + values[i])
             advantages.insert(0, gae)
         
+        # 【正确位置】在这里归一化 Advantage
+        advantages = torch.FloatTensor(advantages).to(self.device)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return returns, advantages
     
     def update(self, next_value=0.0):
@@ -314,7 +320,7 @@ class PPOAgent:
         locations = torch.LongTensor(self.memory['locations']).to(self.device) # 新增
         old_log_probs = torch.FloatTensor(self.memory['log_probs']).to(self.device)
         returns = torch.FloatTensor(returns).to(self.device)
-        advantages = torch.FloatTensor(advantages).to(self.device)
+        # advantages = torch.FloatTensor(advantages).to(self.device)
         
         # 标准化优势（增强数值稳定性）
         # 检查 advantages 是否包含 NaN
@@ -440,7 +446,8 @@ class PPOAgent:
             'locations': [],
             'rewards': [],
             'values': [],
-            'log_probs': []
+            'log_probs': [],
+            'dones': []
         }
     
     def save(self, path):
@@ -526,18 +533,20 @@ if __name__ == "__main__":
     # 测试代码
     print("PPO Agent 初始化测试...")
     
-    state_dim = 64  # 特征维度（推荐 64）
+    state_dim = 256  # 特征维度（推荐 64）
     agent = PPOAgent(state_dim=state_dim, n_actions=6)
+    policy = DualHeadPolicyNetwork(state_dim, 6)
     
-    # 模拟一个状态
-    dummy_state = np.random.randn(state_dim)
-    action_idx, actual_action, loc_idx_val, log_prob, value = agent.select_action(dummy_state)
+    # 模拟一个状态（需要是 PyTorch 张量，且带 batch 维度）
+    dummy_state = torch.randn(1, state_dim)  # [1, state_dim]
+    policy.forward(dummy_state)
+    # action_idx, actual_action, loc_idx_val, log_prob, value = agent.select_action(dummy_state)
     
-    print(f"选择的动作索引: {action_idx}")
-    print(f"实际变异模式: {actual_action}")
-    print(f"位置索引: {loc_idx_val}")
-    print(f"对数概率: {log_prob:.4f}")
-    print(f"状态价值: {value:.4f}")
+    # print(f"选择的动作索引: {action_idx}")
+    # print(f"实际变异模式: {actual_action}")
+    # print(f"位置索引: {loc_idx_val}")
+    # print(f"对数概率: {log_prob:.4f}")
+    # print(f"状态价值: {value:.4f}")
     
-    print("\n测试通过! ✓")
+    # print("\n测试通过! ✓")
 

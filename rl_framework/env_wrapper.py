@@ -29,6 +29,24 @@ from run_utils import run_one
 import run_objdump
 from rl_framework.utils.acfg.r2_acfg_features import RadareACFGExtractor
 
+class MilestoneRewardTracker:
+    """里程碑追踪器（他的实现很好，我完全同意）"""
+    def __init__(self):
+        self.milestones = [0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.42, 0.40]
+        self.milestone_rewards = [2, 3, 5, 8, 12, 18, 25, 50]
+        self.achieved = set()
+    
+    def compute_reward(self, current_score):
+        reward = 0.0
+        for i, threshold in enumerate(self.milestones):
+            if current_score < threshold and threshold not in self.achieved:
+                reward += self.milestone_rewards[i]
+                self.achieved.add(threshold)
+        return reward
+    
+    def reset(self):
+        self.achieved.clear()
+
 
 class BinaryPerturbationEnv:
     """
@@ -101,6 +119,16 @@ class BinaryPerturbationEnv:
         # 在 save_path 下创建固定工作目录
         self._asm_work_dir = os.path.join(self.save_path, '_asm_work')
         os.makedirs(self._asm_work_dir, exist_ok=True)
+
+        # 奖励机制
+        self.milestone_tracker = MilestoneRewardTracker()
+        # 【关键】固定权重，不再动态调整
+        self.reward_weights = {
+            'incremental': 1.0,   # 基础权重
+            'milestone': 1.0,     # 里程碑已经内置了递增权重
+            'ultimate': 1.0,      # 成功奖励已经很大了
+            'penalty': 1.0        # 惩罚权重
+        }
         
         logger.info(f"Environment initialized (Hold Strategy: {self.sample_hold_interval} eps)")
     
@@ -805,10 +833,10 @@ class BinaryPerturbationEnv:
         # 计算奖励
         score_delta = prev_score - score
         no_change = abs(score_delta) < self.no_change_eps
-        reward = self.compute_reward_diff(
+        reward = self.compute_reward_v2(
             prev_score,
             score,
-            grad,
+            self.step_count,
             invalid_loc=not loc_valid,
             no_change=no_change
         )
@@ -880,23 +908,66 @@ class BinaryPerturbationEnv:
 
 
 
-    def compute_reward(self, score, grad):
+    def compute_reward_v2(self, prev_score, current_score, step_count,
+                          invalid_loc=False, no_change=False):
         """计算奖励"""
         # 基础奖励
-        reward = -score
+        total_reward = 0.0
+        # === 1. 基础进步奖励 ===
+        diff = prev_score - current_score
+       
+        if diff > 0:  # 进步
+            # 分段权重：越难的区域给越高奖励
+            if current_score > 0.7:
+                scale = 15.0
+            elif current_score > 0.5:
+                scale = 25.0
+            elif current_score > 0.42:
+                scale = 40.0
+            else:
+                scale = 60.0  # 临门一脚最重要
+            
+            incremental = diff * scale
         
-        # 成功奖励
-        if score < self.target_score:
-            reward += 10.0
+        elif diff < 0:  # 退步
+            # 惩罚轻一点，鼓励探索
+            incremental = diff * 8.0
+
+        else:  # 完全没变化
+            incremental = -0.5
+
+        total_reward += incremental * self.reward_weights['incremental']
+
+        # === 2. 里程碑奖励 ===
+        milestone = self.milestone_tracker.compute_reward(current_score)
+        total_reward += milestone * self.reward_weights['milestone']
+
+        # === 3. 终极成功奖励 ===
+        if current_score < 0.40:
+            # 基础 50 + 质量加成 + 效率加成
+            base_reward = 50.0
+            quality_bonus = (0.40 - current_score) * 100
+            efficiency_bonus = max(0, (50 - step_count) * 0.5)
+            
+            ultimate = base_reward + quality_bonus + efficiency_bonus
+            total_reward += ultimate * self.reward_weights['ultimate']
+
+
+        # === 4. 显式惩罚 ===
+        penalty = 0.0
+        if no_change:
+            penalty += 1.0
+        if invalid_loc:
+            penalty += 2.0
+        penalty += 0.1  # 时间成本
+
+
+        total_reward -= penalty * self.reward_weights['penalty']
         
-        # 梯度奖励
-        reward += abs(grad) * 0.1
-        
-        # 步数惩罚
-        reward -= self.step_count * 0.01
-        
-        return reward
-    
+        # === 5. 硬裁剪（不是归一化！）===
+        # 只是防止极端值，不改变奖励的相对大小关系
+        return np.clip(total_reward, -10.0, 150.0)
+
     # def reset(self):
     #     """重置环境"""
     #     self.current_binary = self.original_binary
@@ -944,6 +1015,7 @@ class BinaryPerturbationEnv:
         self.mutation_history = []
         self.step_count = 0
         self.best_score = 1.0
+        self.milestone_tracker.reset()
         
         # 提取初始特征
         state = self.extract_features(self.original_binary)

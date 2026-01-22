@@ -10,6 +10,7 @@ from disasm.Types import *
 from utils.ail_utils import *
 from utils.pp_print import *
 from junkcodes import get_junk_codes
+from addr_utils import addr_equals, select_block_by_addr
 
 
 obfs_proportion = 0.5
@@ -141,16 +142,48 @@ class bb_reorder_diversify(ailVisitor):
 
         self.update_process()
 
-    def bb_div_reorder(self):
+    def bb_div_reorder(self, target_addr=None):
+        """
+        对基本块执行重排序变异
+        
+        如果指定 target_addr，找到该地址的基本块并与其相邻块交换
+        如果未指定 target_addr，对每个函数随机选择两个基本块进行交换
+        """
+        # 如果指定了 target_addr，只处理包含该地址的基本块
+        if target_addr is not None:
+            found = False
+            for f in self.fb_tbl.keys():
+                bl = self.fb_tbl[f]
+                b, exact = select_block_by_addr(bl, target_addr)
+                if b is None:
+                    continue
+                found = True
+                idx = bl.index(b)
+                if exact:
+                    print '[bb_reorder_diversify.py:bb_div_reorder] Found target_addr: %s (matched with 0x%X)' % (target_addr, b.bblock_begin_loc.loc_addr)
+                else:
+                    print '[bb_reorder_diversify.py:bb_div_reorder] Found target_addr: %s inside block (begin=0x%X)' % (target_addr, b.bblock_begin_loc.loc_addr)
+                # 确保目标块有前后块可以交换
+                if len(bl) > 3 and idx >= 1 and idx < len(bl) - 2:
+                    # 与前一个块交换
+                    n1 = idx - 1
+                    n2 = idx
+                    if n2 < len(bl) - 2:
+                        self.reorder_bb(n1, n2, bl)
+                        return
+                print '[bb_reorder_diversify.py:bb_div_reorder] Warning: target_addr %s cannot be reordered (boundary or too small), fallback to random' % target_addr
+                break
+            if not found:
+                print '[bb_reorder_diversify.py:bb_div_reorder] Warning: target_addr %s not found, fallback to random' % target_addr
+        
+        # 未指定 target_addr或者没有找到tartget_addr，随机选择基本块进行重排序
         for f in self.fb_tbl.keys():
             bl = self.fb_tbl[f]
             if len(bl) > 3:
-                #if random.random() < obfs_proportion:
-                if True: 
-                    n1, n2 = self.get_2_diff_randint(0, len(bl) - 3)
-                    self.reorder_bb(n1, n2, bl)
+                n1, n2 = self.get_2_diff_randint(0, len(bl) - 3)
+                self.reorder_bb(n1, n2, bl)
 
-    def visit(self, instrs):
+    def visit(self, instrs, target_addr = None):
         print 'start bb reorder'
         self.instrs = copy.deepcopy(instrs)
 
@@ -161,5 +194,5 @@ class bb_reorder_diversify(ailVisitor):
         #         il = self.bb_instrs(b)
         #         for i in il:
         #             print pp_print_instr(i)
-        self.bb_div_reorder()
+        self.bb_div_reorder(target_addr)
         return self.instrs

@@ -9,6 +9,7 @@ from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *
 from utils.pp_print import *
+from addr_utils import addr_equals, select_block_by_addr
 
 
 class bb_merge_diversify(ailVisitor):
@@ -102,14 +103,38 @@ class bb_merge_diversify(ailVisitor):
                         res.append((f, t[0], t[1][1]))
         return res
 
-    def bb_div_merge(self):
+    def bb_div_merge(self, target_addr=None):
+        """
+        对基本块执行合并变异
+        
+        如果指定 target_addr，找到包含该地址的可合并对并执行合并
+        如果未指定 target_addr，对所有可合并对随机选择并合并
+        """
         mergeable_pairs = self.mergeable_bb()
         print '%d candidate pairs' % len(mergeable_pairs)
         if len(mergeable_pairs) == 0:
             print 'do nothing'
             return
-        # n = random.randint(0, len(mergeable_pairs) - 1)
-        # self.merge_bb(mergeable_pairs[n])
+        
+        # 如果指定了 target_addr，只处理包含该地址的可合并对
+        if target_addr is not None:
+            for pair in mergeable_pairs:
+                f, s, d = pair
+                if f not in self.fb_tbl.keys():
+                    continue
+                bl = self.fb_tbl[f]
+                b, exact = select_block_by_addr(bl, target_addr)
+                if b is not None and (b.bblock_name == s or b.bblock_name == d):
+                    if exact:
+                            print '[bb_merge_diversify.py:bb_div_merge] Found target_addr: %s (matched with 0x%X) in pair (%s, %s)' % (target_addr, b.bblock_begin_loc.loc_addr, s, d)
+                    else:
+                            print '[bb_merge_diversify.py:bb_div_merge] Found target_addr: %s inside block (begin=0x%X) in pair (%s, %s)' % (target_addr, b.bblock_begin_loc.loc_addr, s, d)
+                            self.merge_bb(pair)
+                            return
+            print '[bb_merge_diversify.py:bb_div_merge] Warning: target_addr %s not found in mergeable pairs' % target_addr
+            return
+        
+        # 未指定 target_addr，随机选择可合并对进行合并
         mergeable_pairs_appears = []
         for i in range(len(mergeable_pairs)):
             if mergeable_pairs[i][0] in self.fb_tbl.keys():
@@ -123,18 +148,9 @@ class bb_merge_diversify(ailVisitor):
             else:
                 for i in range(len(mergeable_pairs_appears)):
                     self.merge_bb(mergeable_pairs_appears[i])
-        '''
-        # strategy for full binary 
-        for i in range(len(mergeable_pairs)):
-            # to avoid redefinition of symbols
-            if i % 10 == 0:
-                if mergeable_pairs[i][0] in self.fb_tbl.keys():
-                    print('Merged')
-                    self.merge_bb(mergeable_pairs[i])
-        '''
 
-    def visit(self, instrs):
+    def visit(self, instrs, target_addr = None):
         print 'start basic block merge ...'
         self.instrs = copy.deepcopy(instrs)
-        self.bb_div_merge()
+        self.bb_div_merge(target_addr)
         return self.instrs

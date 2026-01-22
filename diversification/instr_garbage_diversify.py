@@ -10,6 +10,7 @@ from disasm.Types import *
 from utils.ail_utils import *
 from utils.pp_print import *
 from junkcodes import get_junk_codes
+from addr_utils import addr_equals, select_block_by_addr
 
 
 class instr_garbage_diversify(ailVisitor):
@@ -53,7 +54,38 @@ class instr_garbage_diversify(ailVisitor):
         for i in garbage:
             self.insert_instrs(i, loc)
 
-    def insert_garbage(self):
+    def insert_garbage(self, target_addr=None):
+        """
+        插入垃圾代码
+        
+        如果指定 target_addr，只在该地址的基本块中插入垃圾代码
+        如果未指定 target_addr，在每个函数的随机基本块中插入垃圾代码
+        """
+        # 如果指定了 target_addr，只处理该地址的基本块
+        if target_addr is not None:
+            found = False
+            for f in self.fb_tbl.keys():
+                bl = self.fb_tbl[f]
+                b, exact = select_block_by_addr(bl, target_addr)
+                if b is None:
+                    continue
+                found = True
+                if exact:
+                    print '[instr_garbage_diversify.py:insert_garbage] Found target_addr: %s (matched with 0x%X)' % (target_addr, b.bblock_begin_loc.loc_addr)
+                else:
+                    print '[instr_garbage_diversify.py:insert_garbage] Found target_addr: %s inside block (begin=0x%X)' % (target_addr, b.bblock_begin_loc.loc_addr)
+                bil = self.bb_instrs(b)
+                if len(bil) > 0:
+                    loc = get_loc(random.choice(bil))
+                    self._insert_garbage(loc, mode=random.randint(1, 2))
+                    self.update_process()
+                    return
+                print '[instr_garbage_diversify.py:insert_garbage] Warning: target block empty, fallback to random'
+                break
+            if not found:
+                print '[instr_garbage_diversify.py:insert_garbage] Warning: target_addr %s not found, fallback to random' % target_addr
+        
+        # 未指定 target_addr，在每个函数的随机基本块中插入垃圾代码
         for f in self.fb_tbl.keys():
             # select block to insert garbage
             b = random.choice(self.fb_tbl[f])
@@ -62,8 +94,8 @@ class instr_garbage_diversify(ailVisitor):
             self._insert_garbage(loc, mode=random.randint(1, 2))
         self.update_process()
 
-    def visit(self, instrs):
+    def visit(self, instrs, target_addr = None):
         print 'start garbage insertion ...'
         self.instrs = copy.deepcopy(instrs)
-        self.insert_garbage()
+        self.insert_garbage(target_addr)
         return self.instrs

@@ -14,6 +14,7 @@ from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *
 from utils.pp_print import *
+from addr_utils import addr_equals
 from junkcodes import get_junk_codes
 
 obfs_proportion = 0.02
@@ -26,10 +27,22 @@ class bb_branchfunc_diversify(ailVisitor):
         self.funcs = funcs
         self._new_des_id = 0
 
-    def _branch_a_func(self, f):
+    def _branch_a_func(self, f, target_addr=None):
+        """
+        对单个函数执行分支函数化
+        
+        如果指定 target_addr，只处理该地址的跳转指令
+        如果未指定 target_addr，处理函数中所有的跳转指令
+        """
         fil = self.func_instrs(f)
         find_a_valid_func = False
         for instr in fil:
+            # 如果指定了 target_addr，只处理匹配地址的指令
+            if target_addr:
+                loc = self._get_loc(instr)
+                if not loc or not addr_equals(loc.loc_addr, target_addr):
+                    continue
+            
             op = get_op(instr)
             des = get_cf_des(instr)
             if des is not None and isinstance(des, Label):
@@ -82,24 +95,41 @@ class bb_branchfunc_diversify(ailVisitor):
                         self.replace_instrs(tmp[0], loc, instr)
                         for _i in tmp[1:]:
                             self.append_instrs(_i, loc)
+                    
+                    # 如果指定了 target_addr，找到目标后立即返回
+                    if target_addr:
+                        print '[bb_branchfunc_diversify.py:_branch_a_func] Found and processed target_addr: %s' % target_addr
+                        return True
         return find_a_valid_func
 
-    def branch_func(self):
+    def branch_func(self, target_addr=None):
+        """
+        对函数执行分支函数化
+        
+        如果指定 target_addr，只处理包含该地址的函数
+        如果未指定 target_addr，处理所有函数
+        """
         # print 'bb branch on %d candidate function' % len(self.funcs)
         # select the 1st obfs_proportion functions
         # for f in self.funcs[:int(obfs_proportion * len(self.funcs))]:
         do_branch = False
         for f in self.funcs:
         #for f in random.sample(self.funcs, int(obfs_proportion * len(self.funcs)) + 1):
-            if self._branch_a_func(f):
+            if self._branch_a_func(f, target_addr):
                 do_branch = True
                 self.update_process()
+                # 如果指定了 target_addr，找到后立即返回
+                if target_addr:
+                    return
         if not do_branch:
-            #print 'no valid function is selected'
-            raise Exception('no valid function is selected')
+            if target_addr:
+                print '[bb_branchfunc_diversify.py:branch_func] Warning: target_addr %s not found' % target_addr
+            else:
+                #print 'no valid function is selected'
+                raise Exception('no valid function is selected')
 
-    def bb_div_branch(self):
-        self.branch_func()
+    def bb_div_branch(self, target_addr=None):
+        self.branch_func(target_addr)
 
     def get_branch_routine(self, iloc):
         """
@@ -124,11 +154,11 @@ class bb_branchfunc_diversify(ailVisitor):
         routine_instrs = self.get_branch_routine(loc)
         self.instrs.extend(routine_instrs)
 
-    def bb_div_process(self):
-        self.bb_div_branch()
+    def bb_div_process(self, target_addr=None):
+        self.bb_div_branch(target_addr)
         self.attach_branch_routine()
 
-    def visit(self, instrs):
+    def visit(self, instrs, target_addr = None):
         print 'start bb branch function'
         self.instrs = copy.deepcopy(instrs)
         self.bb_div_process()

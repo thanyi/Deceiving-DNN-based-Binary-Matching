@@ -16,6 +16,7 @@ from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *
 from utils.pp_print import *
+from addr_utils import addr_equals, select_block_by_addr
 from junkcodes import get_junk_codes
 
 
@@ -88,7 +89,13 @@ class bb_flatten_diversify(ailVisitor):
                     self.append_instrs(i1, get_loc(i))
         self.update_process()
 
-    def bb_div_flatten(self):
+    def bb_div_flatten(self, target_addr=None):
+        """
+        对控制流图执行扁平化变异
+        
+        如果指定 target_addr，找到包含该地址的函数并扁平化
+        如果未指定 target_addr，对所有可扁平化的 CFG 进行扁平化
+        """
         cfgs = []
         for cfg in self.cfg_tbl:
             if self.is_flattenable_cfg(cfg):
@@ -97,10 +104,28 @@ class bb_flatten_diversify(ailVisitor):
             #print 'no flattenable block, quit'
             raise Exception('no flattenable block, quit')
             #return
-        #cfg = cfgs[random.randint(0, len(cfgs) - 1)]
-        #self.flatten_cfg(cfg)
+        
+        # 如果指定了 target_addr，找到包含该地址的函数并扁平化
+        if target_addr is not None:
+            for cfg in cfgs:
+                fname = cfg[0]
+                if fname not in self.fb_tbl.keys():
+                    continue
+                bl = self.fb_tbl[fname]
+                b, exact = select_block_by_addr(bl, target_addr)
+                if b is not None:
+                    if exact:
+                        print '[bb_flatten_diversify.py:bb_div_flatten] Found target_addr: %s (matched with 0x%X) in function %s' % (target_addr, b.bblock_begin_loc.loc_addr, fname)
+                    else:
+                        print '[bb_flatten_diversify.py:bb_div_flatten] Found target_addr: %s inside block (begin=0x%X) in function %s' % (target_addr, b.bblock_begin_loc.loc_addr, fname)
+                    self.flatten_cfg(cfg)
+                    self.insert_switch_routine()
+                    return
+            print '[bb_flatten_diversify.py:bb_div_flatten] Warning: target_addr %s not found in flattenable functions' % target_addr
+            return
+        
+        # 未指定 target_addr，对所有可扁平化的 CFG 进行扁平化
         for cfg in cfgs:
-            #if random.random() < obfs_proportion:
             if cfg[0] in self.fb_tbl.keys():
                 self.flatten_cfg(cfg)
         self.insert_switch_routine()
@@ -130,7 +155,7 @@ class bb_flatten_diversify(ailVisitor):
             self.insert_instrs(ins, selected_loc)
         self.update_process()
 
-    def visit(self, instrs):
+    def visit(self, instrs, target_addr = None):
         self.instrs = copy.deepcopy(instrs)
-        self.bb_div_flatten()
+        self.bb_div_flatten(target_addr)
         return self.instrs

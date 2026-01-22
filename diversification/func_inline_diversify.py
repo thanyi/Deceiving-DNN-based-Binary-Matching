@@ -159,8 +159,14 @@ class func_inline_diversify(ailVisitor):
                 print 'no caller is going to be inlined'
         return self.instrs
 
-    def visit(self, instrs):
+    def visit(self, instrs, target_addr = None):
+        """
+        注意：函数内联是函数级别的操作，target_addr 参数在此操作中无意义
+        因为内联操作需要分析函数调用关系，不是针对单个基本块的操作
+        """
         self.instrs = copy.deepcopy(instrs)
+        if target_addr:
+            print '[func_inline_diversify.py:visit] Warning: target_addr is not supported for function inline (function-level operation)'
         if len(self.funcs) >= 5:
             self.func_inline_process()
         else:

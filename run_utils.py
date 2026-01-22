@@ -33,7 +33,6 @@ def run_one(original_binary, mutated_binary, model_original, checkdict, function
     评估原始二进制文件和变异二进制文件之间的相似度
     
     这是一个关键函数，用于计算变异二进制文件与原始文件的相似度分数和梯度值。
-    分数越低表示相似度越高，梯度值用于指导优化方向。
     
     参数:
         original_binary: 原始二进制文件路径
@@ -43,7 +42,7 @@ def run_one(original_binary, mutated_binary, model_original, checkdict, function
         function_name: 目标函数名
     
     返回:
-        score: 相似度分数 (float) - 越低表示越相似，目标是< 0.40
+        score: 余弦相似度 (float) - 范围[0,1]，越低表示越不相似，攻击目标是降到< 0.40
         grad: 梯度值 (float) - 用于指导变异方向的优化指标
     """
     try:
@@ -83,11 +82,13 @@ def run_one(original_binary, mutated_binary, model_original, checkdict, function
                     original_asm = original_asm_cache[cache_key]
                     logger.debug(f"使用缓存的原始文件汇编: {original_asm}")
                 else:
-                    original_output_file = binfunc2asm(ipath = original_binary,
-                                            target_func_name = function_name,    # 原始文件的函数名
-                                            opath=os.path.join(asm_work_dir, 'original'), 
-                                            verbose= False,
-                                            current_sym_addr = ori_sym_addr)
+                    original_output_file = binfunc2asm(
+                        ipath=original_binary,
+                        target_func_name=function_name,    # 原始文件的函数名
+                        opath=os.path.join(asm_work_dir, 'original'), 
+                        verbose=False,
+                        # current_sym_addr=ori_sym_addr
+                    )
                     if not original_output_file:
                         logger.error(f"无法提取原始函数 {function_name} 的汇编文件")
                         return None, None
@@ -97,11 +98,13 @@ def run_one(original_binary, mutated_binary, model_original, checkdict, function
                         original_asm_cache[cache_key] = original_asm
                 
                 # 生成变异文件的汇编文件（每次都需要重新提取）
-                mutate_output_file = binfunc2asm(ipath = mutated_binary,
-                                        target_func_name = function_name,    # 变异文件的函数名
-                                        opath=os.path.join(asm_work_dir, 'mutated'), 
-                                        verbose= False, 
-                                        current_sym_addr = ori_sym_addr)
+                mutate_output_file = binfunc2asm(
+                    ipath=mutated_binary,
+                    target_func_name=function_name,    # 变异文件的函数名
+                    opath=os.path.join(asm_work_dir, 'mutated'), 
+                    verbose=False, 
+                    current_sym_addr=ori_sym_addr
+                )
                 if not mutate_output_file:
                     logger.error(f"无法提取变异函数 {function_name} 的汇编文件")
                     return None, None

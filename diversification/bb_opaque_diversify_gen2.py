@@ -10,6 +10,7 @@ from disasm.Types import *
 from utils.ail_utils import *
 from utils.pp_print import *
 from junkcodes import get_junk_codes
+from addr_utils import addr_equals, select_block_by_addr
 
 obfs_proportion = 0.2
 
@@ -229,17 +230,43 @@ class bb_opaque_diversify_gen2(ailVisitor):
         res.append((instr_update.REPLACE, new_line, iloc_with_block_label, i))
         return res
 
-    def bb_div_opaque(self):
+    def bb_div_opaque(self, target_addr=None):
+        """
+        对基本块执行不透明谓词混淆 (Gen2版本)
+        
+        如果指定 target_addr，只对该地址的基本块进行变异
+        如果未指定 target_addr，对每个函数随机选择一个基本块进行变异
+        """
         # print 'do basic block transformation on: %d functions' % len(self.fb_tbl)
         # add new opaque header method here
         modes = [self.get_opaque_header1, self.get_opaque_header2]
         # header1 may cause errors in disassembling when compiler is gcc-4.8 (x64? I am not sure)
         modes = [self.get_opaque_header1]
-        for f in self.fb_tbl.keys():
-            #if random.random() < obfs_proportion:
-            if True: 
+        
+        # 如果指定了 target_addr，只处理该地址的基本块
+        if target_addr is not None:
+            found = False
+            for f in self.fb_tbl.keys():
                 bl = self.fb_tbl[f]
-                #if len(bl) > 1:
+                b, exact = select_block_by_addr(bl, target_addr)
+                if b is not None:
+                    found = True
+                    if exact:
+                        print '[bb_opaque_diversify_gen2.py:bb_div_opaque] Found target_addr: %s (matched with 0x%X)' % (target_addr, b.bblock_begin_loc.loc_addr)
+                    else:
+                        print '[bb_opaque_diversify_gen2.py:bb_div_opaque] Found target_addr: %s inside block (begin=0x%X)' % (target_addr, b.bblock_begin_loc.loc_addr)
+                    n_mode = random.randint(0, len(modes) - 1)
+                    changelist = modes[n_mode](b, 0)
+                    self._change_instrs_with_changelist(changelist)
+                    self.update_process()
+                    return
+            if not found:
+                print '[bb_opaque_diversify_gen2.py:bb_div_opaque] Warning: target_addr %s not found, fallback to random' % target_addr
+        
+        # 未指定 target_addr，随机选择基本块进行变异
+        for f in self.fb_tbl.keys():
+            bl = self.fb_tbl[f]
+            if len(bl) > 0:
                 n = random.randint(0, len(bl) - 1)
                 n_mode = random.randint(0, len(modes) - 1)
                 changelist = modes[n_mode](bl[n], 0)
@@ -293,13 +320,13 @@ class bb_opaque_diversify_gen2(ailVisitor):
             self.append_instrs(ins, selected_loc)
         self.update_process()
 
-    def bb_opaque_process(self):
-        self.bb_div_opaque()
+    def bb_opaque_process(self, target_addr=None):
+        self.bb_div_opaque(target_addr)
         # remove header1 mode when compiler is gcc-4.8
         self.attach_opaque_routines()
 
-    def visit(self, instrs):
+    def visit(self, instrs, target_addr = None):
         print 'start basic block opaque diversification'
         self.instrs = copy.deepcopy(instrs)
-        self.bb_opaque_process()
+        self.bb_opaque_process(target_addr)
         return self.instrs

@@ -166,11 +166,11 @@ def train_ppo(args):
             episode_done = False  # 标记 episode 是否正常结束
             
             for step in range(args.max_steps):
-                action_idx, actual_action, log_prob, value = agent.select_action(state, explore=True)
+                action_idx, actual_action, loc_idx_val, log_prob, value = agent.select_action(state, explore=True)
                 episode_actions.append(actual_action)
                 
                 # 执行动作
-                next_state, reward, done, info = env.step(actual_action)
+                next_state, reward, done, info = env.step(actual_action, loc_idx_val)
                 
                 # 【优化】如果env返回了更准确的初始分（虽然通常是1.0），可在此更新
                 # 但一般对抗攻击默认起点就是相似度1.0，保持1.0即可
@@ -194,7 +194,7 @@ def train_ppo(args):
                         writer.add_scalar('Step/Similarity_Score', info['score'], current_step)     # 每一步变异后的代码与原代码的相似度。
 
                 # 存储经验
-                agent.store_transition(state, action_idx, shaped_reward, log_prob, value)
+                agent.store_transition(state, action_idx, loc_idx_val, shaped_reward, log_prob, value)
                 
                 episode_reward += shaped_reward
                 state = next_state
@@ -298,12 +298,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', required=True)
     parser.add_argument('--save-path', required=True)
-    parser.add_argument('--state-dim', type=int, default=128) # 默认128维
+    parser.add_argument('--state-dim', type=int, default=256) # 默认256维
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--gamma', type=float, default=0.95)
     parser.add_argument('--epsilon', type=float, default=0.2)
-    parser.add_argument('--episodes', type=int, default=1000)
-    parser.add_argument('--max-steps', type=int, default=50)
+    parser.add_argument('--episodes', type=int, default=2000)
+    parser.add_argument('--max-steps', type=int, default=100)
     parser.add_argument('--save-interval', type=int, default=10)
     parser.add_argument('--model-dir', default='./rl_models')
     parser.add_argument('--resume', default=None)

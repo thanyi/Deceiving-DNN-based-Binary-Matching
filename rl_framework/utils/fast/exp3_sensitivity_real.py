@@ -259,7 +259,7 @@ def run_experiment():
     significance = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*"
     
     # 绘图
-    plt.figure(figsize=(8, 6))
+    plt.figure(figsize=(10, 7))
     
     means = [np.mean(d_rand), np.mean(d_edge), np.mean(d_crit)]
     errors = [np.std(d_rand)/np.sqrt(len(d_rand)), 
@@ -270,24 +270,32 @@ def run_experiment():
     colors = ['#95a5a6', '#3498db', '#e74c3c'] # 灰、蓝、红
     
     x_pos = np.arange(len(labels))
-    bars = plt.bar(x_pos, means, yerr=errors, align='center', alpha=0.9, ecolor='black', capsize=10, color=colors, width=0.6)
+    bars = plt.bar(x_pos, means, yerr=errors, align='center', alpha=0.85, 
+                   ecolor='black', capsize=8, color=colors, width=0.65, edgecolor='white', linewidth=1.5)
     
-    # 在柱子上标数值
+    # 在柱子上标数值 - 增加间距，调整位置
     for bar in bars:
         height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2., 1.05*height,
-                f'{height:.2f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+        # 增加距离：从 1.05 改为 1.12，让数字离柱子更远
+        plt.text(bar.get_x() + bar.get_width()/2., height + max(errors) * 1.3,
+                f'{height:.2f}', ha='center', va='bottom', 
+                fontsize=13, fontweight='bold', color='#2c3e50')
     
-    # 画显著性标记线
+    # 画显著性标记线 - 调整位置，避免和数字重叠
     max_h = max(means) + max(errors)
-    plt.plot([1, 1, 2, 2], [max_h+0.2, max_h+0.3, max_h+0.3, max_h+0.2], lw=1.5, c='k')
-    plt.text(1.5, max_h+0.35, f"{significance}\n(p < 0.001)", ha='center', va='bottom', color='red', fontsize=12)
+    sig_y_start = max_h + max(errors) * 2.5  # 增加起始高度
+    sig_y_end = sig_y_start + max(errors) * 0.8
+    plt.plot([1, 1, 2, 2], [sig_y_start, sig_y_end, sig_y_end, sig_y_start], 
+             lw=1.8, c='black')
+    plt.text(1.5, sig_y_end + max(errors) * 0.3, f"{significance}\n(p = {p_val:.4e})", 
+             ha='center', va='bottom', color='#e74c3c', fontsize=11, fontweight='bold')
 
-    plt.ylabel('Feature Vector Drift (Normalized L2 Distance)', fontsize=12)
-    plt.title('Sensitivity Analysis of Critical Region Perception', fontsize=14, fontweight='bold')
+    plt.ylabel('Feature Vector Drift (Normalized L2 Distance)', fontsize=13, fontweight='bold')
+    plt.title('Sensitivity Analysis of Critical Region Perception', fontsize=15, fontweight='bold', pad=20)
     plt.xticks(x_pos, labels, fontsize=12)
-    plt.ylim(0, max_h * 1.4) # 留出顶部空间
-    plt.grid(axis='y', linestyle='--', alpha=0.4)
+    plt.ylim(0, max_h * 1.8) # 增加顶部空间，从 1.4 改为 1.8
+    plt.grid(axis='y', linestyle='--', alpha=0.3)
+    plt.tight_layout()
     
     save_path = os.path.join(SAVE_DIR, "exp3_real_sensitivity.png")
     plt.savefig(save_path, dpi=300)

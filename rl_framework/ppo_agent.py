@@ -9,6 +9,7 @@ PPO Agent for Binary Code Perturbation
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 from torch.distributions import Categorical
@@ -17,79 +18,137 @@ import os
 from collections import deque
 from loguru import logger
 
-class PolicyNetwork(nn.Module):
-    """策略网络：输出每个动作的概率分布（改进版）"""
-    
-    def __init__(self, state_dim, action_dim, hidden_dim=None):
-        # 根据输入维度自动调整隐藏层大小
-        if hidden_dim is None:
-            # 【优化】根据输入维度合理缩放隐藏层
-            # 规则：hidden_dim ≈ state_dim * 2，但不超过 768（防止过大）
-            if state_dim <= 64:
-                hidden_dim = 256
-            elif state_dim <= 128:
-                hidden_dim = 384
-            elif state_dim <= 256:
-                hidden_dim = 640  # 256维 → 640 (原来512可能稍小，640更平衡)
-            else:
-                hidden_dim = 768  # >256维 → 768 (上限，防止参数爆炸)
-        super(PolicyNetwork, self).__init__()
+class DualHeadPolicyNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=512):
+        super(DualHeadPolicyNetwork, self).__init__()
         
-        # Actor 网络（更深，带归一化）
-        self.actor = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
+        # 定义切片位置 (根据上面的特征工程)
+        self.topk_dim = 32
+        self.num_candidates = 3
+        # 假设前 16+40=56 维是历史+拓扑
+        # 56 到 56+96 是 Top-1/2/3
+        self.start_idx = 56 
+        
+        # 1. Context Encoder (编码除了 Top-3 以外的所有全局特征)
+        # context_dim = total - (32*3)
+        self.context_dim = state_dim - (self.topk_dim * self.num_candidates)
+        self.context_net = nn.Sequential(
+            nn.Linear(self.context_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            
-            nn.Linear(hidden_dim // 2, action_dim),
-            nn.Softmax(dim=-1)
+            nn.ReLU()
         )
         
-        # Critic 网络（独立架构）
+        # 2. Candidate Encoder (编码 Top-1/2/3 每个块的特征)
+        # 这是一个共享权重的层，处理每个候选块
+        self.candidate_net = nn.Sequential(
+            nn.Linear(self.topk_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU()
+        )
+        
+        # 3. Location Head (决定选哪个块)
+        # 输入：Context + 某个Candidate
+        # 输出：Score
+        self.location_head = nn.Sequential(
+            nn.Linear(hidden_dim + hidden_dim // 2, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1) # 给每个块打分
+        )
+        
+        # 4. Action Head (决定做什么动作)
+        # 输入：Context + 被选中的Candidate
+        # 【修复】移除 Softmax，让 Categorical 自己处理
+        self.action_head = nn.Sequential(
+            nn.Linear(hidden_dim + hidden_dim // 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+            # Softmax 由 Categorical 自动处理，不需要在这里添加
+        )
+        
+        # Critic
         self.critic = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim, 1)
         )
-    
-    def forward(self, state):
-        """前向传播：返回动作概率和状态价值"""
-        action_probs = self.actor(state)
+
+    def forward(self, state, sampled_loc_idx=None):
+        """
+        前向传播
+        
+        参数:
+            state: [B, state_dim] 状态特征
+            sampled_loc_idx: [B] 或 None
+                - 训练时：传入采样的 location 索引（硬选择）
+                - 推理时：使用 None（软注意力）
+        
+        返回:
+            action_probs: [B, n_actions] 动作概率分布（logits）
+            loc_probs: [B, 3] 位置概率分布
+            state_value: [B, 1] 状态价值
+        """
+        batch_size = state.size(0)
+        
+        # === 1. 拆分数据 ===
+        # 提取 Top-3 Raw Features: [Batch, 3, 32]
+        flat_candidates = state[:, self.start_idx : self.start_idx + 96]
+        candidates = flat_candidates.view(batch_size, 3, 32)
+        
+        # 提取 Context: [Batch, Rest]
+        ctx_part1 = state[:, :self.start_idx]
+        ctx_part2 = state[:, self.start_idx + 96:]
+        context_raw = torch.cat([ctx_part1, ctx_part2], dim=1)
+        
+        # === 2. 编码 ===
+        ctx_emb = self.context_net(context_raw) # [B, Hidden]
+        # 对 3 个候选块分别编码
+        cand_embs = self.candidate_net(candidates) # [B, 3, Hidden/2]
+        
+        # === 3. Location Decision (Attention) ===
+        # 把 Context 扩展后和每个 Candidate 拼接
+        ctx_expanded = ctx_emb.unsqueeze(1).expand(-1, 3, -1) # [B, 3, Hidden]
+        loc_input = torch.cat([ctx_expanded, cand_embs], dim=-1) # [B, 3, Hidden*1.5]
+        
+        # 计算每个位置的分数
+        loc_scores = self.location_head(loc_input).squeeze(-1) # [B, 3]
+        
+        # 【修复】更鲁棒的 Masking：使用绝对值和避免正负抵消
+        is_pad = (candidates.abs().sum(dim=-1) < 1e-6)
+        loc_scores = loc_scores.masked_fill(is_pad, -1e9)
+        
+        loc_probs = F.softmax(loc_scores, dim=-1) # [B, 3] -> Location Policy
+        
+        # === 4. Action Decision (条件依赖) ===
+        # 【关键修复】：根据是否传入 sampled_loc_idx 决定使用硬选择还是软注意力
+        if sampled_loc_idx is None:
+            # 推理模式：使用软注意力（加权平均）
+            selected_cand_emb = torch.bmm(loc_probs.unsqueeze(1), cand_embs).squeeze(1) # [B, Hidden/2]
+        else:
+            # 训练模式：使用硬选择（实际采样的块）
+            # sampled_loc_idx: [B], cand_embs: [B, 3, Hidden/2]
+            # 使用 gather 或索引选择
+            batch_indices = torch.arange(batch_size, device=state.device)
+            selected_cand_emb = cand_embs[batch_indices, sampled_loc_idx]  # [B, Hidden/2]
+        
+        # Action Head Input
+        action_input = torch.cat([ctx_emb, selected_cand_emb], dim=-1)
+        action_logits = self.action_head(action_input)  # [B, n_actions] 返回 logits，不是概率
+        
         state_value = self.critic(state)
-        return action_probs, state_value
+        
+        return action_logits, loc_probs, state_value
 
 
 class PPOAgent:
     """PPO 智能体"""
     
-    def __init__(self, state_dim, n_actions=8, lr=1e-4, gamma=0.99, 
+    def __init__(self, state_dim, n_actions=8, n_locs=3, lr=1e-4, gamma=0.99, 
                  epsilon=0.2, epochs=10, device='cpu'):
         """
         参数:
             state_dim: 状态维度（特征向量长度）
             n_actions: 动作数量（8种变异策略）
+            n_locs: 位置数量（3个候选块）
             lr: 学习率（降低到 1e-4）
             gamma: 折扣因子
             epsilon: PPO裁剪参数
@@ -104,18 +163,28 @@ class PPOAgent:
         # 动作映射：索引 -> 实际变异模式
         self.action_map = [1, 2, 4, 7, 8, 9, 11]
         self.n_actions = len(self.action_map) 
-        
+        self.n_locs = n_locs
+
         # 初始化网络
-        self.policy = PolicyNetwork(state_dim, n_actions).to(self.device)
+        self.policy = DualHeadPolicyNetwork(state_dim, n_actions, hidden_dim=512).to(self.device)
         
         # 分离 Actor 和 Critic 优化器（降低学习率）
-        self.actor_optimizer = optim.Adam(self.policy.actor.parameters(), lr=lr)
+        # 优化器
+        self.actor_optimizer = optim.Adam(
+            list(self.policy.context_net.parameters()) + 
+            list(self.policy.candidate_net.parameters()) + 
+            list(self.policy.action_head.parameters()) + 
+            list(self.policy.location_head.parameters()), 
+            lr=lr
+        )
+
         self.critic_optimizer = optim.Adam(self.policy.critic.parameters(), lr=lr * 2)  # Critic 学习稍快
         
         # 经验缓冲
         self.memory = {
             'states': [],
             'actions': [],
+            'locations': [],
             'rewards': [],
             'values': [],
             'log_probs': []
@@ -123,41 +192,59 @@ class PPOAgent:
     
     def select_action(self, state, explore=True):
         """
-        选择动作
+        选择动作（两阶段采样：先选位置，再选动作）
         
         参数:
             state: 当前状态特征向量
             explore: 是否探索（训练时为True，测试时为False）
         
         返回:
-            action_idx: 动作索引 (0-7)
-            actual_action: 实际变异模式 (1,2,3,5,7,8,9,11)
-            log_prob: 对数概率
+            action_idx: 动作索引 (0-6)
+            actual_action: 实际变异模式 (1,2,4,7,8,9,11)
+            loc_idx_val: 位置索引 (0-2)
+            joint_log_prob: 联合对数概率
+            state_value: 状态价值
         """
         state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         
+        # === 第一阶段：选择位置 ===
         with torch.no_grad():
-            action_probs, state_value = self.policy(state)
+            # 只使用 location head（不依赖于具体选中的块）
+            _, loc_probs, _ = self.policy(state, sampled_loc_idx=None)
         
-        # 创建分类分布
-        dist = Categorical(action_probs)
+        dist_loc = Categorical(loc_probs)
         
         if explore:
-            action = dist.sample()
+            loc_idx = dist_loc.sample()
         else:
-            action = torch.argmax(action_probs, dim=-1)
+            loc_idx = torch.argmax(loc_probs, dim=-1)
         
-        log_prob = dist.log_prob(action)
+        # === 第二阶段：基于选中的位置选择动作 ===
+        with torch.no_grad():
+            # 传入选中的 location，让 action head 看到真实的块特征
+            action_logits, _, state_value = self.policy(state, sampled_loc_idx=loc_idx)
         
-        action_idx = action.item()
-        actual_action = self.action_map[action_idx]
+        dist_action = Categorical(logits=action_logits)  # 使用 logits 参数
         
-        return action_idx, actual_action, log_prob.item(), state_value.item()
+        if explore:
+            action_idx = dist_action.sample()
+        else:
+            action_idx = torch.argmax(action_logits, dim=-1)
+        
+        # 计算联合对数概率：P(location, action | state) = P(location | state) × P(action | state, location)
+        joint_log_prob = dist_loc.log_prob(loc_idx) + dist_action.log_prob(action_idx)
+        
+        action_idx_val = action_idx.item()
+        actual_action = self.action_map[action_idx_val]
+        loc_idx_val = loc_idx.item()
+        
+        return action_idx_val, actual_action, loc_idx_val, joint_log_prob.item(), state_value.item()
     
-    def store_transition(self, state, action, reward, log_prob, value):
+    def store_transition(self, state, action, location, reward, log_prob, value):
         """存储单步经验"""
         self.memory['states'].append(state)
         self.memory['actions'].append(action)
+        self.memory['locations'].append(location)
         self.memory['rewards'].append(reward)
         self.memory['log_probs'].append(log_prob)
         self.memory['values'].append(value)
@@ -201,6 +288,7 @@ class PPOAgent:
         # 转换为 tensor
         states = torch.FloatTensor(np.array(self.memory['states'])).to(self.device)
         actions = torch.LongTensor(self.memory['actions']).to(self.device)
+        locations = torch.LongTensor(self.memory['locations']).to(self.device) # 新增
         old_log_probs = torch.FloatTensor(self.memory['log_probs']).to(self.device)
         returns = torch.FloatTensor(returns).to(self.device)
         advantages = torch.FloatTensor(advantages).to(self.device)
@@ -231,45 +319,61 @@ class PPOAgent:
         total_critic_loss = 0
         
         for epoch in range(self.epochs):
-            # 前向传播
-            action_probs, state_values = self.policy(states)
+            # 【关键修复】前向传播时传入真实的 locations
+            # 这样 action head 会看到实际选中的块，而不是三个块的平均
+            action_logits, loc_probs, state_values = self.policy(states, sampled_loc_idx=locations)
             
-            # 数值稳定性检查
-            action_probs = torch.clamp(action_probs, min=1e-8, max=1.0)
-            prob_sum = action_probs.sum(dim=-1, keepdim=True)
-            if (prob_sum == 0).any() or torch.isnan(prob_sum).any():
-                logger.warning("[ppo_agent.py:update]: prob_sum is zero or NaN, skipping this epoch")
+            # 数值稳定性检查（对 logits 和 probs 分别处理）
+            loc_probs = torch.clamp(loc_probs, min=1e-8, max=1.0)
+            
+            loc_prob_sum = loc_probs.sum(dim=-1, keepdim=True)
+            
+            if (loc_prob_sum == 0).any() or torch.isnan(loc_prob_sum).any():
+                logger.warning("[ppo_agent.py:update]: loc_prob_sum is zero or NaN, skipping this epoch")
                 continue
-            action_probs = action_probs / prob_sum  # 重新归一化
-            # logger.info(f"[ppo_agent.py:update]: action_probs: {action_probs}")
-            dist = Categorical(action_probs)
-            new_log_probs = dist.log_prob(actions)
-            entropy = dist.entropy().mean()
+
+            loc_probs = loc_probs / loc_prob_sum  # 重新归一化
             
-            # 计算比率（裁剪防止溢出）
-            log_ratio = new_log_probs - old_log_probs
+            # 3. 构建分布（action 使用 logits，location 使用 probs）
+            dist_action = Categorical(logits=action_logits)  # 使用 logits
+            dist_loc = Categorical(loc_probs)
+
+            # 4. 计算新的联合 Log Prob
+            new_log_probs_act = dist_action.log_prob(actions)
+            new_log_probs_loc = dist_loc.log_prob(locations)
+            new_joint_log_probs = new_log_probs_act + new_log_probs_loc
+
+            # 5. 计算联合熵 (鼓励两个维度都探索)
+            entropy = dist_action.entropy().mean() + dist_loc.entropy().mean()
+            
+            # 6.计算比率（裁剪防止溢出）
+            log_ratio = new_joint_log_probs - old_log_probs
             log_ratio = torch.clamp(log_ratio, -20, 20)  # 防止 exp 溢出
             ratio = torch.exp(log_ratio)
             
-            # PPO 裁剪目标
+            # 7. 计算 Actor Loss
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
             actor_loss = -torch.min(surr1, surr2).mean()
             
-            # 加入熵正则化鼓励探索
+            # 减去熵奖励 (Entropy Bonus)
             actor_loss = actor_loss - 0.02 * entropy  # 提高熵系数到 0.02
             
-            # 更新 Actor
+            # 8. 更新 Actor
             self.actor_optimizer.zero_grad()
             actor_loss.backward(retain_graph=True)  # 保留计算图供 Critic 使用
-            torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(self.policy.context_net.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(self.policy.candidate_net.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(self.policy.location_head.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(self.policy.action_head.parameters(), 0.5)
             self.actor_optimizer.step()
             
-            # Critic 损失（使用 Huber Loss 更鲁棒）
-            # 修复尺寸不匹配问题
+            # 9. 计算 Critic Loss 并更新
             state_values_squeezed = state_values.squeeze()
+
             if state_values_squeezed.dim() == 0:
                 state_values_squeezed = state_values_squeezed.unsqueeze(0)
+            # 尺寸对齐保护
             if state_values_squeezed.shape != returns.shape:
                 # 如果形状不匹配，调整 returns
                 if returns.dim() == 0:
@@ -309,6 +413,7 @@ class PPOAgent:
         self.memory = {
             'states': [],
             'actions': [],
+            'locations': [],
             'rewards': [],
             'values': [],
             'log_probs': []

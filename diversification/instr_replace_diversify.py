@@ -9,6 +9,7 @@ from analysis.visit import *
 from disasm.Types import *
 from utils.ail_utils import *
 from utils.pp_print import *
+from addr_utils import addr_equals, select_block_by_addr
 
 obfs_proportion = 1.0
 
@@ -17,6 +18,7 @@ class instr_replace_diversify(ailVisitor):
 
     def __init__(self, funcs, fb_tbl, cfg_tbl):
         ailVisitor.__init__(self)
+        self.fb_tbl = fb_tbl
 
     @staticmethod
     def bits_of_operation(op):
@@ -165,7 +167,13 @@ class instr_replace_diversify(ailVisitor):
                 return True
         return False
 
-    def instr_replace(self):
+    def instr_replace(self, target_addr=None):
+        """
+        执行等价指令替换
+        
+        如果指定 target_addr，优先在包含该地址的基本块内替换
+        如果未指定或未找到目标基本块，对所有指令进行等价替换
+        """
         # we currently ignore the call and return replacement, they can hurt disassembling process
         # update `add 1, %eax` can meet unknown errors
         fs = [
@@ -176,6 +184,51 @@ class instr_replace_diversify(ailVisitor):
             self.update_shl,
             #self.update_xor
         ]
+        
+        # 如果指定了 target_addr，优先在对应基本块内替换
+        if target_addr is not None:
+            target_block = None
+            for f in self.fb_tbl.keys():
+                bl = self.fb_tbl[f]
+                b, exact = select_block_by_addr(bl, target_addr)
+                if b is None:
+                    continue
+                target_block = b
+                if exact:
+                    print '[instr_replace_diversify.py:instr_replace] Found target_addr: %s (matched with 0x%X)' % (target_addr, b.bblock_begin_loc.loc_addr)
+                else:
+                    print '[instr_replace_diversify.py:instr_replace] Found target_addr: %s inside block (begin=0x%X)' % (target_addr, b.bblock_begin_loc.loc_addr)
+                break
+
+            if target_block is not None:
+                bil = self.bb_instrs(target_block)
+                if len(bil) == 0:
+                    print '[instr_replace_diversify.py:instr_replace] Warning: target block empty, fallback to random'
+                else:
+                    # 优先尝试匹配 target_addr 的指令，否则在该基本块内选择可替换指令
+                    exact_instrs = []
+                    for i in bil:
+                        loc = get_loc(i)
+                        if loc and addr_equals(loc.loc_addr, target_addr):
+                            exact_instrs.append(i)
+                    candidates = exact_instrs if len(exact_instrs) > 0 else bil
+                    found = False
+                    for i in candidates:
+                        for f in fs:
+                            res = f(i)
+                            if res:
+                                found = True
+                                break
+                        if found:
+                            break
+                    if found:
+                        self.update_process()
+                        return
+                    print '[instr_replace_diversify.py:instr_replace] Warning: target_addr %s found but no replaceable instr in block, fallback to random' % target_addr
+            else:
+                print '[instr_replace_diversify.py:instr_replace] Warning: target_addr %s not found, fallback to random' % target_addr
+        
+        # 未指定 target_addr，对所有指令进行等价替换
         for i in self.instrs:
             for f in fs:
                 res = f(i)
@@ -183,8 +236,8 @@ class instr_replace_diversify(ailVisitor):
                     break
         self.update_process()
 
-    def visit(self, instrs):
+    def visit(self, instrs, target_addr = None):
         print 'start instruction replacement ...'
         self.instrs = copy.deepcopy(instrs)
-        self.instr_replace()
+        self.instr_replace(target_addr)
         return self.instrs

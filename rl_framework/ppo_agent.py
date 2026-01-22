@@ -18,51 +18,64 @@ import os
 from collections import deque
 from loguru import logger
 
-class DualHeadPolicyNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=512):
-        super(DualHeadPolicyNetwork, self).__init__()
+class StructuredJointNetwork(nn.Module):
+    def __init__(self, state_dim, n_actions, n_locs, hidden_dim=512):
+        super(StructuredJointNetwork, self).__init__()
         
-        # 定义切片位置 (根据上面的特征工程)
-        self.topk_dim = 32
-        self.num_candidates = 3
-        # 假设前 16+40=56 维是历史+拓扑
-        # 56 到 56+96 是 Top-1/2/3
-        self.start_idx = 56 
+        # === 1. 特征切片定义 (根据 env_wrapper.py) ===
+        # Part 1 (16): History
+        # Part 2 (40): Topology
+        # Part 3 (128): Critical Semantics (Top-3 * 32 + Context)
+        # Part 4 (72): Global Semantics
         
-        # 1. Context Encoder (编码除了 Top-3 以外的所有全局特征)
-        # context_dim = total - (32*3)
-        self.context_dim = state_dim - (self.topk_dim * self.num_candidates)
-        self.context_net = nn.Sequential(
-            nn.Linear(self.context_dim, hidden_dim),
+        self.block_feat_start = 56
+        self.block_feat_end = 152
+        self.block_dim = 32
+        self.num_blocks = 3
+
+        # === 编码器 ===
+        # 块特征编码器（共享权重）
+        self.block_encoder = nn.Sequential(
+            nn.Linear(self.block_dim, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 64),
+            nn.ReLU()
+        )
+        
+        # 全局特征编码器
+        self.global_input_dim = state_dim - (self.block_dim * self.num_blocks)
+        self.global_encoder = nn.Sequential(
+            nn.Linear(self.global_input_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 256),
+            nn.ReLU()
+        )
+        
+        # === 联合决策头 ===
+        self.fusion_dim = 256 + (64 * self.num_blocks)
+
+
+        # ✅ 不加 Softmax，输出 logits
+        self.actor_head = nn.Sequential(
+            nn.Linear(self.fusion_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU()
-        )
-        
-        # 2. Candidate Encoder (编码 Top-1/2/3 每个块的特征)
-        # 这是一个共享权重的层，处理每个候选块
-        self.candidate_net = nn.Sequential(
-            nn.Linear(self.topk_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU()
-        )
-        
-        # 3. Location Head (决定选哪个块)
-        # 输入：Context + 某个Candidate
-        # 输出：Score
-        self.location_head = nn.Sequential(
-            nn.Linear(hidden_dim + hidden_dim // 2, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1) # 给每个块打分
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, n_locs * n_actions)
         )
         
-        # 4. Action Head (决定做什么动作)
-        # 输入：Context + 被选中的Candidate
-        # 【修复】移除 Softmax，让 Categorical 自己处理
-        self.action_head = nn.Sequential(
-            nn.Linear(hidden_dim + hidden_dim // 2, hidden_dim),
+        # Critic
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim)
-            # Softmax 由 Categorical 自动处理，不需要在这里添加
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
         )
         
         # Critic
@@ -88,61 +101,38 @@ class DualHeadPolicyNetwork(nn.Module):
             state_value: [B, 1] 状态价值
         """
         batch_size = state.size(0)
+
+        # 1. 提取特征
+        blocks_raw = state[:, self.block_feat_start:self.block_feat_end]
+        blocks_view = blocks_raw.view(batch_size, self.num_blocks, self.block_dim)
+
+        global_raw = torch.cat([
+            state[:, :self.block_feat_start], 
+            state[:, self.block_feat_end:]
+        ], dim=1)
         
-        # === 1. 拆分数据 ===
-        # 提取 Top-3 Raw Features: [Batch, 3, 32]
-        flat_candidates = state[:, self.start_idx : self.start_idx + 96]
-        candidates = flat_candidates.view(batch_size, 3, 32)
-        print(f"candidates: {candidates.shape}")
-        # 提取 Context: [Batch, Rest]
-        ctx_part1 = state[:, :self.start_idx]
-        ctx_part2 = state[:, self.start_idx + 96:]
-        context_raw = torch.cat([ctx_part1, ctx_part2], dim=1)
-        print(f"context_raw: {context_raw.shape}")
-        # === 2. 编码 ===
-        ctx_emb = self.context_net(context_raw) # [B, Hidden]
-        # 对 3 个候选块分别编码
-        cand_embs = self.candidate_net(candidates) # [B, 3, Hidden/2]
+        # 2. 编码
+        global_emb = self.global_encoder(global_raw)
         
-        # === 3. Location Decision (Attention) ===
-        # 把 Context 扩展后和每个 Candidate 拼接
-        ctx_expanded = ctx_emb.unsqueeze(1).expand(-1, 3, -1) # [B, 3, Hidden]
-        loc_input = torch.cat([ctx_expanded, cand_embs], dim=-1) # [B, 3, Hidden*1.5]
+        block_embs = []
+        for i in range(self.num_blocks):
+            b_emb = self.block_encoder(blocks_view[:, i, :])
+            block_embs.append(b_emb)
         
-        # 计算每个位置的分数
-        loc_scores = self.location_head(loc_input).squeeze(-1) # [B, 3]
+        blocks_concat = torch.cat(block_embs, dim=1)
         
-        # 【修复】更鲁棒的 Masking：使用绝对值和避免正负抵消
-        is_pad = (candidates.abs().sum(dim=-1) < 1e-6)
-        loc_scores = loc_scores.masked_fill(is_pad, -1e9)
-        
-        loc_probs = F.softmax(loc_scores, dim=-1) # [B, 3] -> Location Policy
-        
-        # === 4. Action Decision (条件依赖) ===
-        # 【关键修复】：根据是否传入 sampled_loc_idx 决定使用硬选择还是软注意力
-        if sampled_loc_idx is None:
-            # 推理模式：使用软注意力（加权平均）
-            selected_cand_emb = torch.bmm(loc_probs.unsqueeze(1), cand_embs).squeeze(1) # [B, Hidden/2]
-        else:
-            # 训练模式：使用硬选择（实际采样的块）
-            # sampled_loc_idx: [B], cand_embs: [B, 3, Hidden/2]
-            # 使用 gather 或索引选择
-            batch_indices = torch.arange(batch_size, device=state.device)
-            selected_cand_emb = cand_embs[batch_indices, sampled_loc_idx]  # [B, Hidden/2]
-        
-        # Action Head Input
-        action_input = torch.cat([ctx_emb, selected_cand_emb], dim=-1)
-        action_logits = self.action_head(action_input)  # [B, n_actions] 返回 logits，不是概率
-        
+        # 3. 融合与输出
+        fusion = torch.cat([global_emb, blocks_concat], dim=1)
+        action_logits = self.actor_head(fusion)  # ✅ logits
         state_value = self.critic(state)
         
-        return action_logits, loc_probs, state_value
+        return action_logits, state_value
 
 
 class PPOAgent:
     """PPO 智能体"""
     
-    def __init__(self, state_dim, n_actions=None, n_locs=3, lr=1e-4, gamma=0.99, 
+    def __init__(self, state_dim=256, n_actions=None, n_locs=3, lr=1e-4, gamma=0.99, 
                  epsilon=0.2, epochs=10, device='cpu', action_map=None):
         """
         参数:
@@ -182,103 +172,78 @@ class PPOAgent:
         self.n_locs = n_locs
 
         # 初始化网络
-        self.policy = DualHeadPolicyNetwork(state_dim, self.n_actions, hidden_dim=512).to(self.device)
-        
-        # 分离 Actor 和 Critic 优化器（降低学习率）
-        # 优化器
-        self.actor_optimizer = optim.Adam(
-            list(self.policy.context_net.parameters()) + 
-            list(self.policy.candidate_net.parameters()) + 
-            list(self.policy.action_head.parameters()) + 
-            list(self.policy.location_head.parameters()), 
-            lr=lr
-        )
+        self.policy = StructuredJointNetwork(state_dim, self.n_actions, self.n_locs).to(self.device)
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
 
-        self.critic_optimizer = optim.Adam(self.policy.critic.parameters(), lr=lr * 2)  # Critic 学习稍快
+        self.action_stats = np.zeros((self.n_locs, self.n_actions))
         
         # 经验缓冲
         self.memory = {
             'states': [],
-            'actions': [],
-            'locations': [],
+            'joint_actions': [],
             'rewards': [],
             'values': [],
-            'log_probs': []
+            'log_probs': [],
+            'dones': []
         }
     
     def select_action(self, state, explore=True):
         """
-        选择动作（两阶段采样：先选位置，再选动作）
-        
-        参数:
-            state: 当前状态特征向量
-            explore: 是否探索（训练时为True，测试时为False）
-        
-        返回:
-            action_idx: 动作索引 (0 ~ n_actions-1)
-            actual_action: 实际变异模式 (action_map 中的值)
-            loc_idx_val: 位置索引 (0-2)
-            joint_log_prob: 联合对数概率
-            state_value: 状态价值
+       
         """
         state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         
-        # === 第一阶段：选择位置 ===
         with torch.no_grad():
-            # 只使用 location head（不依赖于具体选中的块）
-            _, loc_probs, _ = self.policy(state, sampled_loc_idx=None)
+            action_logits, state_value = self.policy(state)
         
-        dist_loc = Categorical(loc_probs)
+        dist = Categorical(logits=action_logits)
         
         if explore:
-            loc_idx = dist_loc.sample()
+            joint_action = dist.sample()
         else:
-            loc_idx = torch.argmax(loc_probs, dim=-1)
+            joint_action = torch.argmax(action_logits, dim=-1)
         
-        # === 第二阶段：基于选中的位置选择动作 ===
-        with torch.no_grad():
-            # 传入选中的 location，让 action head 看到真实的块特征
-            action_logits, _, state_value = self.policy(state, sampled_loc_idx=loc_idx)
+        log_prob = dist.log_prob(joint_action)
+        joint_idx = joint_action.item()
         
-        dist_action = Categorical(logits=action_logits)  # 使用 logits 参数
+        # 解码
+        loc_idx = joint_idx // self.n_actions
+        act_idx = joint_idx % self.n_actions
+        actual_action = self.action_map[act_idx]
         
+        # 统计
         if explore:
-            action_idx = dist_action.sample()
-        else:
-            action_idx = torch.argmax(action_logits, dim=-1)
+            self.action_stats[loc_idx, act_idx] += 1
         
-        # 计算联合对数概率：P(location, action | state) = P(location | state) × P(action | state, location)
-        joint_log_prob = dist_loc.log_prob(loc_idx) + dist_action.log_prob(action_idx)
-        
-        action_idx_val = action_idx.item()
-        actual_action = self.action_map[action_idx_val]
-        loc_idx_val = loc_idx.item()
-        
-        return action_idx_val, actual_action, loc_idx_val, joint_log_prob.item(), state_value.item()
+        return joint_idx, loc_idx, act_idx, actual_action, log_prob.item(), state_value.item()
 
     def estimate_value(self, state):
-        """估计单个状态的价值（用于截断回合的 bootstrap）"""
+        """
+        估计单个状态的价值（用于截断回合的 bootstrap）
+        
+        参数:
+            state: 当前状态特征向量
+        
+        返回:
+            value: 状态价值估计
+        """
         state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            _, _, state_value = self.policy(state, sampled_loc_idx=None)
+            _, state_value = self.policy(state)  # 只需要 value，不需要 logits
         return state_value.item()
     
-    def store_transition(self, state, action, location, reward, log_prob, value, done):
-        """存储单步经验"""
+    def store_transition(self, state, joint_action, reward, log_prob, value, done):
         self.memory['states'].append(state)
-        self.memory['actions'].append(action)
-        self.memory['locations'].append(location)
+        self.memory['joint_actions'].append(joint_action)
         self.memory['rewards'].append(reward)
         self.memory['log_probs'].append(log_prob)
         self.memory['values'].append(value)
-        self.memory['dones'].append(done)
+        self.memory['dones'].append(1.0 if done else 0.0)
     
     def compute_returns(self, next_value=0):
         """计算回报（使用 GAE - Generalized Advantage Estimation）"""
         returns = []
         advantages = []
-        
-        R = next_value
         gae = 0
         
         rewards = self.memory['rewards']
@@ -301,9 +266,15 @@ class PPOAgent:
             returns.insert(0, gae + values[i])
             advantages.insert(0, gae)
         
-        # 【正确位置】在这里归一化 Advantage
+        # 在这里归一化 Advantage
         advantages = torch.FloatTensor(advantages).to(self.device)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # ✅ 归一化前检查方差
+        if len(advantages) > 1:
+            adv_std = advantages.std()
+            if adv_std > 1e-8:
+                advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+            else:
+                logger.warning("Advantages方差为0，跳过归一化")
         return returns, advantages
     
     def update(self, next_value=0.0):
@@ -316,134 +287,131 @@ class PPOAgent:
         
         # 转换为 tensor
         states = torch.FloatTensor(np.array(self.memory['states'])).to(self.device)
-        actions = torch.LongTensor(self.memory['actions']).to(self.device)
-        locations = torch.LongTensor(self.memory['locations']).to(self.device) # 新增
+        joint_actions = torch.LongTensor(self.memory['joint_actions']).to(self.device)
         old_log_probs = torch.FloatTensor(self.memory['log_probs']).to(self.device)
         returns = torch.FloatTensor(returns).to(self.device)
-        # advantages = torch.FloatTensor(advantages).to(self.device)
         
-        # 标准化优势（增强数值稳定性）
-        # 检查 advantages 是否包含 NaN
-        if torch.isnan(advantages).any():
-            logger.error(f"[ppo_agent.py:update]: NaN in advantages before normalization: {advantages}")
-            logger.error(f"  returns: {returns}, memory values: {self.memory['values']}")
-        
-        adv_mean = advantages.mean()
-        adv_std = advantages.std()
-        
-        # 检查统计量
-        if torch.isnan(adv_mean) or torch.isnan(adv_std):
-            logger.error(f"[ppo_agent.py:update]: NaN in advantages statistics: mean={adv_mean}, std={adv_std}")
-            logger.error(f"  advantages: {advantages}")
-            # 使用零均值单位方差作为后备
-            advantages = torch.zeros_like(advantages)
-        else:
-            advantages = (advantages - adv_mean) / (adv_std + 1e-8)
-            advantages = torch.clamp(advantages, -10.0, 10.0)  # 裁剪防止极端值
-        
-        total_loss = 0
-        
-        # PPO 多轮更新（分离 Actor 和 Critic 更新）
-        total_actor_loss = 0
-        total_critic_loss = 0
+        total_loss_val = 0
         
         for epoch in range(self.epochs):
-            # 【关键修复】前向传播时传入真实的 locations
-            # 这样 action head 会看到实际选中的块，而不是三个块的平均
-            action_logits, loc_probs, state_values = self.policy(states, sampled_loc_idx=locations)
+            action_logits, state_values = self.policy(states)
             
-            # 数值稳定性检查（对 logits 和 probs 分别处理）
-            loc_probs = torch.clamp(loc_probs, min=1e-8, max=1.0)
+            # ✅ 简单裁剪，不归一化
+            action_logits = torch.clamp(action_logits, -20, 20)
             
-            loc_prob_sum = loc_probs.sum(dim=-1, keepdim=True)
+            # ✅ NaN 检查
+            if torch.isnan(action_logits).any():
+                logger.error(f"Epoch {epoch}: NaN in logits!")
+                self.clear_memory()
+                return 0.0
             
-            if (loc_prob_sum == 0).any() or torch.isnan(loc_prob_sum).any():
-                logger.warning("[ppo_agent.py:update]: loc_prob_sum is zero or NaN, skipping this epoch")
-                continue
+            # ✅ 使用 logits
+            dist = Categorical(logits=action_logits)
+            new_log_probs = dist.log_prob(joint_actions)
+            entropy = dist.entropy().mean()
 
-            loc_probs = loc_probs / loc_prob_sum  # 重新归一化
-            
-            # 3. 构建分布（action 使用 logits，location 使用 probs）
-            dist_action = Categorical(logits=action_logits)  # 使用 logits
-            dist_loc = Categorical(loc_probs)
-
-            # 4. 计算新的联合 Log Prob
-            new_log_probs_act = dist_action.log_prob(actions)
-            new_log_probs_loc = dist_loc.log_prob(locations)
-            new_joint_log_probs = new_log_probs_act + new_log_probs_loc
-
-            # 5. 计算联合熵 (鼓励两个维度都探索)
-            entropy = dist_action.entropy().mean() + dist_loc.entropy().mean()
-            
-            # 6.计算比率（裁剪防止溢出）
-            log_ratio = new_joint_log_probs - old_log_probs
-            log_ratio = torch.clamp(log_ratio, -20, 20)  # 防止 exp 溢出
-            ratio = torch.exp(log_ratio)
-            
-            # 7. 计算 Actor Loss
+           # Actor Loss (PPO Clip)
+            ratio = torch.exp(new_log_probs - old_log_probs)
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
-            actor_loss = -torch.min(surr1, surr2).mean()
             
-            # 减去熵奖励 (Entropy Bonus)
-            # 提高探索强度，防止早期收敛导致训练停滞
-            actor_loss = actor_loss - 0.05 * entropy
+            actor_loss = -torch.min(surr1, surr2).mean() - 0.01 * entropy
             
-            # 8. 更新 Actor
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward(retain_graph=True)  # 保留计算图供 Critic 使用
-            torch.nn.utils.clip_grad_norm_(self.policy.context_net.parameters(), 0.5)
-            torch.nn.utils.clip_grad_norm_(self.policy.candidate_net.parameters(), 0.5)
-            torch.nn.utils.clip_grad_norm_(self.policy.location_head.parameters(), 0.5)
-            torch.nn.utils.clip_grad_norm_(self.policy.action_head.parameters(), 0.5)
-            self.actor_optimizer.step()
-            
-            # 9. 计算 Critic Loss 并更新
-            state_values_squeezed = state_values.squeeze()
+            # Critic Loss
+            state_values_sq = state_values.squeeze()
+            if state_values_sq.dim() == 0:
+                state_values_sq = state_values_sq.unsqueeze(0)
 
-            if state_values_squeezed.dim() == 0:
-                state_values_squeezed = state_values_squeezed.unsqueeze(0)
-            # 尺寸对齐保护
-            if state_values_squeezed.shape != returns.shape:
-                # 如果形状不匹配，调整 returns
-                if returns.dim() == 0:
-                    returns = returns.unsqueeze(0)
-                if state_values_squeezed.shape[0] != returns.shape[0]:
-                    # 取较小的长度
-                    min_len = min(state_values_squeezed.shape[0], returns.shape[0])
-                    state_values_squeezed = state_values_squeezed[:min_len]
-                    returns = returns[:min_len]
+            min_len = min(state_values_sq.shape[0], returns.shape[0])
+            critic_loss = nn.functional.smooth_l1_loss(
+                state_values_sq[:min_len], 
+                returns[:min_len]
+            )
+
+            # 总 Loss
+            loss = actor_loss + 0.5 * critic_loss
             
-            critic_loss = nn.functional.smooth_l1_loss(state_values_squeezed, returns)
+            # ✅ 梯度检查
+            if torch.isnan(loss):
+                logger.error(f"Epoch {epoch}: NaN in loss!")
+                self.clear_memory()
+                return 0.0
             
-            # 检查 critic_loss 是否包含 NaN
-            if torch.isnan(critic_loss):
-                logger.error("[ppo_agent.py:update]: NaN in critic_loss!")
-                logger.error(f"  state_values: {state_values}, returns: {returns}")
-                continue
+
+            # 反向传播
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+            self.optimizer.step()
             
-            # 更新 Critic
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.critic.parameters(), 0.5)
-            self.critic_optimizer.step()
-            
-            total_actor_loss += actor_loss.item()
-            total_critic_loss += critic_loss.item()
-        
-        total_loss = total_actor_loss + total_critic_loss
-        
-        # 清空缓冲
+            total_loss_val += loss.item()
+
         self.clear_memory()
+        return total_loss_val / self.epochs
+
+    def log_action_distribution(self, episode):
+        """
+        诊断工具：分析动作分布
+        用于检测策略是否退化成均匀分布
+        """
+        if episode % 50 != 0 or episode == 0:
+            return
         
-        return total_loss / self.epochs
-    
+        total = self.action_stats.sum()
+        if total < 10:
+            return
+        
+        logger.info("=" * 60)
+        logger.info(f"📊 动作分布分析 (Episode {episode})")
+        logger.info("=" * 60)
+        
+        # 计算熵
+        probs = self.action_stats.flatten() / total
+        probs = probs[probs > 0]
+        entropy = -np.sum(probs * np.log(probs))
+        max_entropy = np.log(self.n_locs * self.n_actions)
+        
+        logger.info(f"策略熵: {entropy:.3f} / {max_entropy:.3f} ({entropy/max_entropy:.1%})")
+        
+        # Top-5 组合
+        flat_indices = np.argsort(self.action_stats.flatten())[::-1][:5]
+        logger.info("\n🏆 Top-5 最常用组合:")
+        for rank, flat_idx in enumerate(flat_indices, 1):
+            loc_idx = flat_idx // self.n_actions
+            act_idx = flat_idx % self.n_actions
+            count = self.action_stats.flatten()[flat_idx]
+            ratio = count / total
+            logger.info(
+                f"  #{rank}: 位置{loc_idx} × 动作{act_idx} "
+                f"(实际动作={self.action_map[act_idx]}) | {ratio:.2%}"
+            )
+        
+        # 位置偏好
+        loc_dist = self.action_stats.sum(axis=1) / total
+        logger.info(f"\n📍 位置选择分布: {loc_dist}")
+        
+        # 动作偏好
+        act_dist = self.action_stats.sum(axis=0) / total
+        logger.info(f"⚡ 动作选择分布: {act_dist}")
+        
+        # 警告
+        if entropy > max_entropy * 0.95:
+            logger.warning("⚠️ 熵过高！策略接近随机选择（可能未收敛）")
+        elif entropy < max_entropy * 0.2:
+            logger.warning("⚠️ 熵过低！策略可能过早收敛到次优解")
+        else:
+            logger.success("✅ 策略熵正常，探索与利用平衡良好")
+        
+        logger.info("=" * 60)
+        
+        # 重置
+        self.action_stats.fill(0)
+
     def clear_memory(self):
         """清空经验缓冲"""
         self.memory = {
             'states': [],
-            'actions': [],
-            'locations': [],
+            'joint_actions': [],
             'rewards': [],
             'values': [],
             'log_probs': [],
@@ -451,102 +419,36 @@ class PPOAgent:
         }
     
     def save(self, path):
-        """保存模型（包含两个优化器）"""
+        """保存模型（完整版）"""
         torch.save({
             'policy_state_dict': self.policy.state_dict(),
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
-            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'action_stats': self.action_stats,
+            'hyperparams': {
+                'gamma': self.gamma,
+                'epsilon': self.epsilon,
+                'epochs': self.epochs
+            }
         }, path)
-        print(f"模型已保存到: {path}")
+        logger.info(f"✅ 模型已保存: {path}")
     
     def load(self, path):
         """加载模型（兼容旧版本）"""
-        if os.path.exists(path):
-            checkpoint = torch.load(path, map_location=self.device)
-            self.policy.load_state_dict(checkpoint['policy_state_dict'])
-            
-            # 兼容旧版本（单优化器）
-            if 'actor_optimizer_state_dict' in checkpoint:
-                self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
-                self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-            elif 'optimizer_state_dict' in checkpoint:
-                print("警告: 加载旧版本模型，优化器状态未完全恢复")
-            
-            print(f"模型已从 {path} 加载")
-        else:
-            print(f"模型文件 {path} 不存在")
-
-
-class RewardShaper:
-    """奖励塑形器：设计更好的奖励函数"""
-    
-    def __init__(self, target_score=0.40):
-        self.target_score = target_score
-        self.best_score = float('inf')
-    
-    def compute_reward(self, score, grad, done, step_count):
-        """
-        计算奖励（改进版：降低尺度，提高稳定性）
+        if not os.path.exists(path):
+            logger.warning(f"❌ 模型文件不存在: {path}")
+            return
         
-        参数:
-            score: 相似度分数（越低越好，目标 < 0.40）
-            grad: 梯度值
-            done: 是否达到目标
-            step_count: 当前步数
+        checkpoint = torch.load(path, map_location=self.device)
         
-        返回:
-            reward: 奖励值（归一化到 [-5, 10] 范围）
-        """
-        # 基础奖励：使用对数缩放，降低极端值
-        # score 从 1.0 → 0.4，reward 从 0 → 6
-        reward = -np.log(score + 0.01) * 2.0  # 对数缩放，更平滑
+        # 加载网络权重
+        self.policy.load_state_dict(checkpoint['policy_state_dict'])
         
-        # 成功奖励（降低到 10）
-        if done and score < self.target_score:
-            reward += 10.0
+        # 加载优化器状态（可选）
+        if 'optimizer_state_dict' in checkpoint:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
-        # 进步奖励（大幅降低系数）
-        if score < self.best_score:
-            improvement = self.best_score - score
-            reward += improvement * 20.0  # 从 100 降低到 20
-            self.best_score = score
-        else:
-            # 如果没有进步，小惩罚
-            reward -= 0.5
+        # 加载统计信息（可选）
+        if 'action_stats' in checkpoint:
+            self.action_stats = checkpoint['action_stats']
         
-        # 移除梯度奖励（前面分析表明梯度信息冗余）
-        
-        # 步数惩罚（降低系数）
-        reward -= step_count * 0.02  # 从 0.05 降低到 0.02
-        
-        # 裁剪奖励到合理范围（收窄范围）
-        reward = np.clip(reward, -5.0, 10.0)
-        
-        return reward
-    
-    def reset(self):
-        """重置最优分数"""
-        self.best_score = float('inf')
-
-
-if __name__ == "__main__":
-    # 测试代码
-    print("PPO Agent 初始化测试...")
-    
-    state_dim = 256  # 特征维度（推荐 64）
-    agent = PPOAgent(state_dim=state_dim, n_actions=6)
-    policy = DualHeadPolicyNetwork(state_dim, 6)
-    
-    # 模拟一个状态（需要是 PyTorch 张量，且带 batch 维度）
-    dummy_state = torch.randn(1, state_dim)  # [1, state_dim]
-    policy.forward(dummy_state)
-    # action_idx, actual_action, loc_idx_val, log_prob, value = agent.select_action(dummy_state)
-    
-    # print(f"选择的动作索引: {action_idx}")
-    # print(f"实际变异模式: {actual_action}")
-    # print(f"位置索引: {loc_idx_val}")
-    # print(f"对数概率: {log_prob:.4f}")
-    # print(f"状态价值: {value:.4f}")
-    
-    # print("\n测试通过! ✓")
 

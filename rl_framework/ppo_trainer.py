@@ -7,7 +7,7 @@ PPO 训练器（直接调用环境）
 import os
 import numpy as np
 import torch
-from ppo_agent import PPOAgent, RewardShaper
+from ppo_agent import PPOAgent
 import argparse
 from loguru import logger
 import sys
@@ -124,17 +124,13 @@ def train_ppo(args):
     
     agent = PPOAgent(
         state_dim=args.state_dim,
-        n_actions=6,
         lr=args.lr,
-        gamma=args.gamma,
-        epsilon=args.epsilon,
         device='cuda' if torch.cuda.is_available() and args.use_gpu else 'cpu'
     )
     
     if args.resume and os.path.exists(args.resume):
         agent.load(args.resume)
     
-    reward_shaper = RewardShaper(target_score=0.40)
     log_file = os.path.join(args.model_dir, 'training_log.txt')
     
     episode_binaries = []
@@ -147,18 +143,17 @@ def train_ppo(args):
     success_count = 0
     best_score = float('inf')
     info = {}  # 初始化 info，避免作用域问题
-
+   
+    global_total_steps = 0 
     try:
         for episode in range(args.episodes):
             logger.info("=" * 60)
             logger.info(f"回合 {episode + 1}/{args.episodes}")
             
             state = env.reset()
-            reward_shaper.reset()
             
             episode_actions = [] 
             initial_score = 1.0 # 【优化】默认初始为1.0，防止第一步没取到score导致计算错误
-            prev_score = initial_score  # 用于 compute_reward_diff
             
             episode_reward = 0
             last_binary_info = None
@@ -166,87 +161,65 @@ def train_ppo(args):
             episode_done = False  # 标记 episode 是否正常结束
             
             for step in range(args.max_steps):
-                action_idx, actual_action, loc_idx_val, log_prob, value = agent.select_action(state, explore=True)
+                global_total_steps += 1 
+
+                joint_idx, loc_idx, act_idx, actual_action, log_prob, value = agent.select_action(state, explore=True)
                 episode_actions.append(actual_action)
                 
                 # 执行动作
-                next_state, reward, done, info = env.step(actual_action, loc_idx_val)
+                next_state, reward, done, info = env.step(actual_action, loc_idx)
                 
-                # 【优化】如果env返回了更准确的初始分（虽然通常是1.0），可在此更新
-                # 但一般对抗攻击默认起点就是相似度1.0，保持1.0即可
-
-                # 奖励塑形：使用差分奖励函数
-                if 'score' in info:
-                    current_score = info['score']
-                    shaped_reward = env.compute_reward_diff(
-                        prev_score,
-                        current_score,
-                        info.get('grad', 0),
-                        invalid_loc=not info.get('loc_valid', True),
-                        no_change=info.get('no_change', False)
-                    )
-                    prev_score = current_score  # 更新前一步分数
-                else:
-                    shaped_reward = reward
-                
-                logger.info(f"  Step {step+1}: Act={actual_action}, R={shaped_reward:.4f}, Sim={info.get('score', 0):.4f}")
-                
-                if step % 5 == 0:
-                    # 记录每步指标 (当前设置：每步都记，如果太慢可改为 if step % 5 == 0)
-                    current_step = episode * args.max_steps + step
-                    writer.add_scalar('Step/Shaped_Reward', shaped_reward, current_step)            # Agent 每做一步动作得到的即时反馈（包含进步分、惩罚分等）。
-                    writer.add_scalar('Step/Critic_Value', value, current_step)                     # Critic 网络（裁判）认为“当前这个状态，未来能拿多少分”。
-                    if 'score' in info:
-                        writer.add_scalar('Step/Similarity_Score', info['score'], current_step)     # 每一步变异后的代码与原代码的相似度。
-
-                # 存储经验
-                agent.store_transition(state, action_idx, loc_idx_val, shaped_reward, log_prob, value)
-                
-                episode_reward += shaped_reward
+                episode_reward += reward
                 state = next_state
                 
+                logger.info(f"  Step {step+1}: Act={actual_action}, R={reward:.4f}, Sim={info.get('score', 0):.4f}")
+                
+                if step % 10 == 0:
+                    # 记录每步指标 (当前设置：每步都记，如果太慢可改为 if step % 5 == 0)
+                    writer.add_scalar('Step/Shaped_Reward', reward, global_total_steps)            # Agent 每做一步动作得到的即时反馈（包含进步分、惩罚分等）。
+                    writer.add_scalar('Step/Critic_Value', value, global_total_steps)                     # Critic 网络（裁判）认为“当前这个状态，未来能拿多少分”。
+                    if 'score' in info:
+                        writer.add_scalar('Step/Similarity_Score', info['score'], global_total_steps)     # 每一步变异后的代码与原代码的相似度。
+
+                # 存储经验
+                agent.store_transition(state, joint_idx, reward, log_prob, value, done)
+ 
                 if 'binary' in info:
                     last_binary_info = {
                         'episode': episode, 'step': step,
-                        'binary': info['binary'], 'score': info.get('score', 1.0)
+                        'binary': info['binary'], 'score': info.get('score', 1.0),
+                        'func': info.get('target_func', 'unknown') # 存一下函数名
                     }
                 
-                # 成功检查（必须在错误处理之前，确保统计被记录）
+                # ✅ 成功检查与错误处理
                 if done:
-                    final_score = info.get('score', 1.0)
-                    is_success = final_score < 0.40
-
-                    # 无论成功失败，都要记录到滑动窗口
-                    success_window.append(1 if is_success else 0)
-                    similarity_drop_window.append(max(0.0, initial_score - final_score))
-
-                    if is_success:
-                        success_count += 1
-                        logger.success(f"🎉 攻破! 目标: {info.get('target_func')} | 分数: {final_score:.4f}")
-                        with open(os.path.join(args.save_path, 'success.log'), 'a') as f:
-                            f.write(f"Ep {episode}, Func: {info.get('target_func')}, Score: {final_score:.4f}\n")
-                    
-                    # 错误处理（在统计记录之后）
                     if info.get('should_reset', False):
-                        logger.warning("⚠️ 错误发生，强制切换目标并重置环境")
+                        logger.warning("⚠️ 错误发生，强制切换目标")
                         should_skip_update = True
-                        # 错误时强制切换目标，避免继续使用有问题的目标
                         state = env.reset(force_switch=True)
-                        reward_shaper.reset()
                     
                     episode_done = True
                     break
             
-            # 如果 max_steps 用完了但 done=False，也要记录（兜底）
-            if not episode_done:
-                final_score = info.get('score', 1.0) if 'score' in info else 1.0
-                is_success = final_score < 0.40
-                success_window.append(1 if is_success else 0)
-                similarity_drop_window.append(max(0.0, initial_score - final_score))
-            
+            # ✅ 统一的统计逻辑
+            # 1. 统计成功率和降分 (使用 last_binary_info 更安全)
+            final_score = last_binary_info['score'] if last_binary_info else 1.0
+            target_func = last_binary_info['func'] if last_binary_info else "unknown"
+
+            is_success = final_score < 0.40
+            success_window.append(1 if is_success else 0)
+            similarity_drop_window.append(max(0.0, initial_score - final_score))
+
+            if is_success:
+                success_count += 1
+                logger.success(f"🎉 攻破! 目标: {info.get('target_func')} | 分数: {final_score:.4f}")
+                with open(os.path.join(args.save_path, 'success.log'), 'a') as f:
+                    f.write(f"Ep {episode}, Func: {info.get('target_func')}, Score: {final_score:.4f}\n")
+
             if last_binary_info:
                 episode_binaries.append(last_binary_info)
-            
+
+            # 2. 如果出错跳过更新
             if should_skip_update:
                 agent.clear_memory()
                 continue
@@ -258,6 +231,9 @@ def train_ppo(args):
             
             # PPO 更新
             loss = agent.update(next_value=next_value)
+
+            # 打印动作分布
+            agent.log_action_distribution(episode)
             
             # === Episode 级别记录 (核心) ===
             current_success_rate = np.mean(success_window) if success_window else 0.0

@@ -172,7 +172,6 @@ def train_ppo(args):
                 episode_reward += reward
                 state = next_state
                 
-                logger.info(f"  Step {step+1}: Act={actual_action}, R={reward:.4f}, Sim={info.get('score', 0):.4f}")
                 
                 if step % 10 == 0:
                     # 记录每步指标 (当前设置：每步都记，如果太慢可改为 if step % 5 == 0)
@@ -291,8 +290,8 @@ if __name__ == "__main__":
     parser.add_argument('--gamma', type=float, default=0.95)
     parser.add_argument('--epsilon', type=float, default=0.2)
     parser.add_argument('--episodes', type=int, default=2000)
-    parser.add_argument('--max-steps', type=int, default=100)
-    parser.add_argument('--save-interval', type=int, default=10)
+    parser.add_argument('--max-steps', type=int, default=30)
+    parser.add_argument('--save-interval', type=int, default=5)
     parser.add_argument('--sample-hold-interval', type=int, default=10)
     parser.add_argument('--model-dir', default='./rl_models')
     parser.add_argument('--resume', default=None)

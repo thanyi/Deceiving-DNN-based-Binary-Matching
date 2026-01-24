@@ -353,6 +353,7 @@ class PPOAgent:
         """
         诊断工具：分析动作分布
         用于检测策略是否退化成均匀分布
+        输出写入 log/action_distribution.log 文件
         """
         if episode % 50 != 0 or episode == 0:
             return
@@ -361,48 +362,55 @@ class PPOAgent:
         if total < 10:
             return
         
-        logger.info("=" * 60)
-        logger.info(f"📊 动作分布分析 (Episode {episode})")
-        logger.info("=" * 60)
+        # 确定日志文件路径
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log')
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, 'action_distribution.log')
         
-        # 计算熵
-        probs = self.action_stats.flatten() / total
-        probs = probs[probs > 0]
-        entropy = -np.sum(probs * np.log(probs))
-        max_entropy = np.log(self.n_locs * self.n_actions)
-        
-        logger.info(f"策略熵: {entropy:.3f} / {max_entropy:.3f} ({entropy/max_entropy:.1%})")
-        
-        # Top-5 组合
-        flat_indices = np.argsort(self.action_stats.flatten())[::-1][:5]
-        logger.info("\n🏆 Top-5 最常用组合:")
-        for rank, flat_idx in enumerate(flat_indices, 1):
-            loc_idx = flat_idx // self.n_actions
-            act_idx = flat_idx % self.n_actions
-            count = self.action_stats.flatten()[flat_idx]
-            ratio = count / total
-            logger.info(
-                f"  #{rank}: 位置{loc_idx} × 动作{act_idx} "
-                f"(实际动作={self.action_map[act_idx]}) | {ratio:.2%}"
-            )
-        
-        # 位置偏好
-        loc_dist = self.action_stats.sum(axis=1) / total
-        logger.info(f"\n📍 位置选择分布: {loc_dist}")
-        
-        # 动作偏好
-        act_dist = self.action_stats.sum(axis=0) / total
-        logger.info(f"⚡ 动作选择分布: {act_dist}")
-        
-        # 警告
-        if entropy > max_entropy * 0.95:
-            logger.warning("⚠️ 熵过高！策略接近随机选择（可能未收敛）")
-        elif entropy < max_entropy * 0.2:
-            logger.warning("⚠️ 熵过低！策略可能过早收敛到次优解")
-        else:
-            logger.success("✅ 策略熵正常，探索与利用平衡良好")
-        
-        logger.info("=" * 60)
+        # 写入文件（追加模式）
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write("=" * 60 + "\n")
+            f.write(f"📊 动作分布分析 (Episode {episode})\n")
+            f.write("=" * 60 + "\n")
+            
+            # 计算熵
+            probs = self.action_stats.flatten() / total
+            probs = probs[probs > 0]
+            entropy = -np.sum(probs * np.log(probs))
+            max_entropy = np.log(self.n_locs * self.n_actions)
+            
+            f.write(f"策略熵: {entropy:.3f} / {max_entropy:.3f} ({entropy/max_entropy:.1%})\n")
+            
+            # Top-5 组合
+            flat_indices = np.argsort(self.action_stats.flatten())[::-1][:5]
+            f.write("\n🏆 Top-5 最常用组合:\n")
+            for rank, flat_idx in enumerate(flat_indices, 1):
+                loc_idx = flat_idx // self.n_actions
+                act_idx = flat_idx % self.n_actions
+                count = self.action_stats.flatten()[flat_idx]
+                ratio = count / total
+                f.write(
+                    f"  #{rank}: 位置{loc_idx} × 动作{act_idx} "
+                    f"(实际动作={self.action_map[act_idx]}) | {ratio:.2%}\n"
+                )
+            
+            # 位置偏好
+            loc_dist = self.action_stats.sum(axis=1) / total
+            f.write(f"\n📍 位置选择分布: {loc_dist}\n")
+            
+            # 动作偏好
+            act_dist = self.action_stats.sum(axis=0) / total
+            f.write(f"⚡ 动作选择分布: {act_dist}\n")
+            
+            # 警告
+            if entropy > max_entropy * 0.95:
+                f.write("⚠️ 熵过高！策略接近随机选择（可能未收敛）\n")
+            elif entropy < max_entropy * 0.2:
+                f.write("⚠️ 熵过低！策略可能过早收敛到次优解\n")
+            else:
+                f.write("✅ 策略熵正常，探索与利用平衡良好\n")
+            
+            f.write("=" * 60 + "\n\n")
         
         # 重置
         self.action_stats.fill(0)
@@ -452,3 +460,6 @@ class PPOAgent:
             self.action_stats = checkpoint['action_stats']
         
 
+if __name__ == "__main__":
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log')
+    print(log_dir)

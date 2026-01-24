@@ -656,7 +656,9 @@ class BinaryPerturbationEnv:
             mutated_binary: 变异后的二进制文件路径
         """
         try:
-            logger.info("Applying mutation {} to {}".format(action, seed_binary))
+            # 记录调用时的 step_count，用于调试
+            current_step = getattr(self, 'step_count', 'unknown')
+            logger.info("Applying mutation {} to {} (step={})".format(action, os.path.basename(seed_binary), current_step))
             
             # 确保输出目录存在
             output_dir = '/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/rl_output'
@@ -799,6 +801,7 @@ class BinaryPerturbationEnv:
 
         # 应用变异
         mutated_binary, hash_val = self.apply_mutation(self.current_binary, action, target_addr)
+        logger.info(f"[step] apply_mutation returned, step={self.step_count}")
         # input("press enter to continue")
         if mutated_binary is None:
             # 变异失败：标记需要重置环境并切换文件
@@ -843,7 +846,7 @@ class BinaryPerturbationEnv:
         # reward = self.compute_reward(score, grad)
         
         # 判断是否完成
-        done = score < self.target_score or self.step_count >= 50
+        done = score < self.target_score or self.step_count >= 30
         
         info = {
             'score': score,
@@ -856,9 +859,9 @@ class BinaryPerturbationEnv:
             'score_delta': score_delta
         }
         
-        logger.info("Step {}: action={}, score={:.4f}, reward={:.4f}".format(
-            self.step_count, action, score, reward
-        ))
+        # logger.info("Step {}: action={}, score={:.4f}, reward={:.4f}".format(
+        #     self.step_count, action, score, reward
+        # ))
         
         return state, reward, done, info
     

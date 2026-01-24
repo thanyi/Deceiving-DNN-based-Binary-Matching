@@ -130,6 +130,25 @@ class BinaryPerturbationEnv:
             'penalty': 1.0        # 惩罚权重
         }
         
+        # 记录每个样本的历史成功率
+        # 格式: {sample_id: deque(maxlen=10)}
+        from collections import deque
+        self.sample_history = {}
+
+        # 记录每个样本的权重 (用于采样)
+        # 初始权重都为 1.0
+        self.sample_weights = np.ones(len(self.dataset))
+
+        # 建立索引映射 (index -> sample_id) 以便更新权重
+        self.idx_to_id = {}
+        for idx, item in enumerate(self.dataset):
+            s_id = f"{item['binary_name']}::{item['func_name']}::{item['version']}"
+            self.idx_to_id[idx] = s_id
+            self.sample_history[s_id] = deque(maxlen=10) # 只看最近10次
+
+        self.current_sample_idx = 0 # 追踪当前样本在数据集中的索引
+        self.current_difficulty = 0.5
+
         logger.info(f"Environment initialized (Hold Strategy: {self.sample_hold_interval} eps)")
     
     def set_state_dim(self, state_dim):
@@ -797,8 +816,6 @@ class BinaryPerturbationEnv:
             logger.debug(f"Location index {loc_idx} invalid or no critical blocks ({len(self.current_critical_blocks) if self.current_critical_blocks else 0}), falling back to random.")
             pass
 
-
-
         # 应用变异
         mutated_binary, hash_val = self.apply_mutation(self.current_binary, action, target_addr)
         logger.info(f"[step] apply_mutation returned, step={self.step_count}")
@@ -847,7 +864,7 @@ class BinaryPerturbationEnv:
         
         # 判断是否完成
         done = score < self.target_score or self.step_count >= 30
-        
+
         info = {
             'score': score,
             'grad': grad,
@@ -859,54 +876,73 @@ class BinaryPerturbationEnv:
             'score_delta': score_delta
         }
         
-        # logger.info("Step {}: action={}, score={:.4f}, reward={:.4f}".format(
-        #     self.step_count, action, score, reward
-        # ))
+        # === 核心修改：更新难度权重 ===
+        if done:
+            s_id = self.idx_to_id[self.current_sample_idx]
+            final_score = info.get('score', 1.0)
+            is_success = 1 if final_score < self.target_score else 0
+            
+            # 1. 更新历史记录
+            self.sample_history[s_id].append(is_success)
+            
+            # 2. 动态更新采样权重
+            # 如果失败了(0)，难度增加，权重增加
+            # 如果成功了(1)，难度降低，权重降低
+            # 公式：Weight = 1.0 + (1.0 - SuccessRate) * 2.0
+            # 最难样本权重 = 3.0，最易样本权重 = 1.0
+            
+            history = self.sample_history[s_id]
+            current_rate = sum(history) / len(history)
+            new_weight = 1.0 + (1.0 - current_rate) * 2.0
+            
+            # 更新到全局权重数组
+            self.sample_weights[self.current_sample_idx] = new_weight
+
         
         return state, reward, done, info
     
-    def compute_reward_diff(self, prev_score, current_score, grad, invalid_loc=False, no_change=False):
-        """
-        差分奖励函数：适合多样本训练
-        """
-        # 防御：确保 best_score 初始化
-        if self.best_score is None:
-            self.best_score = prev_score
+    # def compute_reward_diff(self, prev_score, current_score, grad, invalid_loc=False, no_change=False):
+    #     """
+    #     差分奖励函数：适合多样本训练
+    #     """
+    #     # 防御：确保 best_score 初始化
+    #     if self.best_score is None:
+    #         self.best_score = prev_score
 
-        # 1. 进步奖励 (关键)：分数下降了多少
-        improvement = prev_score - current_score
+    #     # 1. 进步奖励 (关键)：分数下降了多少
+    #     improvement = prev_score - current_score
         
-        # 如果进步了，给正奖励；退步了，给负奖励
-        # 放大系数 20，让 Agent 对微小的进步也敏感
-        reward = improvement * 20.0
+    #     # 如果进步了，给正奖励；退步了，给负奖励
+    #     # 放大系数 20，让 Agent 对微小的进步也敏感
+    #     reward = improvement * 20.0
         
-        # 2. 成功奖励 (Jackpot)
-        if current_score < self.target_score:
-            reward += 50.0 
+    #     # 2. 成功奖励 (Jackpot)
+    #     if current_score < self.target_score:
+    #         reward += 50.0 
 
-        # 3. 历史最优奖励：鼓励持续突破，而不是只盯着上一步
-        if current_score < self.best_score:
-            best_improvement = self.best_score - current_score
-            reward += 5.0 + best_improvement * 30.0
-            self.best_score = current_score
+    #     # 3. 历史最优奖励：鼓励持续突破，而不是只盯着上一步
+    #     if current_score < self.best_score:
+    #         best_improvement = self.best_score - current_score
+    #         reward += 5.0 + best_improvement * 30.0
+    #         self.best_score = current_score
 
-        # 4. 停滞惩罚：分数几乎不变时给额外负反馈，防止奖励塌缩
-        if no_change or abs(improvement) < self.no_change_eps:
-            reward -= self.no_change_penalty
-        elif improvement < 0:
-            # 小幅退步额外惩罚，拉开正负差距
-            reward -= 0.1
+    #     # 4. 停滞惩罚：分数几乎不变时给额外负反馈，防止奖励塌缩
+    #     if no_change or abs(improvement) < self.no_change_eps:
+    #         reward -= self.no_change_penalty
+    #     elif improvement < 0:
+    #         # 小幅退步额外惩罚，拉开正负差距
+    #         reward -= 0.1
         
-        # 4.5 无效位置惩罚：location 无效时显式惩罚
-        if invalid_loc:
-            reward -= self.invalid_loc_penalty
+    #     # 4.5 无效位置惩罚：location 无效时显式惩罚
+    #     if invalid_loc:
+    #         reward -= self.invalid_loc_penalty
         
-        # 5. 步数惩罚 (Time Penalty)
-        reward -= 0.1
+    #     # 5. 步数惩罚 (Time Penalty)
+    #     reward -= 0.1
         
-        # 【修复】限制奖励范围，防止梯度爆炸
-        reward = np.clip(reward, -25.0, 60.0) 
-        return reward
+    #     # 【修复】限制奖励范围，防止梯度爆炸
+    #     reward = np.clip(reward, -25.0, 60.0) 
+    #     return reward
 
 
 
@@ -922,22 +958,19 @@ class BinaryPerturbationEnv:
         if diff > 0:  # 进步
             # 分段权重：越难的区域给越高奖励
             if current_score > 0.7:
-                scale = 15.0
+                scale = 12.0
             elif current_score > 0.5:
-                scale = 25.0
+                scale = 16.0
             elif current_score > 0.42:
-                scale = 40.0
+                scale = 20.0
             else:
-                scale = 60.0  # 临门一脚最重要
+                scale = 24.0  # 临门一脚最重要
             
             incremental = diff * scale
         
         elif diff < 0:  # 退步
             # 惩罚轻一点，鼓励探索
-            incremental = diff * 8.0
-
-        else:  # 完全没变化
-            incremental = -0.5
+            incremental = diff * 12.0 
 
         total_reward += incremental * self.reward_weights['incremental']
 
@@ -947,14 +980,17 @@ class BinaryPerturbationEnv:
 
         # === 3. 终极成功奖励 ===
         if current_score < 0.40:
-            # 基础 50 + 质量加成 + 效率加成
-            base_reward = 50.0
-            quality_bonus = (0.40 - current_score) * 100
-            efficiency_bonus = max(0, (50 - step_count) * 0.5)
+            # 基础 10 + 质量加成 + 效率加成
+            base_reward = 10.0
+            quality_bonus = (0.40 - current_score) * 50
+            efficiency_bonus = max(0, (50 - step_count) * 0.5)      # max_step - step_count
             
             ultimate = base_reward + quality_bonus + efficiency_bonus
-            total_reward += ultimate * self.reward_weights['ultimate']
 
+            difficulty_bonus = 30.0 * self.current_difficulty
+            total_reward += ultimate * self.reward_weights['ultimate'] + difficulty_bonus
+            if difficulty_bonus > 15.0:
+                logger.info(f"💎 攻克难题! 基础:{ultimate:.1f} + 难度加成:{difficulty_bonus:.1f}")
 
         # === 4. 显式惩罚 ===
         penalty = 0.0
@@ -971,15 +1007,31 @@ class BinaryPerturbationEnv:
         # 只是防止极端值，不改变奖励的相对大小关系
         return np.clip(total_reward, -10.0, 150.0)
 
-    # def reset(self):
-    #     """重置环境"""
-    #     self.current_binary = self.original_binary
-    #     self.mutation_history = []
-    #     self.step_count = 0
-        
-    #     # 提取初始特征
-    #     state = self.extract_features(self.original_binary)
-    #     return state
+    def _switch_next_target(self):
+        """
+        [辅助函数] 根据难度权重采样下一个目标
+        """
+        # 权重归一化成概率
+        probs = self.sample_weights / np.sum(self.sample_weights)
+        # 按概率抽取索引
+        self.current_sample_idx = np.random.choice(len(self.dataset), p=probs)
+        self.current_sample_data = self.dataset[self.current_sample_idx]
+
+        self.episodes_on_current = 0
+
+        # 计算当前难度 (1.0 - 成功率)
+        s_id = self.idx_to_id[self.current_sample_idx]
+        history = self.sample_history[s_id]
+        if len(history) > 0:
+            success_rate = sum(history) / len(history)
+            self.current_difficulty = 1.0 - success_rate
+            # 保护：最低难度设为 0.1，防止完全不被采样
+            self.current_difficulty = max(0.1, self.current_difficulty)
+        else:
+            self.current_difficulty = 0.5 # 新样本默认中等难度
+
+        self.original_binary = self.current_sample_data['binary_path']
+        self.function_name = self.current_sample_data['func_name']
 
     def reset(self, force_switch=False):
         """
@@ -990,22 +1042,12 @@ class BinaryPerturbationEnv:
         """
         # 强制切换（错误恢复）：忽略 Hold-N 策略，直接切换目标
         if force_switch:
-            self.current_sample_data = random.choice(self.dataset)
-            self.episodes_on_current = 0
-            self.original_binary = self.current_sample_data['binary_path']
-            self.function_name = self.current_sample_data['func_name']
+            self._switch_next_target()
             logger.warning(f"🔄 FORCE SWITCH (Error Recovery) -> {os.path.basename(self.original_binary)}::{self.function_name}")
             logger.info(f"   Version: {self.current_sample_data.get('version')} | Opt: {self.current_sample_data.get('opt_level')}")
         # 正常切换：检查是否需要切换目标
         elif self.current_sample_data is None or self.episodes_on_current >= self.sample_hold_interval:
-            # 随机抽取一个新样本
-            self.current_sample_data = random.choice(self.dataset)
-            self.episodes_on_current = 0
-            
-            # 更新环境配置
-            self.original_binary = self.current_sample_data['binary_path']
-            self.function_name = self.current_sample_data['func_name']
-            
+            self._switch_next_target()
             logger.success(f"🔄 SWITCH TARGET -> {os.path.basename(self.original_binary)}::{self.function_name}")
             logger.info(f"   Version: {self.current_sample_data.get('version')} | Opt: {self.current_sample_data.get('opt_level')}")
         else:
@@ -1049,35 +1091,6 @@ class BinaryPerturbationEnv:
             'cache_misses': self._cache_misses,
             'hit_rate': hit_rate
         }
-
-# if __name__ == "__main__":
-#     # 测试用例
-#     import argparse
-    
-#     parser = argparse.ArgumentParser(description='Binary Perturbation Environment')
-#     parser.add_argument('--binary', required=True, help='Original binary path')
-#     parser.add_argument('--function', required=True, help='Target function name')
-#     parser.add_argument('--save-path', required=True, help='Save path for mutations')
-    
-#     args = parser.parse_args()
-    
-#     env = BinaryPerturbationEnv(
-#         original_binary=args.binary,
-#         function_name=args.function,
-#         save_path=args.save_path
-#     )
-    
-#     logger.info("Environment initialized successfully")
-    
-#     # 测试重置
-#     state = env.reset()
-#     logger.info("Initial state shape: {}".format(len(state)))
-    
-#     # 测试单步
-#     logger.info("Testing mutation with action=5...")
-#     next_state, reward, done, info = env.step(5)
-#     logger.info("Score: {:.4f}, Reward: {:.4f}".format(info.get('score', 0), reward))
-
 
 if __name__ == '__main__':
     bin_path = '/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/coreutils/bin/coreutils-8.15-O0/sort'

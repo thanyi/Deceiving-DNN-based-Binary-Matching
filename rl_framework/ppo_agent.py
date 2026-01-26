@@ -58,31 +58,26 @@ class StructuredJointNetwork(nn.Module):
         # === 联合决策头 ===
         self.fusion_dim = 256 + (64 * self.num_blocks)
 
-
         # ✅ 不加 Softmax，输出 logits
         self.actor_head = nn.Sequential(
             nn.Linear(self.fusion_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, n_locs * n_actions)
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, n_locs * n_actions)
         )
         
-        # Critic
+        # Critic：使用与 actor 相同的融合表征，增加一层表达能力
         self.critic = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
+            nn.Linear(self.fusion_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
-        )
-        
-        # Critic
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, state, sampled_loc_idx=None):
@@ -124,7 +119,7 @@ class StructuredJointNetwork(nn.Module):
         # 3. 融合与输出
         fusion = torch.cat([global_emb, blocks_concat], dim=1)
         action_logits = self.actor_head(fusion)  # ✅ logits
-        state_value = self.critic(state)
+        state_value = self.critic(fusion)
         
         return action_logits, state_value
 

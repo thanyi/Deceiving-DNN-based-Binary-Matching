@@ -9,8 +9,8 @@ import re
 import numpy as np
 from loguru import logger
 
-# def print(message):
-#     pass
+def print(message):
+    pass
 
 # 全局寄存器定义
 X86_GP_REGS = {
@@ -65,15 +65,29 @@ class RadareACFGExtractor:
         print(f"seek_cmd: {seek_cmd}")
 
         func_info = self.r2.cmdj('afij')
+        # 检查 func_info 是否为空
+        if not func_info or len(func_info) == 0:
+            print(f"func_info is empty after seek, function_name: {function_name}, function_addr: {function_addr}")
+            # 尝试分析函数
+            self.r2.cmd('af')
+            func_info = self.r2.cmdj('afij')
+            if not func_info or len(func_info) == 0:
+                print(f"func_info is still empty after 'af', function_name: {function_name}, function_addr: {function_addr}")
+                return None
+        
         # 没有识别到函数，进入entry0
         if func_info[0].get('name') == 'entry0':
-            # print(f"func_info.get('name') == 'entry0', function_name: {function_name}, function_addr: {function_addr}")
+            print(f"func_info.get('name') == 'entry0', function_name: {function_name}, function_addr: {function_addr}")
             if function_name is not None and function_addr is None:
                 function_name = 'sym.' + function_name
                 print(f"[r2_acfg_features.py:RadareACFGExtractor:get_acfg_features] function_name: {function_name}")
                 seek_cmd = f's {function_name}'
                 if seek_cmd: self.r2.cmd(seek_cmd)
                 func_info = self.r2.cmdj('afij')
+                # 检查重新获取的 func_info 是否为空
+                if not func_info or len(func_info) == 0:
+                    print(f"func_info is empty after 'sym.' retry, function_name: {function_name}, function_addr: {function_addr}")
+                    return None
             else:
                 return None
 

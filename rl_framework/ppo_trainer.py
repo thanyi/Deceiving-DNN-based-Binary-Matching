@@ -15,6 +15,7 @@ import shutil
 import glob
 from collections import deque
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 # 导入环境
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -102,6 +103,59 @@ def train_ppo(args):
     """
     PPO 训练主函数
     """
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    log_dir = os.path.join(project_root, 'log')
+    os.makedirs(log_dir, exist_ok=True)
+    train_log_path = os.path.join(log_dir, 'train.log')
+
+    def _console_log_filter(record):
+        level = record["level"].name
+        if level in ("WARNING", "ERROR", "CRITICAL", "SUCCESS"):
+            return True
+        if record["name"] != "ppo_trainer":
+            return False
+        msg = record["message"]
+        return (
+            msg.startswith("PPO 训练启动") or
+            msg.startswith("数据集:") or
+            msg.startswith("保存路径:") or
+            msg.startswith("TensorBoard:") or
+            msg.startswith("回合总结:")
+        )
+
+    def _file_log_filter(record):
+        level = record["level"].name
+        if level in ("WARNING", "ERROR", "CRITICAL", "SUCCESS"):
+            return True
+        name = record["name"]
+        msg = record["message"]
+        if name == "ppo_trainer":
+            return (
+                msg.startswith("PPO 训练启动") or
+                msg.startswith("数据集:") or
+                msg.startswith("保存路径:") or
+                msg.startswith("TensorBoard:") or
+                msg.startswith("回合总结:") or
+                "训练结束" in msg
+            )
+        if name == "ppo_agent" and msg.startswith("✅ 模型已保存"):
+            return True
+        return False
+
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level="INFO",
+        filter=_console_log_filter,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+    )
+    logger.add(
+        train_log_path,
+        level="INFO",
+        filter=_file_log_filter,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+    )
+
     logger.info("PPO 训练启动 (Multi-Sample Mode)")
     logger.info(f"数据集: {args.dataset}")
     logger.info(f"保存路径: {args.save_path}")
@@ -117,14 +171,16 @@ def train_ppo(args):
     env = BinaryPerturbationEnv(
         save_path=args.save_path,
         dataset_path=args.dataset,
-        sample_hold_interval=args.sample_hold_interval # Hold-N 策略
-        
+        sample_hold_interval=args.sample_hold_interval, # Hold-N 策略
+        max_steps=args.max_steps
     )
     env.set_state_dim(args.state_dim)
     
     agent = PPOAgent(
         state_dim=args.state_dim,
         lr=args.lr,
+        gamma=args.gamma,
+        epsilon=args.epsilon,
         device='cuda' if torch.cuda.is_available() and args.use_gpu else 'cpu'
     )
     
@@ -146,6 +202,7 @@ def train_ppo(args):
    
     global_total_steps = 0 
     try:
+        pbar = tqdm(total=args.episodes, desc="Training", unit="ep", dynamic_ncols=True)
         for episode in range(args.episodes):
             logger.info("=" * 60)
             logger.info(f"回合 {episode + 1}/{args.episodes}")
@@ -168,7 +225,7 @@ def train_ppo(args):
                 
                 # 执行动作
                 next_state, reward, done, info = env.step(actual_action, loc_idx)
-                
+                # input("step down, press enter to continue")
                 episode_reward += reward
                 state = next_state
                 
@@ -221,6 +278,7 @@ def train_ppo(args):
             # 2. 如果出错跳过更新
             if should_skip_update:
                 agent.clear_memory()
+                pbar.update(1)
                 continue
             
             # 截断回合时做 bootstrap
@@ -238,7 +296,7 @@ def train_ppo(args):
             current_success_rate = np.mean(success_window) if success_window else 0.0
             avg_drop = np.mean(similarity_drop_window) if similarity_drop_window else 0.0
             
-            logger.info(f"回合总结: 总奖={episode_reward:.2f} | 滑动成功率={current_success_rate:.2f} | 平均降分={avg_drop:.2f}")
+            logger.success(f"回合总结: 总奖={episode_reward:.2f} | 滑动成功率={current_success_rate:.2f} | 平均降分={avg_drop:.2f} | 步数={step+1} | 目标函数={target_func} | 目标二进制={last_binary_info['binary'] if last_binary_info else 'N/A'}")
             
             writer.add_scalar('Main/Success_Rate_MA50', current_success_rate, episode)      # 最近 50 个回合中，成功绕过检测（分数 < 0.4）的比例。
             writer.add_scalar('Main/Similarity_Drop_MA50', avg_drop, episode)               # 最近 50 个回合中，平均把相似度降低了多少（初始分 1.0 - 最终分）
@@ -246,6 +304,8 @@ def train_ppo(args):
             writer.add_scalar('Main/Episode_Length', step + 1, episode)                      # 一个回合内总共执行了多少步。
             writer.add_histogram('Debug/Action_Distribution', np.array(episode_actions), episode)   # 在当前回合中，Agent 选择了哪些变异动作（Action 0-5）。
             writer.add_scalar('Debug/Policy_Loss', loss, episode)                           # PPO 算法更新时的 Loss 值。
+            pbar.set_postfix_str(f"sr={current_success_rate:.2f} drop={avg_drop:.2f} loss={loss:.2f}")
+            pbar.update(1)
             
             # 写日志文件
             with open(log_file, 'a') as f:
@@ -267,6 +327,8 @@ def train_ppo(args):
         logger.warning("训练中断")
     
     finally:
+        if 'pbar' in locals():
+            pbar.close()
         agent.save(os.path.join(args.model_dir, 'ppo_model_final.pt'))
         writer.close()
         
@@ -289,9 +351,9 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--gamma', type=float, default=0.95)
     parser.add_argument('--epsilon', type=float, default=0.2)
-    parser.add_argument('--episodes', type=int, default=2000)
+    parser.add_argument('--episodes', type=int, default=6000)
     parser.add_argument('--max-steps', type=int, default=30)
-    parser.add_argument('--save-interval', type=int, default=5)
+    parser.add_argument('--save-interval', type=int, default=50)
     parser.add_argument('--sample-hold-interval', type=int, default=10)
     parser.add_argument('--model-dir', default='./rl_models')
     parser.add_argument('--resume', default=None)

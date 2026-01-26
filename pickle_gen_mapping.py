@@ -33,7 +33,7 @@ def gen_seed(s):
                 logger.warning("[pickle_gen_mapping.py:gen_seed]: Symbol '{}' maps to '{}' but not found in s[0]. Skipping.".format(symbol, new_symbol))
                 continue
             addr = s[0][new_symbol].upper().replace('X','x')
-            addr = normalize_addr(addr)  # ✅ 规范化地址格式
+            addr = normalize_addr(addr)  # 规范化地址格式
             sym_to_addr[symbol] = addr
             sym_to_cur_sym[symbol] = new_symbol
         except KeyError as e:
@@ -60,25 +60,33 @@ def gen_mutated(sym_to_addr,sym_to_cur_sym,failure_seed,s):
     logger.debug("[pickle_gen_mapping.py:gen_mutated]: s[3] sample = {}".format(list(s[3])))
     logger.debug("[pickle_gen_mapping.py:gen_mutated]: s[3] total keys = {}".format(len(s[3])))
     
+    success_count = 0
     for symbol in sym_to_addr.keys():
         old_addr = sym_to_addr[symbol]
         # ✅ 规范化地址格式：去除前导零 (0x0000000004049D6 -> 0x4049D6)
         old_addr = normalize_addr(old_addr)
-        logger.debug("[pickle_gen_mapping.py:gen_mutated]: old_addr = {} (normalized)".format(old_addr))
+        # 【日志优化】注释掉每个符号的详细日志，避免日志爆炸（36000+ 条）
+        # logger.debug("[pickle_gen_mapping.py:gen_mutated]: old_addr = {} (normalized)".format(old_addr))
         try:
             new_symbol = s[3][old_addr]
             addr = s[0][new_symbol].upper().replace('X','x')
             addr = normalize_addr(addr)  # ✅ 规范化新地址格式
             sym_to_addr[symbol] = addr
             sym_to_cur_sym[symbol] = new_symbol
-            logger.debug("[pickle_gen_mapping.py:gen_mutated]: SUCCESS: {} => {} => {}".format(symbol, old_addr, new_symbol))
+            success_count += 1
+            # 【日志优化】注释掉每个符号的成功日志，只保留失败日志
+            # logger.debug("[pickle_gen_mapping.py:gen_mutated]: SUCCESS: {} => {} => {}".format(symbol, old_addr, new_symbol))
         except Exception as e:
             failure.append(symbol)
+            # 【保留】FAILURE 日志很重要，需要调试时知道哪里出错
             logger.warning("[pickle_gen_mapping.py:gen_mutated]: FAILURE: {} (old_addr={}) - {}".format(symbol, old_addr, str(e)))
     for symbol in failure:
         tmp = sym_to_addr.pop(symbol, None)
         tmp = sym_to_cur_sym.pop(symbol, None)
     failure += failure_seed
+    # 【日志优化】添加汇总日志，替代逐条日志
+    logger.info("[pickle_gen_mapping.py:gen_mutated]: Processed {} symbols, {} succeeded, {} failed".format(
+        success_count + len(failure), success_count, len(failure)))
     return sym_to_addr,sym_to_cur_sym,failure
 
 

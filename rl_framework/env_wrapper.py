@@ -55,7 +55,7 @@ class BinaryPerturbationEnv:
     与 PPO Agent 在同一进程中运行，通过函数调用通信
     """
     
-    def __init__(self, save_path, dataset_path, sample_hold_interval=3):
+    def __init__(self, save_path, dataset_path, sample_hold_interval=3, max_steps=30):
         """
         参数:
             original_binary: 原始二进制文件路径
@@ -94,12 +94,13 @@ class BinaryPerturbationEnv:
         # 变异历史
         self.mutation_history = []
         self.step_count = 0
+        self.max_steps = max_steps
         self.target_score = 0.40
         self.state_dim = 256  # 默认状态维度（256维），可以通过参数修改
         # 记录当前目标下的历史最优分数，用于奖励塑形
         self.best_score = 1.0
         # 奖励塑形超参：显式惩罚“无变化/无效位置”
-        self.no_change_eps = 1e-4
+        self.no_change_eps = 1e-2
         self.no_change_penalty = 0.5
         self.invalid_loc_penalty = 1.0
         
@@ -863,7 +864,7 @@ class BinaryPerturbationEnv:
         # reward = self.compute_reward(score, grad)
         
         # 判断是否完成
-        done = score < self.target_score or self.step_count >= 30
+        done = score < self.target_score or self.step_count >= self.max_steps
 
         info = {
             'score': score,
@@ -968,22 +969,23 @@ class BinaryPerturbationEnv:
             
             incremental = diff * scale
         
-        elif diff < 0:  # 退步
+        elif diff <= 0:  # 退步
             # 惩罚轻一点，鼓励探索
             incremental = diff * 12.0 
 
-        total_reward += incremental * self.reward_weights['incremental']
+        difficulty_scale = 1.0 + 0.5 * self.current_difficulty
+        total_reward += incremental * self.reward_weights['incremental'] * difficulty_scale
 
         # === 2. 里程碑奖励 ===
         milestone = self.milestone_tracker.compute_reward(current_score)
-        total_reward += milestone * self.reward_weights['milestone']
+        total_reward += milestone * self.reward_weights['milestone'] * difficulty_scale
 
         # === 3. 终极成功奖励 ===
-        if current_score < 0.40:
+        if current_score < self.target_score:
             # 基础 10 + 质量加成 + 效率加成
             base_reward = 10.0
-            quality_bonus = (0.40 - current_score) * 50
-            efficiency_bonus = max(0, (50 - step_count) * 0.5)      # max_step - step_count
+            quality_bonus = (self.target_score - current_score) * 50
+            efficiency_bonus = max(0, (self.max_steps - step_count) * 0.5)      # max_step - step_count
             
             ultimate = base_reward + quality_bonus + efficiency_bonus
 
@@ -995,7 +997,7 @@ class BinaryPerturbationEnv:
         # === 4. 显式惩罚 ===
         penalty = 0.0
         if no_change:
-            penalty += 1.0
+            penalty += 2.0
         if invalid_loc:
             penalty += 2.0
         penalty += 0.1  # 时间成本
@@ -1044,12 +1046,12 @@ class BinaryPerturbationEnv:
         if force_switch:
             self._switch_next_target()
             logger.warning(f"🔄 FORCE SWITCH (Error Recovery) -> {os.path.basename(self.original_binary)}::{self.function_name}")
-            logger.info(f"   Version: {self.current_sample_data.get('version')} | Opt: {self.current_sample_data.get('opt_level')}")
+            logger.warning(f"   Version: {self.current_sample_data.get('version')} | Opt: {self.current_sample_data.get('opt_level')}")
         # 正常切换：检查是否需要切换目标
         elif self.current_sample_data is None or self.episodes_on_current >= self.sample_hold_interval:
             self._switch_next_target()
             logger.success(f"🔄 SWITCH TARGET -> {os.path.basename(self.original_binary)}::{self.function_name}")
-            logger.info(f"   Version: {self.current_sample_data.get('version')} | Opt: {self.current_sample_data.get('opt_level')}")
+            logger.success(f"   Version: {self.current_sample_data.get('version')} | Opt: {self.current_sample_data.get('opt_level')}")
         else:
             # 保持当前目标，增加计数
             self.episodes_on_current += 1

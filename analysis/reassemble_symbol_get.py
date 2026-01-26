@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import bisect
 import config
 from visit import ailVisitor
 from share_lib_helper import lib32_helper
@@ -26,6 +27,7 @@ class datahandler:
         """
         self.sec = {}
         self.plt_symbols = {}
+        self.plt_symbol_addrs = []
 
         self.text_mem_addrs = []
         self.label_mem_addrs = []
@@ -153,8 +155,12 @@ class datahandler:
                 if self.assumption_two:
                     self.in_jmptable = False
                 else:
-                    if s.sec_name in ['.plt', '.plt.sec'] and val in self.plt_symbols:
-                        l[i] = (l[i][0], '.quad ' + self.plt_symbols[val])
+                    if s.sec_name in ['.plt', '.plt.sec', '.plt.got']:
+                        plt_name = self.resolve_plt_symbol(val)
+                        if plt_name:
+                            l[i] = (l[i][0], '.quad ' + plt_name)
+                        else:
+                            l[i] = (l[i][0], '.quad ' + dec_hex(val))
                         l[i+1:i+8] = [('', '')] * 7
                     else:
                         self.data_labels.insert(0, (s.sec_name, val))
@@ -218,8 +224,12 @@ class datahandler:
                 if self.assumption_two:
                     self.in_jmptable = False
                 elif not ELF_utils.elf_arm() or self.checkifprobd2dARM(val):
-                    if s.sec_name in ['.plt', '.plt.sec'] and val in self.plt_symbols:
-                        l[i] = (l[i][0], '.long ' + self.plt_symbols[val])
+                    if s.sec_name in ['.plt', '.plt.sec', '.plt.got']:
+                        plt_name = self.resolve_plt_symbol(val)
+                        if plt_name:
+                            l[i] = (l[i][0], '.long ' + plt_name)
+                        else:
+                            l[i] = (l[i][0], '.long ' + dec_hex(val))
                         l[i+1:i+4] = [('', '')] * 3
                     else:
                         self.data_labels.insert(0, (s.sec_name, val))
@@ -297,6 +307,24 @@ class datahandler:
             for l in f:
                 items = l.split()
                 self.plt_symbols[int(items[0], 16)] = items[1].split('@')[0][1:]
+        self.plt_symbol_addrs = sorted(self.plt_symbols.keys())
+
+    def resolve_plt_symbol(self, addr):
+        """
+        Map a .plt address (possibly inside a stub) to a plt symbol name.
+        """
+        if not self.plt_symbol_addrs:
+            return None
+        if addr in self.plt_symbols:
+            return self.plt_symbols[addr]
+        idx = bisect.bisect_right(self.plt_symbol_addrs, addr) - 1
+        if idx < 0:
+            return None
+        base = self.plt_symbol_addrs[idx]
+        next_base = self.plt_symbol_addrs[idx + 1] if idx + 1 < len(self.plt_symbol_addrs) else base + 0x20
+        if addr < next_base:
+            return self.plt_symbols.get(base)
+        return None
 
     def section_offset(self, name, addr):
         """
@@ -640,6 +668,9 @@ class reassemble(ailVisitor):
             return reassemble.normal_char + 'S_' + dec_hex(c)
 
     def build_plt_symbol(self, c):
+        # 防御性检查：如果 plt_hash 中没有该地址，回退到普通符号构建
+        if c not in self.plt_hash:
+            return self.build_symbol(c)
         n = self.plt_hash[c]
         if isinstance(c, Types.Point):
             return n

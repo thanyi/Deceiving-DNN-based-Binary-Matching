@@ -64,7 +64,11 @@ def pltgot(filepath):
     logger.debug("[extern_symbol_process.py:pltgot]: pltgotsym = {}".format(pltgotsym))
     pltgottargets_cmd = config.objdump + ' -Dr -j .plt.got ' + filepath + ' | grep jmp | cut -f1,3'
     logger.debug("[extern_symbol_process.py:pltgot]: pltgottargets_cmd = {}".format(pltgottargets_cmd)) 
-    pltgottargets = check_output(pltgottargets_cmd, shell=True)   # 结果如：['0x401018 <malloc@plt>', '0x401020 <free@plt>']
+    try:
+        pltgottargets = check_output(pltgottargets_cmd, shell=True)   # 结果如：['0x401018 <malloc@plt>', '0x401020 <free@plt>']
+    except Exception as e:
+        logger.info("[extern_symbol_process.py:pltgot]: .plt.got section missing or unreadable, skipping. ({})".format(e))
+        return
     def pltgotmapper(l):            # 需添加如下判断，目的是判断objdump的输出格式问题
         items = l.strip().split()
         if len(items) == 0:

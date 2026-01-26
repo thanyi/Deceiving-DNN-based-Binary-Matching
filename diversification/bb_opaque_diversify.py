@@ -212,7 +212,7 @@ class bb_opaque_diversify(ailVisitor):
                     self.update_process()
                     return  # 找到目标后立即返回
             print '[bb_opaque_diversify.py:bb_div_opaque] Warning: target_addr %s not found' % target_addr
-            print '[bb_opaque_diversify.py:bb_div_opaque] start to random mutate' % target_addr
+            print '[bb_opaque_diversify.py:bb_div_opaque] start to random mutate %s' % target_addr
             # return
         
         # 未指定 target_addr或者没有找到tartget_addr，随机选择基本块进行变异

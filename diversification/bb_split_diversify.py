@@ -3,7 +3,7 @@
 【变异操作类型】基本块分割 (Basic Block Splitting)
 【框架序号】Action ID: 4
 【功能说明】将较大的基本块分割成多个较小的基本块，通过插入无条件跳转和标签来
-           改变基本块粒度，影响基于基本块大小的特征提取，但不在 RL 框架的动作空间中。
+           改变基本块粒度，影响基于基本块大小的特征提取。
 """
 from analysis.visit import *
 from disasm.Types import *
@@ -40,14 +40,6 @@ class bb_split_diversify(ailVisitor):
 
         self.insert_instrs(i1, loc)
         # self.insert_instrs(i2, loc)
-        # we insert some codes after the jmp, which will never execute
-        useless = []
-        useless.append(DoubleInstr((self._ops['push'], self._regs[1], loc_without_label, None)))
-        useless.append(TripleInstr((self._ops['mov'], self._regs[0], self._regs[1], loc_without_label, None)))
-        useless.append(TripleInstr(('xor', self._regs[0], self._regs[0], loc_without_label, None)))
-        useless.append(DoubleInstr((self._ops['jmp'], Label('printf'), loc_without_label, None)))
-        for u in useless:
-            self.insert_instrs(u, loc)
 
         junk = get_junk_codes(loc_with_label)
         if len(junk) == 0:
@@ -74,7 +66,7 @@ class bb_split_diversify(ailVisitor):
         对基本块执行分割变异
         
         如果指定 target_addr，只分割该地址的基本块
-        如果未指定 target_addr，对所有基本块进行分割
+        如果未指定 target_addr，只随机分割一个合格的基本块
         """
         # 如果指定了 target_addr，只处理该地址的基本块
         if target_addr is not None:
@@ -93,17 +85,31 @@ class bb_split_diversify(ailVisitor):
                 if do_split:
                     self.update_process()
                     return
-                print '[bb_split_diversify.py:bb_div_split] Warning: target_addr %s too small to split (< %d instrs), fallback to random' % (target_addr, split_threshold)
-                break
+                print '[bb_split_diversify.py:bb_div_split] Warning: target_addr %s too small to split (< %d instrs), skip' % (target_addr, split_threshold)
+                return
             if not found:
-                print '[bb_split_diversify.py:bb_div_split] Warning: target_addr %s not found, fallback to random' % target_addr
+                print '[bb_split_diversify.py:bb_div_split] Warning: target_addr %s not found, skip' % target_addr
+            return
         
-        # 未指定 target_addr，对所有基本块进行分割
+        # 未指定 target_addr，随机分割一个合格的基本块
+        candidates = []
         for f in self.fb_tbl.keys():
             bl = self.fb_tbl[f]
             for b in bl:
-                do_split = self.update_bb(b)
-        self.update_process()
+                try:
+                    if len(self.bb_instrs(b)) > split_threshold:
+                        candidates.append(b)
+                except Exception:
+                    continue
+        if not candidates:
+            print '[bb_split_diversify.py:bb_div_split] Warning: no block is large enough to split, skip'
+            return
+        b = random.choice(candidates)
+        do_split = self.update_bb(b)
+        if do_split:
+            self.update_process()
+        else:
+            print '[bb_split_diversify.py:bb_div_split] Warning: selected block too small to split, skip'
 
     def visit(self, instrs, target_addr = None):
         print 'start basic block split diversification'

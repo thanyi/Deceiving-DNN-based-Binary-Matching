@@ -34,8 +34,10 @@ def main(instrument=False):
                 elif 'movzbl $S_' in l:
                     l = l.replace('movzbl $S_', 'movzbl S_')
                 elif '$S_0x' in l:
-                    # 修复立即数符号引用：$S_0x495E -> $0x495E
-                    l = re.sub(r'\$S_0x([0-9A-Fa-f]+)', r'$0x\1', l)
+                    # 保留符号立即数，避免 64 位下绝对地址常量导致错误重定位
+                    # 仅在 32 位下保留旧行为以兼容历史输出
+                    if ELF_utils.elf_32() and 'branch_des' not in l:
+                        l = re.sub(r'\$S_0x([0-9A-Fa-f]+)', r'$0x\1', l)
                 elif 'jmpq ' in l and '*' not in l:
                     l = l.replace('jmpq ', 'jmp ')
                 elif 'repz retq' in l:
@@ -67,6 +69,25 @@ def main(instrument=False):
             # ret = os.system("python3 /home/ycy/ours/Deceiving-DNN-based-Binary-Matching/postprocess/fix_missing_symbols.py")
             # logger.info("[post_process.py:main]: fix_missing_symbols.py done, ret = {}".format(ret))
             lines = map(helpf, lines)
+            # 转换为列表（兼容 Python 2/3）
+            # lines = list(lines)
+
+    # # 清理行尾的无效字符（修复 "junk at end of line" 错误）
+    # # 移除行尾的 "空格/制表符 + 0" 模式（但保留有效的数字如 0x10, $0 等）
+    # def clean_line_endings(l):
+    #     if not l:
+    #         return l
+    #     # 使用正则表达式移除行尾的无效 '0' 字符
+    #     # 匹配：行尾有空格/制表符 + '0'，且前面不是有效数字的一部分
+    #     # 但保留如 0x10, $0, 10, %rax0 等有效格式
+    #     l = re.sub(r'[ \t]+0$', '', l.rstrip())
+    #     # 确保行以换行符结尾
+    #     if l and not l.endswith('\n'):
+    #         l = l + '\n'
+    #     return l
+    
+    # # 对所有行进行清理
+    # lines = [clean_line_endings(l) for l in lines]
 
     with open("final.s", 'w') as f:
         f.writelines(lines)

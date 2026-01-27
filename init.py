@@ -214,10 +214,12 @@ class Init(object):
             os.system(cmd)
         logger.debug("[init.py:pltProcess]: pltcmd = {}".format(cmd))
 
-    def ailProcess(self, instrument=False,specific_function=None):
+    def ailProcess(self, instrument=False,specific_function=None,target_addr=None):
         """
         Invoke processing skeleton
         :param instrument: True to apply instrumentations
+        :param specific_function: diversify specific function
+        :param target_addr: target address of one of the top critical blocks
         """
         logger.info("[init.py:ailProcess]: start ailProcess ...")
         logger.debug("[init.py:ailProcess]: self.file = {}".format(self.file))
@@ -228,7 +230,7 @@ class Init(object):
         processor.global_bss()  # load global bss symbols
         # try to construct control flow graph and call graph
         # which can help to obfuscating process
-        processor.instrProcess(instrument, docfg=True,specific_function=specific_function)
+        processor.instrProcess(instrument, docfg=True,specific_function=specific_function,target_addr=target_addr)
         logger.info("[init.py:ailProcess]: processor.instrProcess function done ...")
 
     def checkret(self, ret, path):
@@ -241,18 +243,20 @@ class Init(object):
             os.remove(path)
 
 
-def main(filepath, instrument=False,specific_function=None):
+def main(filepath, instrument=False,specific_function=None,target_addr=None):
     """
     Init processing
     :param filepath: path to executable
     :param instrument: True to apply instrumentation
+    :param specific_function: diversify specific function
+    :param target_addr: target address of one of the top critical blocks
     """
     logger.info("[init.py:main]: start the init.main...")
     if ELF_utils.elf_strip() and ELF_utils.elf_exe():
         init = Init(filepath)
         init.disassemble()
         init.process()
-        init.ailProcess(instrument,specific_function=specific_function)
+        init.ailProcess(instrument,specific_function=specific_function,target_addr=target_addr)
     else:
         logger.error("[init.py:main]: binary is not stripped or is a shared library")
         sys.stderr.write('Error: binary is not stripped or is a shared library\n')

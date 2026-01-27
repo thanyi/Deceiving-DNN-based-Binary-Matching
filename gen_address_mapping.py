@@ -80,8 +80,9 @@ def gen_mapping(mode):
     old_addr_to_new_symbol = {}
 
     new_symbol_to_new_addr,new_addr_to_new_symbol = execute_mapping()
-    logger.info("[gen_address_mapping.py:gen_mapping]: new_symbol_to_new_addr = {}".format(new_symbol_to_new_addr))
-    logger.info("[gen_address_mapping.py:gen_mapping]: new_addr_to_new_symbol = {}".format(new_addr_to_new_symbol))
+    # 【日志优化】这些映射表可能有数千个条目，只记录数量而不是完整内容
+    logger.info("[gen_address_mapping.py:gen_mapping]: new_symbol_to_new_addr contains {} mappings".format(len(new_symbol_to_new_addr)))
+    logger.info("[gen_address_mapping.py:gen_mapping]: new_addr_to_new_symbol contains {} mappings".format(len(new_addr_to_new_symbol)))
     # use for original transformation 
     new_symbol_to_seed_symbol = {}
     seed_symbol_to_new_symbol = {}
@@ -166,7 +167,8 @@ def gen_mapping(mode):
             #     seed_symbol_to_new_symbol[old_symbol_tmp] = new_symbol_tmp
             #     new_symbol_to_old_addr[new_symbol_tmp] = old_addr_tmp
             #     old_addr_to_new_symbol[old_addr_tmp] = new_symbol_tmp
-        logger.info("[gen_address_mapping.py:gen_mapping]: new_symbol_to_seed_symbol is {}".format(new_symbol_to_seed_symbol))
+        # 【日志优化】只记录映射表数量，不记录完整内容
+        logger.info("[gen_address_mapping.py:gen_mapping]: new_symbol_to_seed_symbol contains {} mappings".format(len(new_symbol_to_seed_symbol)))
         return [new_symbol_to_new_addr,new_addr_to_new_symbol,\
               new_symbol_to_seed_symbol,seed_symbol_to_new_symbol,\
               new_symbol_to_old_addr,old_addr_to_new_symbol]

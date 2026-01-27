@@ -17,8 +17,9 @@ import gen_address_mapping
 import pickle_gen_mapping
 
 log_file_path = '/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/log/uroboro.log'
+# 【日志优化】将级别从 DEBUG 改为 INFO，减少冗余日志输出
 logging.basicConfig(filename=log_file_path,
-                    level=logging.DEBUG,
+                    level=logging.INFO,  # 从 DEBUG 改为 INFO
                     format='%(asctime)s - %(levelname)s - %(message)s',
                     filemode='a') # 'a' for append, 'w' for overwrite
 logger = logging.getLogger(__name__)
@@ -44,13 +45,14 @@ def fix_final_s(filepath):
             _main_globl_added = True 
         sys.stdout.write(line)
 
-def process(filepath, instrument=False, fexclude='',specific_function=None):
+def process(filepath, instrument=False, fexclude='',specific_function=None,target_addr=None):
     """
     Start file processing
     :param filepath: path to executable
     :param instrument: True to apply instrumentation
     :param fexclude: path to file of symbol exclusions
     :param specific_function: diversify specific function
+    :param target_addr: target address of one of the top critical blocks
     :return: True if everything ok
     """
     import init
@@ -71,7 +73,7 @@ def process(filepath, instrument=False, fexclude='',specific_function=None):
         os.system(config.strip + ' ' + filepath)
         os.system('file ' + filepath + ' > elf.info')
 
-        init.main(filepath, instrument,specific_function = specific_function)
+        init.main(filepath, instrument,specific_function = specific_function,target_addr=target_addr)
         logger.info("[uroboros_automate-func-name.py:process]: init.main function done ...")
         if not os.path.isfile("final.s"): 
             logger.info("[uroboros_automate-func-name.py:process]: write final_data.s failed!")
@@ -213,6 +215,7 @@ a label or an address range of data section to exclude from symbol search""")
 
     p.add_argument('-div', '--function', type=str ,default="",nargs='+',
                    help='Function to modify')
+    p.add_argument('-t', '--target_addr', type=str, default="", help='target address of one of the top critical blocks')
 
     args = p.parse_args()
     filepath = os.path.realpath(args.binary)
@@ -220,7 +223,8 @@ a label or an address range of data section to exclude from symbol search""")
     exclude = os.path.realpath(args.exclude) if len(args.exclude) > 0 else ''
     fexclude = os.path.realpath(args.functionexclude) if len(args.functionexclude) > 0 else ''
 
-    logger.debug("[uroboros_automate-func-name.py:main]: outpath = {},".format(outpath))
+    # 【日志优化】注释掉详细的参数日志
+    # logger.debug("[uroboros_automate-func-name.py:main]: outpath = {},".format(outpath))
     num_iteration = args.iteration
     if num_iteration is None or num_iteration <= 0:
         num_iteration = 1
@@ -233,13 +237,15 @@ a label or an address range of data section to exclude from symbol search""")
     logger.info("[uroboros_automate-func-name.py:main]: diversifications = {}".format(diversifications))
     abs_path = os.path.dirname(os.path.abspath(__file__))
     open_path(args.folder)
-    logger.debug("[uroboros_automate-func-name.py:main]: args.binary = {}," \
-                            " args.mode = {}, args.function = {}".format(args.binary, args.mode, args.function))
+    # 【日志优化】注释掉详细的参数日志
+    # logger.debug("[uroboros_automate-func-name.py:main]: args.binary = {}," \
+    #                         " args.mode = {}, args.function = {}".format(args.binary, args.mode, args.function))
     for i in range(1, num_iteration + 1):
         workdir = abs_path + '/workdir_' + str(i)
         if not os.path.isdir(workdir):
             os.mkdir(workdir)
-        logger.debug("[uroboros_automate-func-name.py:main]: workdir= {}".format(workdir))
+        # 【日志优化】注释掉工作目录日志
+        # logger.debug("[uroboros_automate-func-name.py:main]: workdir= {}".format(workdir))
         # print colored(('iteration %d dir:' + workdir) % i, 'green')
         # logger.info(('iteration %d dir:' + workdir) % i, 'green')
         os.chdir(workdir)
@@ -256,7 +262,8 @@ a label or an address range of data section to exclude from symbol search""")
             gg = "/".join(gg.split("/")[:-1])
             # 设置环境变量，让main_discover能够找到unstriped.out
             os.environ['UROBOROS_FOLDER'] = gg
-            logger.debug("[uroboros_automate-func-name.py:main]: gg+'/sym_to_addr.pickle' = {},".format(gg+'/sym_to_addr.pickle'))
+            # 【日志优化】注释掉 pickle 路径日志
+            # logger.debug("[uroboros_automate-func-name.py:main]: gg+'/sym_to_addr.pickle' = {},".format(gg+'/sym_to_addr.pickle'))
 
             sym_to_addr = pickle.load(open(gg+'/sym_to_addr.pickle','rb'))
             sym_to_cur_sym = pickle.load(open(gg+'/sym_to_cur_sym.pickle','rb'))
@@ -273,7 +280,8 @@ a label or an address range of data section to exclude from symbol search""")
         if len(args.function) > 0 and args.mode=='mutated' :
             specific_function = []
             func_list = args.function
-            logger.info("[uroboros_automate-func-name.py:main]: sym_to_addr = {}".format(sym_to_addr))
+            # 【日志优化】sym_to_addr 可能很大，注释掉
+            # logger.info("[uroboros_automate-func-name.py:main]: sym_to_addr = {}".format(sym_to_addr))
             for function_name in func_list:
                 addr_tmp = ""
                 if function_name in sym_to_addr.keys():
@@ -292,11 +300,12 @@ a label or an address range of data section to exclude from symbol search""")
                 specific_function.append([function_name,addr_tmp])
             if len(specific_function) == 0:
                 raise Exception('Fail')
-        logger.debug("[uroboros_automate-func-name.py:main]: specific_function = {},".format(specific_function))
+        # 【日志优化】specific_function 已在上方打印，这里注释掉
+        # logger.debug("[uroboros_automate-func-name.py:main]: specific_function = {},".format(specific_function))
 
         if check(filepath, args.assumption, args.gccopt, exclude, args.instrument) and set_assumption(args.assumption):
             # process(filepath, instrument=False, fexclude='',specific_function=None)
-            if process(os.path.basename(filepath), args.instrument, fexclude = fexclude,specific_function=specific_function):
+            if process(os.path.basename(filepath), args.instrument, fexclude = fexclude,specific_function=specific_function,target_addr=args.target_addr):
                 # this will parse and return the pickled object 
                 logger.info("[uroboros_automate-func-name.py:main]: process func returns True !")
                 '''
@@ -308,16 +317,19 @@ a label or an address range of data section to exclude from symbol search""")
                                 old_addr_to_new_symbol]
                 '''
                 mapping_dict = gen_address_mapping.gen_mapping(args.mode)
-                logger.debug("[uroboros_automate-func-name.py:main]]: args.folder is {}".format(args.folder))
+                # 【日志优化】注释掉 folder 路径日志
+                # logger.debug("[uroboros_automate-func-name.py:main]]: args.folder is {}".format(args.folder))
                 with open(args.folder+'/mapping_dict.pickle', 'wb') as handle:
                     pickle.dump(mapping_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                logger.info("[uroboros_automate-func-name.py:main]: write mapping_dict = {} in folder {}".format(mapping_dict, args.folder))
+                # 【日志优化】mapping_dict 可能很大，只记录长度
+                logger.info("[uroboros_automate-func-name.py:main]: write mapping_dict ({} entries) in folder {}".format(len(mapping_dict) if isinstance(mapping_dict, (list, dict)) else 'N/A', args.folder))
                 if args.mode == "original" :
                     sym_to_addr,sym_to_cur_sym = pickle_gen_mapping.gen_seed(mapping_dict)
                 else:
                     sym_to_addr,sym_to_cur_sym,failure = pickle_gen_mapping.gen_mutated(sym_to_addr,sym_to_cur_sym,failure_seed,mapping_dict)
                 
-                logger.debug("[uroboros_automate-func-name.py:main]: sym_to_addr is {}".format(sym_to_addr))
+                # 【日志优化】sym_to_addr 可能有数千个条目，只记录数量
+                logger.info("[uroboros_automate-func-name.py:main]: sym_to_addr contains {} symbols".format(len(sym_to_addr)))
                 with open(args.folder+'/sym_to_addr.pickle', 'wb') as handle:
                     pickle.dump(sym_to_addr, handle, protocol=pickle.HIGHEST_PROTOCOL)
                 with open(args.folder+'/sym_to_cur_sym.pickle', 'wb') as handle:
@@ -330,6 +342,10 @@ a label or an address range of data section to exclude from symbol search""")
                 os.system('strip a.out')
                 print colored("Processing %d succeeded" % i, "blue")
                 if outpath is not None:
+                    # 确保目标目录存在
+                    outdir = os.path.dirname(outpath)
+                    if outdir and not os.path.exists(outdir):
+                        os.makedirs(outdir)
                     shutil.copy('a.out', outpath + '_' + str(i) + '_mode_' + str(config.diversification_mode))
                     shutil.copy('a.out', outpath)
                 # change source file path

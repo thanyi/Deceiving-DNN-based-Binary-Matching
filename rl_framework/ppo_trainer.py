@@ -181,13 +181,14 @@ def train_ppo(args):
         lr=args.lr,
         gamma=args.gamma,
         epsilon=args.epsilon,
+        n_locs=args.n_locs,
         device='cuda' if torch.cuda.is_available() and args.use_gpu else 'cpu'
     )
     
     if args.resume and os.path.exists(args.resume):
         agent.load(args.resume)
     
-    log_file = os.path.join(args.model_dir, 'training_log.txt')
+    # log_file = os.path.join(args.model_dir, 'training_log.txt')
     
     episode_binaries = []
     
@@ -222,7 +223,9 @@ def train_ppo(args):
 
                 joint_idx, loc_idx, act_idx, actual_action, log_prob, value = agent.select_action(state, explore=True)
                 episode_actions.append(actual_action)
+                prev_state = state
                 
+                logger.success(f"Step {step}: Loc {loc_idx}, Action {actual_action} (JointIdx {joint_idx})")
                 # 执行动作
                 next_state, reward, done, info = env.step(actual_action, loc_idx)
                 # input("step down, press enter to continue")
@@ -230,7 +233,7 @@ def train_ppo(args):
                 state = next_state
                 
                 
-                if step % 10 == 0:
+                if step % 100 == 0:
                     # 记录每步指标 (当前设置：每步都记，如果太慢可改为 if step % 5 == 0)
                     writer.add_scalar('Step/Shaped_Reward', reward, global_total_steps)            # Agent 每做一步动作得到的即时反馈（包含进步分、惩罚分等）。
                     writer.add_scalar('Step/Critic_Value', value, global_total_steps)                     # Critic 网络（裁判）认为“当前这个状态，未来能拿多少分”。
@@ -238,7 +241,7 @@ def train_ppo(args):
                         writer.add_scalar('Step/Similarity_Score', info['score'], global_total_steps)     # 每一步变异后的代码与原代码的相似度。
 
                 # 存储经验
-                agent.store_transition(state, joint_idx, reward, log_prob, value, done)
+                agent.store_transition(prev_state, joint_idx, reward, log_prob, value, done)
  
                 if 'binary' in info:
                     last_binary_info = {
@@ -287,7 +290,8 @@ def train_ppo(args):
                 next_value = agent.estimate_value(state)
             
             # PPO 更新
-            loss = agent.update(next_value=next_value)
+            update_info = agent.update(next_value=next_value)
+            loss = update_info['loss']
 
             # 打印动作分布
             agent.log_action_distribution(episode)
@@ -304,12 +308,22 @@ def train_ppo(args):
             writer.add_scalar('Main/Episode_Length', step + 1, episode)                      # 一个回合内总共执行了多少步。
             writer.add_histogram('Debug/Action_Distribution', np.array(episode_actions), episode)   # 在当前回合中，Agent 选择了哪些变异动作（Action 0-5）。
             writer.add_scalar('Debug/Policy_Loss', loss, episode)                           # PPO 算法更新时的 Loss 值。
-            pbar.set_postfix_str(f"sr={current_success_rate:.2f} drop={avg_drop:.2f} loss={loss:.2f}")
+            writer.add_scalar('Debug/Advantage_Mean_Raw', update_info['adv_mean_raw'], episode)
+            writer.add_scalar('Debug/Advantage_Std_Raw', update_info['adv_std_raw'], episode)
+            writer.add_scalar('Debug/Advantage_AbsMean_Raw', update_info['adv_abs_mean_raw'], episode)
+            writer.add_scalar('Debug/Advantage_MaxAbs_Raw', update_info['adv_max_abs_raw'], episode)
+            pbar.set_postfix_str(
+                f"sr={current_success_rate:.2f} drop={avg_drop:.2f} "
+                f"loss={loss:.2f} adv_std={update_info['adv_std_raw']:.2f}"
+            )
             pbar.update(1)
             
             # 写日志文件
-            with open(log_file, 'a') as f:
-                f.write(f"{episode},{step+1},{episode_reward:.4f},{loss:.4f},{current_success_rate:.2f}\n")
+            # with open(log_file, 'a') as f:
+            #     f.write(
+            #         f"{episode},{step+1},{episode_reward:.4f},{loss:.4f},"
+            #         f"{current_success_rate:.2f},{update_info['adv_std_raw']:.4f}\n"
+            #     )
             
             # 保存模型
             if (episode + 1) % args.save_interval == 0:
@@ -351,6 +365,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--gamma', type=float, default=0.95)
     parser.add_argument('--epsilon', type=float, default=0.2)
+    parser.add_argument('--n-locs', type=int, default=3)
     parser.add_argument('--episodes', type=int, default=6000)
     parser.add_argument('--max-steps', type=int, default=30)
     parser.add_argument('--save-interval', type=int, default=50)

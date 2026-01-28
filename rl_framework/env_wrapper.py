@@ -68,6 +68,8 @@ class BinaryPerturbationEnv:
         # 用于存储当前二进制文件的 Top-K 关键块地址列表
         # 格式: [0x401000, 0x401050, 0x401090]
         self.current_critical_blocks = []
+        # 当前函数的所有基本块地址（用于随机选非Top块）
+        self.current_all_blocks = []
         # 加载数据集
         if not os.path.exists(dataset_path):
             raise FileNotFoundError(f"Dataset not found: {dataset_path}")
@@ -97,12 +99,21 @@ class BinaryPerturbationEnv:
         self.max_steps = max_steps
         self.target_score = 0.40
         self.state_dim = 256  # 默认状态维度（256维），可以通过参数修改
+        # 动作空间（必须与 PPOAgent 的 action_map 保持一致）
+        # All available actions (keep 11 for future use).
+        self.all_action_ids = [1, 2, 4, 7, 8, 9, 11]
+        # Temporarily disable action 11.
+        self.action_ids = [1, 2, 4, 7, 8, 9]
+        self.action_id_to_index = {aid: idx for idx, aid in enumerate(self.action_ids)}
+        self.n_actions = len(self.action_ids)
         # 记录当前目标下的历史最优分数，用于奖励塑形
         self.best_score = 1.0
         # 奖励塑形超参：显式惩罚“无变化/无效位置”
         self.no_change_eps = 1e-2
         self.no_change_penalty = 0.5
         self.invalid_loc_penalty = 1.0
+        # Small penalty when the policy keeps repeating the same action.
+        self.repeat_action_penalty = 0.3
         
         # 【性能优化】Radare2 特征提取缓存
         # 缓存键: (binary_path, function_name, function_addr)
@@ -225,22 +236,16 @@ class BinaryPerturbationEnv:
         else:
             features.extend([1.0] * 5)
             
-        # 2. Action Histogram (6 dims)
-        action_counts = [0] * 6
-        total = max(len(self.mutation_history), 1)
-        for m in self.mutation_history:
-            idx = m.get('action')
-            if 0 <= idx < 6: action_counts[idx] += 1
-        features.extend([c/total for c in action_counts])
+        # 2. Action Histogram (7 dims, action_id -> action_index)
+        features.extend(self._action_histogram_features())
         
         # 3. Progress (2 dims)
         features.append(self.step_count / 50.0)
         features.append(1.0 if self.step_count > 25 else 0.0)
         
-        # 4. Global State (3 dims)
+        # 4. Global State (2 dims)
         features.append(1.0 if len(self.mutation_history) > 0 else 0.0) # Is Modified
         features.append(self.episodes_on_current / 20.0) # Dataset progress
-        features.append(0.0) # Padding
 
         # ==========================================
         # Part 2: 基于 Radare2 的 ACFG 特征 (核心)
@@ -281,10 +286,12 @@ class BinaryPerturbationEnv:
             
             if acfg_data:
                 # logger.debug(f"acfg_data: {acfg_data}")
+                self.current_all_blocks = list(acfg_data.get('basic_blocks', {}).keys())
                 acfg_vec = self._vectorize_acfg(acfg_data)
                 
         except (FileNotFoundError, KeyError, ValueError, AttributeError) as e:
             logger.warning(f"Feature extraction failed for {binary_path}: {e}")
+            self.current_all_blocks = []
             # 保持全0
         
         features.extend(acfg_vec)
@@ -310,6 +317,39 @@ class BinaryPerturbationEnv:
             
         return features
 
+    def _action_histogram_features(self):
+        """
+        将历史动作(action_id)映射到稳定的索引空间(action_index)，避免把 action_id 当索引导致统计失真。
+        返回长度为 n_actions 的归一化直方图。
+        """
+        counts = np.zeros(self.n_actions, dtype=np.float32)
+        total = max(len(self.mutation_history), 1)
+
+        for m in self.mutation_history:
+            action_id = m.get('action')
+            action_idx = self.action_id_to_index.get(action_id)
+
+            # 兼容旧数据：如果历史里存的是索引而不是 action_id，则回退为索引。
+            if action_idx is None and isinstance(action_id, int) and 0 <= action_id < self.n_actions:
+                action_idx = action_id
+
+            if action_idx is not None:
+                counts[action_idx] += 1.0
+
+        return (counts / total).tolist()
+
+    def _repeat_action_streak(self, action_id):
+        """
+        Count how many immediately previous steps used the same action_id.
+        0 means this action is different from the last step.
+        """
+        streak = 0
+        for m in reversed(self.mutation_history):
+            if m.get('action') != action_id:
+                break
+            streak += 1
+        return streak
+
 
 
 
@@ -331,22 +371,16 @@ class BinaryPerturbationEnv:
         else:
             features.extend([1.0] * 5)
             
-        # 2. Action Histogram (6 dims)
-        action_counts = [0] * 6
-        total = max(len(self.mutation_history), 1)
-        for m in self.mutation_history:
-            idx = m.get('action')
-            if 0 <= idx < 6: action_counts[idx] += 1
-        features.extend([c/total for c in action_counts])
+        # 2. Action Histogram (7 dims, action_id -> action_index)
+        features.extend(self._action_histogram_features())
         
         # 3. Progress (2 dims)
         features.append(self.step_count / 50.0)
         features.append(1.0 if self.step_count > 25 else 0.0)
         
-        # 4. Global State (3 dims)
+        # 4. Global State (2 dims)
         features.append(1.0 if len(self.mutation_history) > 0 else 0.0) # Is Modified
         features.append(self.episodes_on_current / 20.0) # Dataset progress
-        features.append(0.0) # Padding
 
         # ==========================================
         # Part 2: 基于 Radare2 的 ACFG 特征 (核心)
@@ -383,12 +417,14 @@ class BinaryPerturbationEnv:
             
             if acfg_data:
                 self.current_critical_blocks = acfg_data.get('top_critical_blocks', [])[:3]
+                self.current_all_blocks = list(acfg_data.get('basic_blocks', {}).keys())
                 acfg_vec = self._vectorize_acfg(acfg_data)
                 
                 
         except (FileNotFoundError, KeyError, ValueError, AttributeError) as e:
             logger.warning(f"Feature extraction failed for {binary_path}: {e}")
             self.current_critical_blocks = []
+            self.current_all_blocks = []
             # 保持全0
         
         features.extend(acfg_vec)
@@ -670,12 +706,15 @@ class BinaryPerturbationEnv:
         
         参数:
             seed_binary: 种子二进制文件路径
-            action: 变异模式 (1,2,3,5,7,8,9,11)
+            action: 变异模式 (1,2,4,7,8,9)  # 11 暂时禁用
             target_addr: 攻击位置地址
         返回:
             mutated_binary: 变异后的二进制文件路径
         """
         try:
+            if self.function_name == 'main':
+                logger.warning("Skip mutation for function 'main' (avoid unstable target)")
+                return None, None
             # 记录调用时的 step_count，用于调试
             current_step = getattr(self, 'step_count', 'unknown')
             logger.info("Applying mutation {} to {} (step={})".format(action, os.path.basename(seed_binary), current_step))
@@ -804,18 +843,37 @@ class BinaryPerturbationEnv:
         self.step_count += 1
         # 记录上一步分数，用于计算差分奖励
         prev_score = self.mutation_history[-1]['score'] if self.mutation_history else 1.0
+        repeat_streak = self._repeat_action_streak(action)
         # === 【核心逻辑】解析攻击位置 ===
         target_addr = None
 
-        # 检查索引是否有效 (比如提取出了5个关键块，Agent选了第2个，有效)
-        # 如果提取失败列表为空，或者 Agent 选的索引超出了列表范围，就退化为 None (随机)
-        loc_valid = bool(self.current_critical_blocks) and loc_idx < len(self.current_critical_blocks)
-        if loc_valid:
+        # 位置选择：
+        # - loc_idx 在 Top-N 范围内：直接用关键块
+        # - 随机非Top块逻辑已暂时禁用（后续可恢复）
+        loc_valid = False
+        if self.current_critical_blocks and loc_idx < len(self.current_critical_blocks):
             target_addr = self.current_critical_blocks[loc_idx]
+            loc_valid = True
         else:
-            # 这种情况可能发生于：函数太小没有关键块，或者 Agent 刚初始化还在乱猜
-            logger.debug(f"Location index {loc_idx} invalid or no critical blocks ({len(self.current_critical_blocks) if self.current_critical_blocks else 0}), falling back to random.")
-            pass
+            # --- Random NonTop (disabled) ---
+            # candidate_blocks = []
+            # if self.current_all_blocks:
+            #     exclude = set(self.current_critical_blocks)
+            #     candidate_blocks = [addr for addr in self.current_all_blocks if addr not in exclude]
+            #
+            # if candidate_blocks:
+            #     target_addr = random.choice(candidate_blocks)
+            #     loc_valid = True
+            # elif self.current_all_blocks:
+            #     # 如果没有非Top块，退回随机任意块（避免完全无效）
+            #     target_addr = random.choice(self.current_all_blocks)
+            #     loc_valid = True
+
+            # 这种情况可能发生于：函数太小没有关键块，或特征提取失败
+            logger.debug(
+                f"No target block selected; loc_idx={loc_idx}, "
+                f"top_blocks={len(self.current_critical_blocks) if self.current_critical_blocks else 0}."
+            )
 
         # 应用变异
         mutated_binary, hash_val = self.apply_mutation(self.current_binary, action, target_addr)
@@ -859,7 +917,8 @@ class BinaryPerturbationEnv:
             score,
             self.step_count,
             invalid_loc=not loc_valid,
-            no_change=no_change
+            no_change=no_change,
+            repeat_streak=repeat_streak,
         )
         # reward = self.compute_reward(score, grad)
         
@@ -874,7 +933,8 @@ class BinaryPerturbationEnv:
             'target_func': self.function_name, # 记录当前目标函数名
             'loc_valid': loc_valid,
             'no_change': no_change,
-            'score_delta': score_delta
+            'score_delta': score_delta,
+            'repeat_streak': repeat_streak,
         }
         
         # === 核心修改：更新难度权重 ===
@@ -949,7 +1009,7 @@ class BinaryPerturbationEnv:
 
 
     def compute_reward_v2(self, prev_score, current_score, step_count,
-                          invalid_loc=False, no_change=False):
+                          invalid_loc=False, no_change=False, repeat_streak=0):
         """计算奖励"""
         # 基础奖励
         total_reward = 0.0
@@ -973,12 +1033,13 @@ class BinaryPerturbationEnv:
             # 惩罚轻一点，鼓励探索
             incremental = diff * 12.0 
 
-        difficulty_scale = 1.0 + 0.5 * self.current_difficulty
-        total_reward += incremental * self.reward_weights['incremental'] * difficulty_scale
+        # 关键决策：难度已经用于“采样更频繁”，这里不再二次放大奖励，
+        # 避免对“难样本”重复加成导致训练不稳定。
+        total_reward += incremental * self.reward_weights['incremental']
 
         # === 2. 里程碑奖励 ===
         milestone = self.milestone_tracker.compute_reward(current_score)
-        total_reward += milestone * self.reward_weights['milestone'] * difficulty_scale
+        total_reward += milestone * self.reward_weights['milestone']
 
         # === 3. 终极成功奖励 ===
         if current_score < self.target_score:
@@ -989,10 +1050,7 @@ class BinaryPerturbationEnv:
             
             ultimate = base_reward + quality_bonus + efficiency_bonus
 
-            difficulty_bonus = 30.0 * self.current_difficulty
-            total_reward += ultimate * self.reward_weights['ultimate'] + difficulty_bonus
-            if difficulty_bonus > 15.0:
-                logger.info(f"💎 攻克难题! 基础:{ultimate:.1f} + 难度加成:{difficulty_bonus:.1f}")
+            total_reward += ultimate * self.reward_weights['ultimate']
 
         # === 4. 显式惩罚 ===
         penalty = 0.0
@@ -1000,6 +1058,9 @@ class BinaryPerturbationEnv:
             penalty += 2.0
         if invalid_loc:
             penalty += 2.0
+        if repeat_streak > 0:
+            # Penalize repeated actions, but cap to avoid dominating the reward.
+            penalty += self.repeat_action_penalty * min(repeat_streak, 4)
         penalty += 0.1  # 时间成本
 
 

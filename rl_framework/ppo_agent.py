@@ -128,12 +128,12 @@ class PPOAgent:
     """PPO 智能体"""
     
     def __init__(self, state_dim=256, n_actions=None, n_locs=3, lr=1e-4, gamma=0.99, 
-                 epsilon=0.2, epochs=10, device='cpu', action_map=None):
+                 epsilon=0.2, epochs=5, device='cpu', action_map=None):
         """
         参数:
             state_dim: 状态维度（特征向量长度）
             n_actions: 动作数量（默认使用 action_map 的长度）
-            n_locs: 位置数量（3个候选块）
+            n_locs: 位置数量（默认3：Top-3）
             lr: 学习率（降低到 1e-4）
             gamma: 折扣因子
             epsilon: PPO裁剪参数
@@ -147,7 +147,9 @@ class PPOAgent:
         self.epochs = epochs
         
         # 动作映射：索引 -> 实际变异模式（保留原有选择顺序）
-        default_action_map = [1, 2, 4, 7, 8, 9, 11]
+        all_action_map = [1, 2, 4, 7, 8, 9, 11]
+        # 暂时禁用 11，保留以便后续启用
+        default_action_map = [1, 2, 4, 7, 8, 9]
         if action_map is None:
             action_map = list(default_action_map)
 
@@ -261,7 +263,16 @@ class PPOAgent:
             returns.insert(0, gae + values[i])
             advantages.insert(0, gae)
         
-        # 在这里归一化 Advantage
+        # 先记录未归一化的优势统计，用于诊断是否在“真学习”
+        raw_adv = np.array(advantages, dtype=np.float32) if advantages else np.zeros(1, dtype=np.float32)
+        adv_stats = {
+            'adv_mean_raw': float(raw_adv.mean()),
+            'adv_std_raw': float(raw_adv.std()),
+            'adv_abs_mean_raw': float(np.abs(raw_adv).mean()),
+            'adv_max_abs_raw': float(np.abs(raw_adv).max())
+        }
+
+        # 在这里归一化 Advantage（用于训练稳定性）
         advantages = torch.FloatTensor(advantages).to(self.device)
         # ✅ 归一化前检查方差
         if len(advantages) > 1:
@@ -270,15 +281,21 @@ class PPOAgent:
                 advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
             else:
                 logger.warning("Advantages方差为0，跳过归一化")
-        return returns, advantages
+        return returns, advantages, adv_stats
     
     def update(self, next_value=0.0):
         """PPO 更新策略"""
         if len(self.memory['states']) == 0:
-            return 0.0
+            return {
+                'loss': 0.0,
+                'adv_mean_raw': 0.0,
+                'adv_std_raw': 0.0,
+                'adv_abs_mean_raw': 0.0,
+                'adv_max_abs_raw': 0.0
+            }
         
         # 计算回报和优势
-        returns, advantages = self.compute_returns(next_value=next_value)
+        returns, advantages, adv_stats = self.compute_returns(next_value=next_value)
         
         # 转换为 tensor
         states = torch.FloatTensor(np.array(self.memory['states'])).to(self.device)
@@ -298,7 +315,10 @@ class PPOAgent:
             if torch.isnan(action_logits).any():
                 logger.error(f"Epoch {epoch}: NaN in logits!")
                 self.clear_memory()
-                return 0.0
+                return {
+                    'loss': 0.0,
+                    **adv_stats
+                }
             
             # ✅ 使用 logits
             dist = Categorical(logits=action_logits)
@@ -310,7 +330,8 @@ class PPOAgent:
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
             
-            actor_loss = -torch.min(surr1, surr2).mean() - 0.01 * entropy
+            # Stronger entropy bonus helps prevent early collapse to one action.
+            actor_loss = -torch.min(surr1, surr2).mean() - 0.03 * entropy
             
             # Critic Loss
             state_values_sq = state_values.squeeze()
@@ -330,7 +351,10 @@ class PPOAgent:
             if torch.isnan(loss):
                 logger.error(f"Epoch {epoch}: NaN in loss!")
                 self.clear_memory()
-                return 0.0
+                return {
+                    'loss': 0.0,
+                    **adv_stats
+                }
             
 
             # 反向传播
@@ -342,7 +366,10 @@ class PPOAgent:
             total_loss_val += loss.item()
 
         self.clear_memory()
-        return total_loss_val / self.epochs
+        return {
+            'loss': total_loss_val / self.epochs,
+            **adv_stats
+        }
 
     def log_action_distribution(self, episode):
         """

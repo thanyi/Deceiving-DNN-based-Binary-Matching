@@ -8,6 +8,7 @@ import os
 import sys
 import glob
 import shutil
+import json
 import numpy as np
 import torch
 import argparse
@@ -73,8 +74,10 @@ def cleanup_inference_files(save_path, keep_binary):
             except Exception as e:
                 logger.warning(f"无法删除 {item}: {e}")
     
-    # 清理 rl_output 中的中间文件
-    rl_output = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rl_output')
+    # 清理 rl_output 中的中间文件（优先使用 save_path 下的私有目录）
+    rl_output = os.path.join(save_path, 'rl_output')
+    if not os.path.exists(rl_output):
+        rl_output = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rl_output')
     if os.path.exists(rl_output):
         for mutant in glob.glob(os.path.join(rl_output, 'mutant_*.bin*')):
             try:
@@ -125,10 +128,25 @@ def inference_ppo(args):
     
     # 初始化环境
     logger.info("初始化变异环境...")
+    dataset_path = os.path.join(args.save_path, "inference_dataset.json")
+    dataset = [{
+        "binary_path": os.path.abspath(args.binary),
+        "binary_name": os.path.basename(args.binary),
+        "version": "inference",
+        "opt_level": "unknown",
+        "func_name": args.function,
+        "func_addr": 0,
+        "size": 0,
+        "id": "inference"
+    }]
+    with open(dataset_path, "w") as f:
+        json.dump(dataset, f, indent=2)
+
     env = BinaryPerturbationEnv(
-        original_binary=args.binary,
-        function_name=args.function,
-        save_path=args.save_path
+        save_path=args.save_path,
+        dataset_path=dataset_path,
+        sample_hold_interval=1,
+        max_steps=args.max_steps
     )
     env.set_state_dim(args.state_dim)
     logger.info("环境初始化完成 ✓")
@@ -138,7 +156,7 @@ def inference_ppo(args):
     device = 'cuda' if torch.cuda.is_available() and args.use_gpu else 'cpu'
     agent = PPOAgent(
         state_dim=args.state_dim,
-        n_actions=6,
+        n_actions=7,
         device=device
     )
     agent.load(args.model_path)
@@ -163,17 +181,19 @@ def inference_ppo(args):
         logger.info("-" * 60)
         
         # 使用模型选择动作（不探索，选择最优动作）
-        action_idx, actual_action, log_prob, value = agent.select_action(state, explore=False)
-        
-        logger.info(f"选择动作: {actual_action} (索引: {action_idx})")
+        joint_idx, loc_idx, act_idx, actual_action, log_prob, value = agent.select_action(state, explore=False)
+
+        logger.info(f"选择动作: {actual_action} (位置: {loc_idx}, 动作索引: {act_idx}, 联合索引: {joint_idx})")
         logger.info(f"状态价值: {value:.4f}")
         
         # 执行动作
-        next_state, reward, done, info = env.step(actual_action)
+        next_state, reward, done, info = env.step(actual_action, loc_idx)
         
         # 记录信息
         step_info = {
             'step': step + 1,
+            'loc': loc_idx,
+            'act_idx': act_idx,
             'action': actual_action,
             'score': info.get('score', 1.0),
             'grad': info.get('grad', 0.0),
@@ -236,9 +256,9 @@ def inference_ppo(args):
         f.write(f"成功: {success}\n")
         f.write(f"最佳结果: {best_binary}\n\n")
         f.write("步骤详情:\n")
-        f.write("step,action,score,grad,reward,value,binary\n")
+        f.write("step,loc,act_idx,action,score,grad,reward,value,binary\n")
         for record in step_records:
-            f.write(f"{record['step']},{record['action']},{record['score']:.4f},"
+            f.write(f"{record['step']},{record['loc']},{record['act_idx']},{record['action']},{record['score']:.4f},"
                    f"{record['grad']:.4f},{record['reward']:.4f},{record['value']:.4f},"
                    f"{record['binary']}\n")
     
@@ -366,4 +386,3 @@ if __name__ == "__main__":
             logger.error("单次推理模式需要指定 --binary, --function, --save-path")
             sys.exit(1)
         inference_ppo(args)
-

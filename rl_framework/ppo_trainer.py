@@ -77,9 +77,11 @@ def cleanup_intermediate_files(save_path, episode_binaries=None):
             except Exception as e:
                 logger.warning(f"  无法删除容器目录 {container_dir}: {e}")
     
-    # 清理 rl_output 中的中间文件
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    rl_output_dir = os.path.join(current_dir, 'rl_output')
+    # 清理 rl_output 中的中间文件（优先使用 save_path 下的私有目录）
+    rl_output_dir = os.path.join(save_path, 'rl_output')
+    if not os.path.exists(rl_output_dir):
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        rl_output_dir = os.path.join(current_dir, 'rl_output')
     if os.path.exists(rl_output_dir):
         mutant_files = glob.glob(os.path.join(rl_output_dir, 'mutant_*.bin*'))
         for file_path in mutant_files:
@@ -120,7 +122,9 @@ def train_ppo(args):
             msg.startswith("数据集:") or
             msg.startswith("保存路径:") or
             msg.startswith("TensorBoard:") or
-            msg.startswith("回合总结:")
+            msg.startswith("回合总结:") or
+            msg.startswith("action_stats:") or
+            msg.startswith("loc_valid统计:")
         )
 
     def _file_log_filter(record):
@@ -136,6 +140,8 @@ def train_ppo(args):
                 msg.startswith("保存路径:") or
                 msg.startswith("TensorBoard:") or
                 msg.startswith("回合总结:") or
+                msg.startswith("action_stats:") or
+                msg.startswith("loc_valid统计:") or
                 "训练结束" in msg
             )
         if name == "ppo_agent" and msg.startswith("✅ 模型已保存"):
@@ -175,7 +181,7 @@ def train_ppo(args):
         max_steps=args.max_steps
     )
     env.set_state_dim(args.state_dim)
-    
+
     agent = PPOAgent(
         state_dim=args.state_dim,
         lr=args.lr,
@@ -184,6 +190,9 @@ def train_ppo(args):
         n_locs=args.n_locs,
         device='cuda' if torch.cuda.is_available() and args.use_gpu else 'cpu'
     )
+
+    action_ids = list(getattr(env, "action_ids", []))
+    action_stats = {aid: {'count': 0, 'reward_sum': 0.0, 'success': 0} for aid in action_ids}
     
     if args.resume and os.path.exists(args.resume):
         agent.load(args.resume)
@@ -201,7 +210,9 @@ def train_ppo(args):
     best_score = float('inf')
     info = {}  # 初始化 info，避免作用域问题
    
-    global_total_steps = 0 
+    global_total_steps = 0
+    global_loc_total_steps = 0
+    global_loc_invalid_steps = 0
     try:
         pbar = tqdm(total=args.episodes, desc="Training", unit="ep", dynamic_ncols=True)
         for episode in range(args.episodes):
@@ -214,6 +225,8 @@ def train_ppo(args):
             initial_score = 1.0 # 【优化】默认初始为1.0，防止第一步没取到score导致计算错误
             
             episode_reward = 0
+            episode_loc_total_steps = 0
+            episode_loc_invalid_steps = 0
             last_binary_info = None
             should_skip_update = False
             episode_done = False  # 标记 episode 是否正常结束
@@ -231,6 +244,14 @@ def train_ppo(args):
                 # input("step down, press enter to continue")
                 episode_reward += reward
                 state = next_state
+
+                loc_valid = info.get('loc_valid')
+                if loc_valid is not None:
+                    episode_loc_total_steps += 1
+                    global_loc_total_steps += 1
+                    if not loc_valid:
+                        episode_loc_invalid_steps += 1
+                        global_loc_invalid_steps += 1
                 
                 
                 if step % 100 == 0:
@@ -239,6 +260,13 @@ def train_ppo(args):
                     writer.add_scalar('Step/Critic_Value', value, global_total_steps)                     # Critic 网络（裁判）认为“当前这个状态，未来能拿多少分”。
                     if 'score' in info:
                         writer.add_scalar('Step/Similarity_Score', info['score'], global_total_steps)     # 每一步变异后的代码与原代码的相似度。
+
+                # 统计动作级别的 reward/success
+                stat = action_stats.setdefault(actual_action, {'count': 0, 'reward_sum': 0.0, 'success': 0})
+                stat['count'] += 1
+                stat['reward_sum'] += reward
+                if info.get('score', 1.0) < env.target_score:
+                    stat['success'] += 1
 
                 # 存储经验
                 agent.store_transition(prev_state, joint_idx, reward, log_prob, value, done)
@@ -299,13 +327,46 @@ def train_ppo(args):
             # === Episode 级别记录 (核心) ===
             current_success_rate = np.mean(success_window) if success_window else 0.0
             avg_drop = np.mean(similarity_drop_window) if similarity_drop_window else 0.0
-            
-            logger.success(f"回合总结: 总奖={episode_reward:.2f} | 滑动成功率={current_success_rate:.2f} | 平均降分={avg_drop:.2f} | 步数={step+1} | 目标函数={target_func} | 目标二进制={last_binary_info['binary'] if last_binary_info else 'N/A'}")
+            episode_loc_invalid_ratio = (
+                episode_loc_invalid_steps / episode_loc_total_steps
+                if episode_loc_total_steps > 0 else 0.0
+            )
+            global_loc_invalid_ratio = (
+                global_loc_invalid_steps / global_loc_total_steps
+                if global_loc_total_steps > 0 else 0.0
+            )
+
+            logger.success(
+                f"回合总结: 总奖={episode_reward:.2f} | 滑动成功率={current_success_rate:.2f} | 平均降分={avg_drop:.2f} "
+                f"| loc_valid=False(本回合)={episode_loc_invalid_ratio:.2%} | loc_valid=False(全局)={global_loc_invalid_ratio:.2%} "
+                f"| 步数={step+1} | 目标函数={target_func} | 目标二进制={last_binary_info['binary'] if last_binary_info else 'N/A'}"
+            )
+            logger.info(
+                f"loc_valid统计: 本回合无效比例={episode_loc_invalid_ratio:.2%} | 全局无效比例={global_loc_invalid_ratio:.2%} "
+                f"| 本回合统计步数={episode_loc_total_steps} | 全局统计步数={global_loc_total_steps}"
+            )
+            if episode % 50 == 0 and action_stats:
+                parts = []
+                for aid in sorted(action_stats.keys()):
+                    stat = action_stats[aid]
+                    if stat['count'] == 0:
+                        continue
+                    avg_r = stat['reward_sum'] / stat['count']
+                    succ = stat['success'] / stat['count']
+                    parts.append(f"a{aid}:cnt={stat['count']} avgR={avg_r:.3f} succ={succ:.1%}")
+                if parts:
+                    logger.info("action_stats: " + " | ".join(parts))
+                for stat in action_stats.values():
+                    stat['count'] = 0
+                    stat['reward_sum'] = 0.0
+                    stat['success'] = 0
             
             writer.add_scalar('Main/Success_Rate_MA50', current_success_rate, episode)      # 最近 50 个回合中，成功绕过检测（分数 < 0.4）的比例。
             writer.add_scalar('Main/Similarity_Drop_MA50', avg_drop, episode)               # 最近 50 个回合中，平均把相似度降低了多少（初始分 1.0 - 最终分）
             writer.add_scalar('Main/Episode_Reward', episode_reward, episode)               # Agent 在一个回合内拿到的所有奖励之和。
             writer.add_scalar('Main/Episode_Length', step + 1, episode)                      # 一个回合内总共执行了多少步。
+            writer.add_scalar('Debug/Loc_Invalid_Ratio_Episode', episode_loc_invalid_ratio, episode)
+            writer.add_scalar('Debug/Loc_Invalid_Ratio_Global', global_loc_invalid_ratio, episode)
             writer.add_histogram('Debug/Action_Distribution', np.array(episode_actions), episode)   # 在当前回合中，Agent 选择了哪些变异动作（Action 0-5）。
             writer.add_scalar('Debug/Policy_Loss', loss, episode)                           # PPO 算法更新时的 Loss 值。
             writer.add_scalar('Debug/Advantage_Mean_Raw', update_info['adv_mean_raw'], episode)

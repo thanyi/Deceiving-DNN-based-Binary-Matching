@@ -33,7 +33,7 @@ class MilestoneRewardTracker:
     """里程碑追踪器（他的实现很好，我完全同意）"""
     def __init__(self):
         self.milestones = [0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.42, 0.40]
-        self.milestone_rewards = [2, 3, 5, 8, 12, 18, 25, 50]
+        self.milestone_rewards = [1.0, 1.5, 2.5, 4.0, 6.0, 9.0, 12.5, 25.0]
         self.achieved = set()
     
     def compute_reward(self, current_score):
@@ -55,7 +55,7 @@ class BinaryPerturbationEnv:
     与 PPO Agent 在同一进程中运行，通过函数调用通信
     """
     
-    def __init__(self, save_path, dataset_path, sample_hold_interval=3, max_steps=30):
+    def __init__(self, save_path, dataset_path, sample_hold_interval=3, max_steps=30, output_dir=None):
         """
         参数:
             original_binary: 原始二进制文件路径
@@ -102,9 +102,13 @@ class BinaryPerturbationEnv:
         # 动作空间（必须与 PPOAgent 的 action_map 保持一致）
         # All available actions (keep 11 for future use).
         self.all_action_ids = [1, 2, 4, 7, 8, 9, 11]
-        # Temporarily disable action 11.
-        self.action_ids = [1, 2, 4, 7, 8, 9]
+        # Enable full 7-action space (including 11).
+        self.action_ids = [1, 2, 4, 7, 8, 9, 11]
         self.action_id_to_index = {aid: idx for idx, aid in enumerate(self.action_ids)}
+        # Fixed histogram space: keep 7 bins to match the 16-dim history layout.
+        self.hist_action_ids = list(self.all_action_ids)
+        self.hist_action_id_to_index = {aid: idx for idx, aid in enumerate(self.hist_action_ids)}
+        self.hist_action_dim = len(self.hist_action_ids)
         self.n_actions = len(self.action_ids)
         # 记录当前目标下的历史最优分数，用于奖励塑形
         self.best_score = 1.0
@@ -113,7 +117,7 @@ class BinaryPerturbationEnv:
         self.no_change_penalty = 0.5
         self.invalid_loc_penalty = 1.0
         # Small penalty when the policy keeps repeating the same action.
-        self.repeat_action_penalty = 0.3
+        self.repeat_action_penalty = 1.0
         
         # 【性能优化】Radare2 特征提取缓存
         # 缓存键: (binary_path, function_name, function_addr)
@@ -131,6 +135,9 @@ class BinaryPerturbationEnv:
         # 在 save_path 下创建固定工作目录
         self._asm_work_dir = os.path.join(self.save_path, '_asm_work')
         os.makedirs(self._asm_work_dir, exist_ok=True)
+        # 独立的变异输出目录（避免多进程/多实验互相污染）
+        self.output_dir = os.path.abspath(output_dir) if output_dir else os.path.join(self.save_path, 'rl_output')
+        os.makedirs(self.output_dir, exist_ok=True)
 
         # 奖励机制
         self.milestone_tracker = MilestoneRewardTracker()
@@ -320,17 +327,17 @@ class BinaryPerturbationEnv:
     def _action_histogram_features(self):
         """
         将历史动作(action_id)映射到稳定的索引空间(action_index)，避免把 action_id 当索引导致统计失真。
-        返回长度为 n_actions 的归一化直方图。
+        返回长度为 7 的归一化直方图（包含暂时禁用的 action 11，占位为 0）。
         """
-        counts = np.zeros(self.n_actions, dtype=np.float32)
+        counts = np.zeros(self.hist_action_dim, dtype=np.float32)
         total = max(len(self.mutation_history), 1)
 
         for m in self.mutation_history:
             action_id = m.get('action')
-            action_idx = self.action_id_to_index.get(action_id)
+            action_idx = self.hist_action_id_to_index.get(action_id)
 
             # 兼容旧数据：如果历史里存的是索引而不是 action_id，则回退为索引。
-            if action_idx is None and isinstance(action_id, int) and 0 <= action_id < self.n_actions:
+            if action_idx is None and isinstance(action_id, int) and 0 <= action_id < self.hist_action_dim:
                 action_idx = action_id
 
             if action_idx is not None:
@@ -706,7 +713,7 @@ class BinaryPerturbationEnv:
         
         参数:
             seed_binary: 种子二进制文件路径
-            action: 变异模式 (1,2,4,7,8,9)  # 11 暂时禁用
+            action: 变异模式 (1,2,4,7,8,9,11)
             target_addr: 攻击位置地址
         返回:
             mutated_binary: 变异后的二进制文件路径
@@ -719,12 +726,8 @@ class BinaryPerturbationEnv:
             current_step = getattr(self, 'step_count', 'unknown')
             logger.info("Applying mutation {} to {} (step={})".format(action, os.path.basename(seed_binary), current_step))
             
-            # 确保输出目录存在
-            output_dir = '/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/rl_output'
-            os.makedirs(output_dir, exist_ok=True)
-            
             # 生成临时二进制文件名
-            tmp_bin = os.path.join(output_dir, 'mutant_' + str(int(time.time() * 1000)) + '.bin')
+            tmp_bin = os.path.join(self.output_dir, 'mutant_' + str(int(time.time() * 1000)) + '.bin')
             
             # 确定模式
             fmode = 'mutated' if seed_binary != self.original_binary else 'original'
@@ -856,18 +859,18 @@ class BinaryPerturbationEnv:
             loc_valid = True
         else:
             # --- Random NonTop (disabled) ---
-            # candidate_blocks = []
-            # if self.current_all_blocks:
-            #     exclude = set(self.current_critical_blocks)
-            #     candidate_blocks = [addr for addr in self.current_all_blocks if addr not in exclude]
-            #
-            # if candidate_blocks:
-            #     target_addr = random.choice(candidate_blocks)
-            #     loc_valid = True
-            # elif self.current_all_blocks:
-            #     # 如果没有非Top块，退回随机任意块（避免完全无效）
-            #     target_addr = random.choice(self.current_all_blocks)
-            #     loc_valid = True
+            candidate_blocks = []
+            if self.current_all_blocks:
+                exclude = set(self.current_critical_blocks)
+                candidate_blocks = [addr for addr in self.current_all_blocks if addr not in exclude]
+            
+            if candidate_blocks:
+                target_addr = random.choice(candidate_blocks)
+                loc_valid = True
+            elif self.current_all_blocks:
+                # 如果没有非Top块，退回随机任意块（避免完全无效）
+                target_addr = random.choice(self.current_all_blocks)
+                loc_valid = True
 
             # 这种情况可能发生于：函数太小没有关键块，或特征提取失败
             logger.debug(
@@ -1055,7 +1058,7 @@ class BinaryPerturbationEnv:
         # === 4. 显式惩罚 ===
         penalty = 0.0
         if no_change:
-            penalty += 2.0
+            penalty += 1.0
         if invalid_loc:
             penalty += 2.0
         if repeat_streak > 0:
@@ -1068,7 +1071,7 @@ class BinaryPerturbationEnv:
         
         # === 5. 硬裁剪（不是归一化！）===
         # 只是防止极端值，不改变奖励的相对大小关系
-        return np.clip(total_reward, -10.0, 150.0)
+        return np.clip(total_reward, -5.0, 30.0)
 
     def _switch_next_target(self):
         """

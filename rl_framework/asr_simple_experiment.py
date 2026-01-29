@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 # Local imports
 from env_wrapper import BinaryPerturbationEnv
@@ -107,6 +108,7 @@ def make_mutated_query(sample: Dict, mutated_binary: Optional[str]) -> Dict:
         mutated["binary_path"] = mutated_binary
     base = f"{mutated.get('binary_path', '')}::{mutated.get('func_name', '')}"
     mutated["id"] = hashlib.md5(base.encode("utf-8")).hexdigest()[:8]
+    print(f"    Mutated query : {mutated}")
     return mutated
 
 
@@ -226,6 +228,7 @@ def run_asr_simple(
     csv_path: str,
     use_gpu: bool,
     retrieval_mode: str,
+    retrieval_ctx: Optional[Dict],
 ) -> Tuple[float, List[Dict]]:
     dataset = load_dataset(dataset_path)
     if limit is not None:
@@ -240,17 +243,22 @@ def run_asr_simple(
     )
 
     # Shared asm2vec work dir and caches reduce repeated bin->asm extraction.
-    retrieval_ctx = {
-        "asm_work_dir": os.path.join(save_path, "_asm2vec_retrieval"),
-        "original_asm_cache": {},
-        "sym_to_addr_cache": {},
-    }
+    if retrieval_ctx is None:
+        retrieval_ctx = {
+            "asm_work_dir": os.path.join(save_path, "_asm2vec_retrieval"),
+            "original_asm_cache": {},
+            "sym_to_addr_cache": {},
+            "safe_checkpoint_dir": None,
+            "safe_i2v_dir": None,
+            "safe_use_gpu": True,
+        }
     os.makedirs(retrieval_ctx["asm_work_dir"], exist_ok=True)
 
     rows: List[Dict] = []
     success = 0
 
-    for idx, sample in enumerate(dataset):
+    pbar = tqdm(enumerate(dataset), total=len(dataset), desc=f"ASR@{k}", unit="sample")
+    for idx, sample in pbar:
         sample_id = str(sample.get("id") or f"sample_{idx}")
 
         try:
@@ -326,7 +334,7 @@ def run_asr_simple(
 
         if (idx + 1) % 10 == 0:
             current_asr = success / (idx + 1)
-            print(f"[progress] {idx+1}/{len(dataset)} | ASR@{k}={current_asr:.3f}")
+            pbar.set_postfix({"asr": f"{current_asr:.3f}"})
 
     asr = success / max(len(dataset), 1)
     save_csv(rows, csv_path)
@@ -356,7 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
     repo_root = os.path.dirname(os.path.abspath(__file__))
     default_dataset = os.path.join(repo_root, "utils/fast/dataset_test.json")
     default_model = os.path.join(
-        os.path.dirname(repo_root), "rl_models/ppo_model_ep750.pt"
+        os.path.dirname(repo_root), "rl_models/ppo_model_ep150.pt"
     )
     default_save = os.path.join(repo_root, "asr_workdir")
 
@@ -371,10 +379,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-gpu", action="store_true")
     parser.add_argument(
         "--retrieval-mode",
-        choices=["run_one", "stub"],
+        choices=["run_one", "safe", "stub"],
         default="run_one",
-        help="run_one uses run_utils.py asm2vec pipeline; stub is a deterministic placeholder.",
+        help="run_one uses asm2vec pipeline; safe uses SAFE model; stub is a placeholder.",
     )
+    parser.add_argument("--safe-checkpoint-dir", default=None)
+    parser.add_argument("--safe-i2v-dir", default=None)
+    parser.add_argument("--safe-use-gpu", action="store_true")
     return parser
 
 
@@ -388,9 +399,10 @@ def asm2vec_topk_with_mode(
     """
     Retrieval wrapper:
     - run_one: uses run_utils.run_one(simple_mode=True) for real scores.
+    - safe: uses SAFE model embeddings (address-based).
     - stub: stable hash-based placeholder.
     """
-    if retrieval_mode != "run_one":
+    if retrieval_mode == "stub":
         return asm2vec_topk(query, dataset, k)
 
     if run_one is None:
@@ -400,7 +412,7 @@ def asm2vec_topk_with_mode(
     original_binary = query.get("binary_path")
     if not func_name or not original_binary:
         return asm2vec_topk(query, dataset, k)
-
+    # print(f"[*] asm2vec_topk_with_mode: dataset is '{dataset}'")
     asm_work_dir = None
     original_asm_cache = None
     sym_to_addr_cache = None
@@ -423,20 +435,24 @@ def asm2vec_topk_with_mode(
         cand_binary = cand.get("binary_path")
         if not cand_binary or not os.path.exists(cand_binary):
             continue
-
-        # run_one is heavy but accurate: it extracts asm and compares functions.
+        # print(f"    Comparing to candidate binary: {cand_binary} :: {cand.get('func_name')}")
+        # run_one/SAFE are heavy but accurate: they extract features and compare functions.
         score, _grad = run_one(
             original_binary,
             cand_binary,
             model_original=None,
             checkdict={},
             function_name=str(func_name),
-            detection_method="asm2vec",
+            detection_method="safe" if retrieval_mode == "safe" else "asm2vec",
             asm_work_dir=asm_work_dir,
             original_asm_cache=original_asm_cache,
             simple_mode=True,
+            original_func_addr=query.get("func_addr"),
             mutated_func_addr=cand.get("func_addr"),
             sym_to_addr_path=sym_to_addr_path,
+            safe_checkpoint_dir=retrieval_ctx.get("safe_checkpoint_dir") if retrieval_ctx else None,
+            safe_i2v_dir=retrieval_ctx.get("safe_i2v_dir") if retrieval_ctx else None,
+            safe_use_gpu=bool(retrieval_ctx.get("safe_use_gpu")) if retrieval_ctx else True,
         )
         if score is None:
             continue
@@ -460,6 +476,18 @@ def main() -> None:
     if not os.path.isabs(csv_path):
         csv_path = os.path.join(args.save_path, csv_path)
 
+    retrieval_ctx = {
+        "asm_work_dir": os.path.join(args.save_path, "_asm2vec_retrieval"),
+        "original_asm_cache": {},
+        "sym_to_addr_cache": {},
+        "safe_checkpoint_dir": None,
+        "safe_i2v_dir": None,
+        "safe_use_gpu": True,
+    }
+    retrieval_ctx["safe_checkpoint_dir"] = args.safe_checkpoint_dir
+    retrieval_ctx["safe_i2v_dir"] = args.safe_i2v_dir
+    retrieval_ctx["safe_use_gpu"] = args.safe_use_gpu
+
     asr, rows = run_asr_simple(
         dataset_path=args.dataset,
         model_path=args.model_path,
@@ -470,6 +498,7 @@ def main() -> None:
         csv_path=csv_path,
         use_gpu=args.use_gpu,
         retrieval_mode=args.retrieval_mode,
+        retrieval_ctx=retrieval_ctx,
     )
 
     print(f"ASR@{args.topk}: {asr:.4f} ({sum(r['success'] for r in rows)}/{len(rows)})")

@@ -149,7 +149,7 @@ class PPOAgent:
         # 动作映射：索引 -> 实际变异模式（保留原有选择顺序）
         all_action_map = [1, 2, 4, 7, 8, 9, 11]
         # 暂时禁用 11，保留以便后续启用
-        default_action_map = [1, 2, 4, 7, 8, 9]
+        default_action_map = [1, 2, 4, 7, 8, 9, 11]
         if action_map is None:
             action_map = list(default_action_map)
 
@@ -331,7 +331,7 @@ class PPOAgent:
             surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
             
             # Stronger entropy bonus helps prevent early collapse to one action.
-            actor_loss = -torch.min(surr1, surr2).mean() - 0.03 * entropy
+            actor_loss = -torch.min(surr1, surr2).mean() - 0.08 * entropy
             
             # Critic Loss
             state_values_sq = state_values.squeeze()

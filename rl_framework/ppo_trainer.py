@@ -101,6 +101,17 @@ def cleanup_intermediate_files(save_path, episode_binaries=None):
     logger.success(f"✓ 清理完成: 删除 {deleted_count} 个项目，释放 {size_str} 空间")
 
 
+def _load_trainer_state(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        checkpoint = torch.load(path, map_location="cpu")
+    except Exception as e:
+        logger.warning(f"无法读取训练状态: {path}, {e}")
+        return None
+    return checkpoint.get("trainer_state")
+
+
 def train_ppo(args):
     """
     PPO 训练主函数
@@ -213,9 +224,37 @@ def train_ppo(args):
     global_total_steps = 0
     global_loc_total_steps = 0
     global_loc_invalid_steps = 0
+    start_episode = 0
+
+    trainer_state = _load_trainer_state(args.resume) if args.resume else None
+    if trainer_state:
+        start_episode = int(trainer_state.get("episode", -1)) + 1
+        global_total_steps = int(trainer_state.get("global_total_steps", 0))
+        global_loc_total_steps = int(trainer_state.get("global_loc_total_steps", 0))
+        global_loc_invalid_steps = int(trainer_state.get("global_loc_invalid_steps", 0))
+        success_count = int(trainer_state.get("success_count", 0))
+        best_score = float(trainer_state.get("best_score", float('inf')))
+        success_window = deque(trainer_state.get("success_window", []), maxlen=50)
+        similarity_drop_window = deque(trainer_state.get("similarity_drop_window", []), maxlen=50)
+        logger.info(f"从断点恢复训练: start_episode={start_episode}")
+    if start_episode >= args.episodes:
+        logger.warning(f"resume 进度已达到 args.episodes ({args.episodes}), 无需继续训练")
+        return
+    def _make_trainer_state(episode):
+        return {
+            "episode": int(episode),
+            "global_total_steps": int(global_total_steps),
+            "global_loc_total_steps": int(global_loc_total_steps),
+            "global_loc_invalid_steps": int(global_loc_invalid_steps),
+            "success_count": int(success_count),
+            "best_score": float(best_score),
+            "success_window": list(success_window),
+            "similarity_drop_window": list(similarity_drop_window),
+        }
+
     try:
-        pbar = tqdm(total=args.episodes, desc="Training", unit="ep", dynamic_ncols=True)
-        for episode in range(args.episodes):
+        pbar = tqdm(total=args.episodes - start_episode, desc="Training", unit="ep", dynamic_ncols=True)
+        for episode in range(start_episode, args.episodes):
             logger.info("=" * 60)
             logger.info(f"回合 {episode + 1}/{args.episodes}")
             
@@ -388,11 +427,17 @@ def train_ppo(args):
             
             # 保存模型
             if (episode + 1) % args.save_interval == 0:
-                agent.save(os.path.join(args.model_dir, f'ppo_model_ep{episode+1}.pt'))
+                agent.save(
+                    os.path.join(args.model_dir, f'ppo_model_ep{episode+1}.pt'),
+                    extra_state=_make_trainer_state(episode),
+                )
             
             if 'score' in info and info['score'] < best_score:
                 best_score = info['score']
-                agent.save(os.path.join(args.model_dir, 'ppo_model_best.pt'))
+                agent.save(
+                    os.path.join(args.model_dir, 'ppo_model_best.pt'),
+                    extra_state=_make_trainer_state(episode),
+                )
 
             # 定期清理
             if episode % 40 == 0:   
@@ -404,7 +449,11 @@ def train_ppo(args):
     finally:
         if 'pbar' in locals():
             pbar.close()
-        agent.save(os.path.join(args.model_dir, 'ppo_model_final.pt'))
+        last_episode = locals().get("episode", start_episode - 1)
+        agent.save(
+            os.path.join(args.model_dir, 'ppo_model_final.pt'),
+            extra_state=_make_trainer_state(last_episode),
+        )
         writer.close()
         
         # 【优化】取消注释，确保退出时清理垃圾

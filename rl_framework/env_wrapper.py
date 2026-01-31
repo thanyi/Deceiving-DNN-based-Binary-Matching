@@ -500,7 +500,7 @@ class BinaryPerturbationEnv:
         vec.append(np.log1p(n_nodes))
         vec.append(np.log1p(n_edges))
         vec.append(n_edges / n_nodes if n_nodes > 0 else 0) 
-        vec.append(np.log1p(complexity))
+        vec.append(np.log1p(max(complexity, 0.0)))
         vec.append(complexity / n_nodes if n_nodes > 0 else 0)
         
         # Leaf / Branch nodes ratio
@@ -518,7 +518,7 @@ class BinaryPerturbationEnv:
             if not values: return [0.0]*4
             arr = np.array(values)
             # 对原始值取 log1p 后再算矩，拉平量纲
-            log_arr = np.log1p(arr)
+            log_arr = np.log1p(np.maximum(arr, 0.0))
             return [np.mean(log_arr), np.max(log_arr), np.std(log_arr), np.median(log_arr)]
 
         dist_bet = [b.get('centrality_betweenness', 0) for b in bbs]

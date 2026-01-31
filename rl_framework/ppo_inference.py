@@ -9,15 +9,40 @@ import sys
 import glob
 import shutil
 import json
+import pickle
 import numpy as np
 import torch
 import argparse
 from loguru import logger
+from tqdm import tqdm
+import random   
 
 # 导入环境和 Agent
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from env_wrapper import BinaryPerturbationEnv
 from ppo_agent import PPOAgent
+from run_utils import run_one
+
+_INFERENCE_LOGGER_READY = False
+
+
+def _setup_inference_logging():
+    global _INFERENCE_LOGGER_READY
+    if _INFERENCE_LOGGER_READY:
+        return
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "log")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "ppo_inference.log")
+    def _inference_log_filter(record):
+        return record["name"] in ("ppo_inference", "__main__")
+    logger.add(
+        log_path,
+        level="INFO",
+        filter=_inference_log_filter,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+    )
+    logger.info(f"PPO inference log file: {log_path}")
+    _INFERENCE_LOGGER_READY = True
 
 
 def cleanup_inference_files(save_path, keep_binary):
@@ -95,6 +120,35 @@ def cleanup_inference_files(save_path, keep_binary):
         logger.info(f"✓ 已保留最佳结果: {os.path.basename(keep_container)}")
 
 
+def _find_sym_to_addr(binary_path):
+    """Best-effort lookup for sym_to_addr.pickle near a binary."""
+    base_dir = os.path.dirname(os.path.abspath(binary_path))
+    candidates = [
+        os.path.join(base_dir, "sym_to_addr.pickle"),
+        os.path.join(os.path.dirname(base_dir), "sym_to_addr.pickle"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _load_sym_to_addr(path):
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return {}
+
+
+def _resolve_func_addr(binary_path, func_name):
+    sym_path = _find_sym_to_addr(binary_path)
+    sym_map = _load_sym_to_addr(sym_path)
+    return sym_map.get(func_name)
+
+
 def inference_ppo(args):
     """
     使用训练好的 PPO 模型进行推理
@@ -117,6 +171,8 @@ def inference_ppo(args):
     logger.info(f"保存路径: {args.save_path}")
     logger.info(f"最大步数: {args.max_steps}")
     logger.info(f"目标分数: {args.target_score}")
+    logger.info(f"检测方法: {args.detection_method}")
+    _setup_inference_logging()
     
     # 检查模型文件是否存在
     if not os.path.exists(args.model_path):
@@ -149,6 +205,7 @@ def inference_ppo(args):
         max_steps=args.max_steps
     )
     env.set_state_dim(args.state_dim)
+    env.target_score = args.target_score
     logger.info("环境初始化完成 ✓")
     
     # 初始化 PPO Agent 并加载模型
@@ -172,6 +229,9 @@ def inference_ppo(args):
     success = False
     best_score = float('inf')
     best_binary = None
+    asm_work_dir = os.path.join(args.save_path, "_asm2vec_eval")
+    os.makedirs(asm_work_dir, exist_ok=True)
+    original_asm_cache = {}
     
     # 记录每步信息
     step_records = []
@@ -189,13 +249,46 @@ def inference_ppo(args):
         # 执行动作
         next_state, reward, done, info = env.step(actual_action, loc_idx)
         
+        # 可选：使用指定检测方法重新计算相似度
+        eval_score = info.get('score', 1.0)
+        if info.get('binary') and args.detection_method != "asm2vec":
+            mutated_func_addr = None
+            sym_to_addr_path = _find_sym_to_addr(info.get('binary'))
+            if args.detection_method == "safe":
+                mutated_func_addr = _resolve_func_addr(info.get('binary'), env.function_name)
+                sym_to_addr_path = _find_sym_to_addr(env.original_binary)
+            eval_score, _ = run_one(
+                env.original_binary,
+                info.get('binary'),
+                model_original=None,
+                checkdict={},
+                function_name=env.function_name,
+                detection_method=args.detection_method,
+                asm_work_dir=asm_work_dir,
+                original_asm_cache=original_asm_cache,
+                simple_mode=True,
+                original_func_addr=dataset[0].get("func_addr"),
+                mutated_func_addr=mutated_func_addr,
+                sym_to_addr_path=sym_to_addr_path,
+                safe_checkpoint_dir=args.safe_checkpoint_dir,
+                safe_i2v_dir=args.safe_i2v_dir,
+                safe_use_gpu=args.safe_use_gpu,
+            )
+            if eval_score is None:
+                eval_score = info.get('score', 1.0)
+        logger.info(
+            f"Step {step+1}: action={actual_action}, loc={loc_idx}, reward={reward:.4f}, eval_score={eval_score}"
+            f"env_score={info.get('score')}, eval_score={eval_score}, done={done}, "
+            f"should_reset={info.get('should_reset')}"
+        )
+
         # 记录信息
         step_info = {
             'step': step + 1,
             'loc': loc_idx,
             'act_idx': act_idx,
             'action': actual_action,
-            'score': info.get('score', 1.0),
+            'score': eval_score,
             'grad': info.get('grad', 0.0),
             'binary': info.get('binary', None),
             'reward': reward,
@@ -204,21 +297,21 @@ def inference_ppo(args):
         step_records.append(step_info)
         
         # 输出结果
-        if 'score' in info:
-            logger.info(f"相似度分数: {info['score']:.4f}")
+        if eval_score is not None:
+            logger.info(f"相似度分数: {eval_score:.4f}")
             logger.info(f"梯度值: {info.get('grad', 0):.4f}")
             logger.info(f"奖励: {reward:.4f}")
             
             # 更新最佳结果
-            if info['score'] < best_score:
-                best_score = info['score']
+            if eval_score < best_score:
+                best_score = eval_score
                 best_binary = info.get('binary', None)
                 logger.success(f"✨ 发现更好的结果! 分数: {best_score:.4f}")
             
             # 检查是否达到目标
-            if info['score'] < args.target_score:
+            if eval_score < args.target_score:
                 success = True
-                logger.success(f"🎉 成功达到目标! 分数: {info['score']:.4f} < {args.target_score}")
+                logger.success(f"🎉 成功达到目标! 分数: {eval_score:.4f} < {args.target_score}")
                 logger.success(f"变异后的二进制: {info.get('binary', 'unknown')}")
                 break
         else:
@@ -226,9 +319,14 @@ def inference_ppo(args):
         
         state = next_state
         
-        if done:
-            logger.info("回合结束")
-            break
+        if args.detection_method == "asm2vec":
+            if done:
+                logger.info("回合结束")
+                break
+        else:
+            if info.get("should_reset"):
+                logger.info("回合结束 (should_reset)")
+                break
     
     # 输出总结
     logger.info("")
@@ -245,6 +343,10 @@ def inference_ppo(args):
     
     if best_binary:
         logger.info(f"最佳变异结果: {best_binary}")
+    logger.info(
+        f"RESULT: success={int(success)}, steps={step + 1}, "
+        f"best_score={best_score:.6f}, target_score={args.target_score}"
+    )
     
     # 保存推理日志
     log_file = os.path.join(args.save_path, 'inference_log.txt')
@@ -352,22 +454,171 @@ def batch_inference(args):
     logger.info(f"批量结果已保存: {batch_log}")
 
 
+def _pin_sample(env, sample_idx, sample):
+    env.current_sample_idx = sample_idx
+    env.current_sample_data = sample
+    env.episodes_on_current = 0
+    env.original_binary = sample.get("binary_path")
+    env.function_name = sample.get("func_name")
+
+
+def evaluate_dataset(args):
+    logger.info("=" * 80)
+    logger.info("PPO 数据集评估模式")
+    logger.info("=" * 80)
+    logger.info(f"模型路径: {args.model_path}")
+    logger.info(f"数据集: {args.dataset}")
+    logger.info(f"保存路径: {args.save_path}")
+    logger.info(f"最大步数: {args.max_steps}")
+    logger.info(f"目标分数: {args.target_score}")
+    logger.info(f"检测方法: {args.detection_method}")
+    _setup_inference_logging()
+
+    if not os.path.exists(args.model_path):
+        logger.error(f"模型文件不存在: {args.model_path}")
+        return
+    if not os.path.exists(args.dataset):
+        logger.error(f"数据集文件不存在: {args.dataset}")
+        return
+
+    with open(args.dataset, "r", encoding="utf-8") as f:
+        dataset = json.load(f)
+    if not isinstance(dataset, list):
+        logger.error("数据集格式错误：必须是 JSON 列表")
+        return
+
+    if args.seed is not None:
+        random.seed(args.seed)
+    random.shuffle(dataset)
+
+    if args.limit is not None:
+        dataset = dataset[: args.limit]
+
+    os.makedirs(args.save_path, exist_ok=True)
+
+    env = BinaryPerturbationEnv(
+        save_path=args.save_path,
+        dataset_path=args.dataset,
+        sample_hold_interval=10**9,
+        max_steps=args.max_steps,
+    )
+    env.set_state_dim(args.state_dim)
+    env.target_score = args.target_score
+
+    device = 'cuda' if torch.cuda.is_available() and args.use_gpu else 'cpu'
+    agent = PPOAgent(
+        state_dim=args.state_dim,
+        n_actions=7,
+        device=device
+    )
+    agent.load(args.model_path)
+    agent.policy.eval()
+
+    asm_work_dir = os.path.join(args.save_path, "_asm2vec_eval")
+    os.makedirs(asm_work_dir, exist_ok=True)
+    original_asm_cache = {}
+
+    success_count = 0
+    total = len(dataset)
+
+    pbar = tqdm(enumerate(dataset), total=total, desc="PPO Eval", unit="sample")
+    for idx, sample in pbar:
+        _pin_sample(env, idx, sample)
+        state = env.reset(force_switch=False)
+
+        best_score = 1.0
+        success = False
+
+        for step in range(args.max_steps):
+            joint_idx, loc_idx, act_idx, actual_action, log_prob, value = agent.select_action(state, explore=True)
+            next_state, reward, done, info = env.step(actual_action, loc_idx)
+            print(f"Step {step}: action={actual_action}, loc={loc_idx}, reward={reward:.4f}")
+            eval_score = info.get('score', 1.0)
+            if info.get('binary') and args.detection_method != "asm2vec":
+                mutated_func_addr = None
+                sym_to_addr_path = _find_sym_to_addr(info.get('binary'))
+                if args.detection_method == "safe":
+                    mutated_func_addr = _resolve_func_addr(info.get('binary'), env.function_name)
+                    sym_to_addr_path = _find_sym_to_addr(env.original_binary)
+                eval_score, _ = run_one(
+                    env.original_binary,
+                    info.get('binary'),
+                    model_original=None,
+                    checkdict={},
+                    function_name=env.function_name,
+                    detection_method=args.detection_method,
+                    asm_work_dir=asm_work_dir,
+                    original_asm_cache=original_asm_cache,
+                    simple_mode=True,
+                    original_func_addr=sample.get("func_addr"),
+                    mutated_func_addr=mutated_func_addr,
+                    sym_to_addr_path=sym_to_addr_path,
+                    safe_checkpoint_dir=args.safe_checkpoint_dir,
+                    safe_i2v_dir=args.safe_i2v_dir,
+                    safe_use_gpu=args.safe_use_gpu,
+                )
+                if eval_score is None:
+                    eval_score = info.get('score', 1.0)
+
+            logger.info(
+                f"Eval step {step+1}: action={actual_action}, loc={loc_idx}, reward={reward:.4f}, "
+                f"env_score={info.get('score')}, eval_score={eval_score}, done={done}, "
+                f"should_reset={info.get('should_reset')}"
+            )
+            if eval_score is not None and eval_score < best_score:
+                best_score = eval_score
+                if eval_score < args.target_score:
+                    success = True
+                    break
+
+            state = next_state
+            if args.detection_method == "asm2vec":
+                if done:
+                    break
+            else:
+                if info.get("should_reset"):
+                    break
+
+        if success:
+            success_count += 1
+
+        if (idx + 1) % 10 == 0:
+            pbar.set_postfix({"success_rate": f"{success_count/max(1, idx+1):.3f}"})
+
+    success_rate = success_count / max(1, total)
+    logger.success(f"✓ 测试完成: success_rate={success_rate:.4f} ({success_count}/{total})")
+    logger.info(
+        f"RESULT: success_rate={success_rate:.6f}, success_count={success_count}, total={total}, "
+        f"target_score={args.target_score}"
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='PPO Inference for Binary Perturbation')
     
     # 模型参数
-    parser.add_argument('--model-path', required=True, help='训练好的模型路径 (如 rl_models/ppo_model_best.pt)')
+    default_model = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'rl_models/ppo_model_ep200.pt')
+    parser.add_argument('--model-path', default=default_model, help='训练好的模型路径')
     
     # 目标参数
+    default_dataset = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'datasets/fast_0128/dataset_test.json')
     parser.add_argument('--binary', help='原始二进制文件路径')
     parser.add_argument('--function', help='目标函数名')
     parser.add_argument('--save-path', help='变异结果保存路径')
+    parser.add_argument('--dataset', default=default_dataset, help='测试数据集路径')
+    parser.add_argument('--limit', type=int, default=None, help='限制评估样本数量')
+    parser.add_argument('--eval-dataset', action='store_true', help='评估整个数据集的成功率')
+    parser.add_argument('--seed', type=int, default=42, help='随机种子')
     
     # 推理参数
     parser.add_argument('--state-dim', type=int, default=256, help='状态维度（必须与训练时一致，默认 256）')
     parser.add_argument('--max-steps', type=int, default=30, help='最大步数')
     parser.add_argument('--target-score', type=float, default=0.40, help='目标相似度分数')
+    parser.add_argument('--detection-method', choices=['asm2vec', 'safe'], default='asm2vec', help='相似度检测方法')
     parser.add_argument('--use-gpu', action='store_true', help='使用 GPU')
+    parser.add_argument('--safe-checkpoint-dir', default=None, help='SAFE 模型 checkpoint 目录')
+    parser.add_argument('--safe-i2v-dir', default=None, help='SAFE i2v 目录')
+    parser.add_argument('--safe-use-gpu', action='store_true', help='SAFE 使用 GPU')
     
     # 批量模式
     parser.add_argument('--batch', action='store_true', help='批量推理模式')
@@ -375,8 +626,13 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # 批量模式或单次推理
-    if args.batch:
+    # 批量模式/数据集评估/单次推理
+    if args.eval_dataset:
+        if not args.save_path:
+            logger.error("数据集评估需要指定 --save-path")
+            sys.exit(1)
+        evaluate_dataset(args)
+    elif args.batch:
         if not args.batch_file:
             logger.error("批量模式需要指定 --batch-file")
             sys.exit(1)

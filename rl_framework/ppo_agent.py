@@ -128,7 +128,7 @@ class PPOAgent:
     """PPO 智能体"""
     
     def __init__(self, state_dim=256, n_actions=None, n_locs=3, lr=1e-4, gamma=0.99, 
-                 epsilon=0.2, epochs=5, device='cpu', action_map=None):
+                 epsilon=0.2, epochs=10, device='cpu', action_map=None):
         """
         参数:
             state_dim: 状态维度（特征向量长度）
@@ -448,9 +448,9 @@ class PPOAgent:
             'dones': []
         }
     
-    def save(self, path):
+    def save(self, path, extra_state=None):
         """保存模型（完整版）"""
-        torch.save({
+        payload = {
             'policy_state_dict': self.policy.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'action_stats': self.action_stats,
@@ -459,7 +459,10 @@ class PPOAgent:
                 'epsilon': self.epsilon,
                 'epochs': self.epochs
             }
-        }, path)
+        }
+        if extra_state:
+            payload['trainer_state'] = extra_state
+        torch.save(payload, path)
         logger.info(f"✅ 模型已保存: {path}")
     
     def load(self, path):

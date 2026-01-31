@@ -11,6 +11,7 @@ from utils.ail_utils import *
 from utils.pp_print import *
 from junkcodes import get_junk_codes
 from addr_utils import addr_equals, select_block_by_addr
+import random
 
 obfs_proportion = 0.2
 
@@ -35,6 +36,8 @@ class bb_opaque_diversify_gen2(ailVisitor):
     def get_opaque_header2(self, b, spt_pos=0):
         opaque_symbol = b.bblock_name + '_opaque_next'
         bil = self.bb_instrs(b)
+        if not bil or spt_pos >= len(bil):
+            return []
         i = bil[spt_pos]
 
         # print 'basic block opaque transformation: ' + b.bblock_name + ' ' + dec_hex(b.bblock_begin_loc.loc_addr) \
@@ -67,8 +70,11 @@ class bb_opaque_diversify_gen2(ailVisitor):
         '''
 
 
-        # store the %eax to stack
-        i1 = SingleInstr(("pusha", iloc, None)) # DoubleInstr(('push', self._regs[0], iloc, None))
+        # store general regs to stack (pusha/popa are invalid on x86_64)
+        save_regs = []
+        for idx, reg in enumerate(self._regs):
+            loc = iloc if idx == 0 else tmp_iloc
+            save_regs.append(DoubleInstr((self._ops['push'], reg, loc, None)))
         save_flag = SingleInstr((self._ops['pushf'], tmp_iloc, None))
         i2 = TripleInstr(('mov', RegClass('eax'), Types.Normal(0x41414141),  tmp_iloc, None))
         i3 = TripleInstr(('mov', RegClass('ecx'), Types.Normal(0x42424242),  tmp_iloc, None))
@@ -83,11 +89,14 @@ class bb_opaque_diversify_gen2(ailVisitor):
         i12 = DoubleInstr(('setl', RegClass('ah'), tmp_iloc, None))
         i13 = TripleInstr(('xor', RegClass('ah'), RegClass('al'), tmp_iloc, None))
         recover_flag = SingleInstr((self._ops['popf'], tmp_iloc, None))
-        i14 = SingleInstr(("popa", tmp_iloc, None))
+        restore_regs = []
+        for reg in reversed(self._regs):
+            restore_regs.append(DoubleInstr((self._ops['pop'], reg, tmp_iloc, None)))
         i0 = set_loc(i, tmp_iloc)
 
         res = list()
-        res.append((instr_update.INSERT, i1, iloc))
+        for ins in save_regs:
+            res.append((instr_update.INSERT, ins, iloc))
         res.append((instr_update.INSERT, save_flag, iloc))
         res.append((instr_update.INSERT, i2, iloc))
         res.append((instr_update.INSERT, i3, iloc))
@@ -102,7 +111,8 @@ class bb_opaque_diversify_gen2(ailVisitor):
         res.append((instr_update.INSERT, i12, iloc))
         res.append((instr_update.INSERT, i13, iloc))
         res.append((instr_update.INSERT, recover_flag, iloc))
-        res.append((instr_update.INSERT, i14, iloc))
+        for ins in restore_regs:
+            res.append((instr_update.INSERT, ins, iloc))
         res.append((instr_update.REPLACE, i0, iloc, i))
         return res
 
@@ -117,6 +127,8 @@ class bb_opaque_diversify_gen2(ailVisitor):
         """
         opaque_symbol = b.bblock_name + '_opaque_next'
         bil = self.bb_instrs(b)
+        if not bil or spt_pos >= len(bil):
+            return []
         i = bil[spt_pos]
         iloc_with_block_label = self._get_loc(i)
         iloc_without_label = copy.deepcopy(iloc_with_block_label)
@@ -206,7 +218,7 @@ class bb_opaque_diversify_gen2(ailVisitor):
         res.append((instr_update.INSERT, DoubleInstr(('je', Types.Label(opaque_symbol), iloc_without_label, None)),
                     iloc_with_block_label))
         # false branch
-        res.append((instr_update.INSERT, DoubleInstr(('call', Types.Label('abort'), iloc_without_label, None)),
+        res.append((instr_update.INSERT, DoubleInstr(('call', Types.Label('halt_func'), iloc_without_label, None)),
                     iloc_with_block_label))
         # true branch
         res.append((instr_update.INSERT, TripleInstr(('mov', self._regs[2], Types.Normal(0x41414141), iloc_with_true_branch_label, None)),
@@ -257,6 +269,9 @@ class bb_opaque_diversify_gen2(ailVisitor):
                         print '[bb_opaque_diversify_gen2.py:bb_div_opaque] Found target_addr: %s inside block (begin=0x%X)' % (target_addr, b.bblock_begin_loc.loc_addr)
                     n_mode = random.randint(0, len(modes) - 1)
                     changelist = modes[n_mode](b, 0)
+                    if not changelist:
+                        print '[bb_opaque_diversify_gen2.py:bb_div_opaque] Warning: empty block at target_addr, skip'
+                        return
                     self._change_instrs_with_changelist(changelist)
                     self.update_process()
                     return
@@ -267,10 +282,14 @@ class bb_opaque_diversify_gen2(ailVisitor):
         for f in self.fb_tbl.keys():
             bl = self.fb_tbl[f]
             if len(bl) > 0:
-                n = random.randint(0, len(bl) - 1)
+                candidates = [b for b in bl if self.bb_instrs(b)]
+                if not candidates:
+                    continue
+                n = random.randint(0, len(candidates) - 1)
                 n_mode = random.randint(0, len(modes) - 1)
-                changelist = modes[n_mode](bl[n], 0)
-                self._change_instrs_with_changelist(changelist)
+                changelist = modes[n_mode](candidates[n], 0)
+                if changelist:
+                    self._change_instrs_with_changelist(changelist)
         self.update_process()
 
     def get_opaque_routines(self, iloc):
@@ -309,7 +328,12 @@ class bb_opaque_diversify_gen2(ailVisitor):
             if get_op(self.instrs[i]) in ControlOp and 'ret' in p_op(self.instrs[i]):
                 # Note: do not use 'jmp', because it may result in collision with bb_branchfunc_diversify
                 bb_starts.append(i)
-        selected_i = self.instrs[random.choice(bb_starts)]
+        if not self.instrs:
+            return
+        if bb_starts:
+            selected_i = self.instrs[random.choice(bb_starts)]
+        else:
+            selected_i = self.instrs[-1]
         # to avoid possible error in disassembling
         # selected_i = self.instrs[-1]
         # the location of opaque routines should be carefully selected

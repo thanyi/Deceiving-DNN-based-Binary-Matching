@@ -23,8 +23,11 @@ VAL_RATIO = 0.1
 
 MIN_INSTR = 15
 MAX_INSTR = 800
+MIN_FUNC_SIZE = 300
+MIN_BBS = 10
 BLACKLIST_FUNCS = [
-    "_init", "_start", "_fini", "__libc_csu_init", 
+    "_init", "_start", "_fini", "__libc_csu_init",
+    "main",
     "entry0", "usage", "emit_bug_reporting_address",
     "version_etc", "version_etc_va", "deregister_tm_clones",
     "register_tm_clones", "frame_dummy", "atexit", "set_char_quoting"
@@ -134,6 +137,7 @@ def extract_valid_functions(binary_path):
         for f in funcs:
             raw_name = f.get('name', '')
             f_size = f.get('size', 0)
+            f_bbs = f.get('nbbs', f.get('nbb', 0))
             # 兼容不同 r2 版本的地址字段
             f_addr = f.get('offset') or f.get('addr') or f.get('vaddr') or 0
             
@@ -150,11 +154,14 @@ def extract_valid_functions(binary_path):
             
             # 3. 尺寸过滤
             if f_size < MIN_INSTR * 3 or f_size > MAX_INSTR * 5: continue
+            if f_size < MIN_FUNC_SIZE: continue
+            if f_bbs < MIN_BBS: continue
             
             valid_funcs.append({
                 "func_name": f_name,
                 "func_addr": f_addr,
-                "func_size": f_size
+                "func_size": f_size,
+                "func_bbs": f_bbs
             })
             
         return valid_funcs
@@ -209,6 +216,7 @@ def main():
                         "func_name": func_name,
                         "func_addr": f['func_addr'],
                         "size": f['func_size'],
+                        "basic_blocks": f.get('func_bbs', 0),
                         "id": hashlib.md5(f"{bin_path}_{func_name}".encode()).hexdigest()[:8]
                     }
 
@@ -244,6 +252,7 @@ def main():
                     "func_name": func_name,
                     "func_addr": f['func_addr'],
                     "size": f['func_size'],
+                    "basic_blocks": f.get('func_bbs', 0),
                     "id": hashlib.md5(f"{bin_path}_{func_name}".encode()).hexdigest()[:8]
                 }
 
@@ -290,11 +299,16 @@ def main():
     print(f"  Testing Samples:    {len(test_pool)}")
     print("="*40)
     
-    os.makedirs("fast", exist_ok=True)
-    with open("fast/dataset_train.json", "w") as f: json.dump(final_train_pool, f, indent=2)
-    with open("fast/dataset_val.json", "w") as f: json.dump(val_pool, f, indent=2)
-    with open("fast/dataset_test.json", "w") as f: json.dump(test_pool, f, indent=2)
-    
+    os.makedirs("fast_0128", exist_ok=True)
+    with open("fast_0128/dataset_train.json", "w") as f: json.dump(final_train_pool, f, indent=2)
+    with open("fast_0128/dataset_val.json", "w") as f: json.dump(val_pool, f, indent=2)
+    with open("fast_0128/dataset_test.json", "w") as f: json.dump(test_pool, f, indent=2)
+
+    # os.makedirs("fast", exist_ok=True)
+    # with open("/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/BinaryCorp-3M/dataset_train.json", "w") as f: json.dump(final_train_pool, f, indent=2)
+    # with open("/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/BinaryCorp-3M/dataset_val.json", "w") as f: json.dump(val_pool, f, indent=2)
+    # with open("/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/BinaryCorp-3M/dataset_test.json", "w") as f: json.dump(test_pool, f, indent=2)
+
     print(f"[+] Done.")
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ class MilestoneRewardTracker:
     """里程碑追踪器（他的实现很好，我完全同意）"""
     def __init__(self):
         self.milestones = [0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.42, 0.40]
-        self.milestone_rewards = [1.0, 1.5, 2.5, 4.0, 6.0, 9.0, 12.5, 25.0]
+        self.milestone_rewards = [1.0, 2.0, 4.0, 6.0, 10.0, 15.0, 20.0, 30.0]
         self.achieved = set()
     
     def compute_reward(self, current_score):
@@ -55,7 +55,18 @@ class BinaryPerturbationEnv:
     与 PPO Agent 在同一进程中运行，通过函数调用通信
     """
     
-    def __init__(self, save_path, dataset_path, sample_hold_interval=3, max_steps=30, output_dir=None):
+    def __init__(
+        self,
+        save_path,
+        dataset_path,
+        sample_hold_interval=3,
+        max_steps=30,
+        output_dir=None,
+        detection_method="asm2vec",
+        safe_checkpoint_dir=None,
+        safe_i2v_dir=None,
+        safe_use_gpu=False,
+    ):
         """
         参数:
             original_binary: 原始二进制文件路径
@@ -88,10 +99,15 @@ class BinaryPerturbationEnv:
         self.original_binary = None # 原始二进制文件路径
         self.function_name = None # 目标函数名
         self.current_binary = None # 当前变异后的二进制文件路径
+        self.original_func_addr = None
         
-        # 不再需要加载模型（使用 asm2vec 方法）
+        # 不再需要加载模型（默认使用 asm2vec 方法）
         self.model_original = None
-        logger.info("Using asm2vec detection method (no model loading required)")
+        self.detection_method = detection_method
+        self.safe_checkpoint_dir = safe_checkpoint_dir
+        self.safe_i2v_dir = safe_i2v_dir
+        self.safe_use_gpu = safe_use_gpu
+        logger.info(f"Using {self.detection_method} detection method (no model loading required)")
         
         # 变异历史
         self.mutation_history = []
@@ -113,9 +129,9 @@ class BinaryPerturbationEnv:
         # 记录当前目标下的历史最优分数，用于奖励塑形
         self.best_score = 1.0
         # 奖励塑形超参：显式惩罚“无变化/无效位置”
-        self.no_change_eps = 1e-2
-        self.no_change_penalty = 0.5
-        self.invalid_loc_penalty = 1.0
+        self.no_change_eps = 1e-3
+        self.no_change_penalty = 0.2
+        self.invalid_loc_penalty = 2.0
         # Small penalty when the policy keeps repeating the same action.
         self.repeat_action_penalty = 1.0
         
@@ -140,15 +156,18 @@ class BinaryPerturbationEnv:
         os.makedirs(self.output_dir, exist_ok=True)
 
         # 奖励机制
-        self.milestone_tracker = MilestoneRewardTracker()
         # 【关键】固定权重，不再动态调整
         self.reward_weights = {
             'incremental': 1.0,   # 基础权重
-            'milestone': 1.0,     # 里程碑已经内置了递增权重
             'ultimate': 1.0,      # 成功奖励已经很大了
             'penalty': 1.0        # 惩罚权重
         }
-        
+        # 奖励裁剪统计（用于判断奖励是否经常触顶/触底）
+        self._reward_clip_total = 0
+        self._reward_clip_hi = 0
+        self._reward_clip_lo = 0
+        self.reward_clip_log_interval = 200
+
         # 记录每个样本的历史成功率
         # 格式: {sample_id: deque(maxlen=10)}
         from collections import deque
@@ -169,6 +188,31 @@ class BinaryPerturbationEnv:
         self.current_difficulty = 0.5
 
         logger.info(f"Environment initialized (Hold Strategy: {self.sample_hold_interval} eps)")
+
+    def _find_sym_to_addr(self, binary_path):
+        base_dir = os.path.dirname(os.path.abspath(binary_path))
+        candidates = [
+            os.path.join(base_dir, "sym_to_addr.pickle"),
+            os.path.join(os.path.dirname(base_dir), "sym_to_addr.pickle"),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _load_sym_to_addr(self, path):
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return {}
+
+    def _resolve_original_addr(self):
+        if self.current_sample_data and "func_addr" in self.current_sample_data:
+            return self.current_sample_data.get("func_addr")
+        return None
     
     def set_state_dim(self, state_dim):
         """
@@ -188,6 +232,7 @@ class BinaryPerturbationEnv:
         """
         # 1. 如果是原始文件，我们需要知道原始地址
         # 这里假设原始文件未 Strip，或者你能通过函数名找到
+        # print(f"[_resolve_mutated_address]:Resolving address for binary: {binary_path}")
         if binary_path == self.original_binary:
             return None, self.function_name
 
@@ -398,6 +443,7 @@ class BinaryPerturbationEnv:
         
         try:
             # 1. 解析地址
+            # print("[extract_features]:binary_path:", binary_path)
             target_addr, target_name = self._resolve_mutated_address(binary_path)
             # print(f"target_addr: {target_addr}, target_name: {target_name}")
             # 2. 【性能优化】检查缓存
@@ -809,16 +855,32 @@ class BinaryPerturbationEnv:
         """
         try:
             # 【性能优化】传递工作目录和缓存，避免每次创建临时目录
+            mutated_func_addr = None
+            if self.detection_method == "safe":
+                if self.original_func_addr is None:
+                    self.original_func_addr = self._resolve_original_addr()
+                # print(f"[evaluate]:mutated_binary: {mutated_binary}")
+                mutated_func_addr, _ = self._resolve_mutated_address(mutated_binary)
+                # print(f"[evaluate]:mutated_func_addr: {mutated_func_addr}")
             score, grad = run_one(
                 self.original_binary,
                 mutated_binary,
                 self.model_original,
                 checkdict,
                 self.function_name,
+                detection_method=self.detection_method,
                 asm_work_dir=self._asm_work_dir,
-                original_asm_cache=self._original_asm_cache
+                original_asm_cache=self._original_asm_cache,
+                original_func_addr=self.original_func_addr,
+                mutated_func_addr=mutated_func_addr,
+                safe_checkpoint_dir=self.safe_checkpoint_dir,
+                safe_i2v_dir=self.safe_i2v_dir,
+                safe_use_gpu=self.safe_use_gpu,
             )
-            
+            if self.detection_method == "safe":
+                logger.success(f"[SAFE] eval_score={score}")
+            else:
+                logger.debug(f"[ASM2VEC] eval_score={score}")
             if score is None or grad is None:
                 logger.warning("Evaluation returned None")
                 return 1.0, 0.0  # 默认最差值
@@ -843,6 +905,7 @@ class BinaryPerturbationEnv:
             done: 是否完成
             info: 额外信息
         """
+        # input("Press Enter to continue step...")
         self.step_count += 1
         # 记录上一步分数，用于计算差分奖励
         prev_score = self.mutation_history[-1]['score'] if self.mutation_history else 1.0
@@ -914,7 +977,7 @@ class BinaryPerturbationEnv:
         
         # 计算奖励
         score_delta = prev_score - score
-        no_change = abs(score_delta) < self.no_change_eps
+        no_change = (score_delta <= 0.0) and (abs(score_delta) < self.no_change_eps)
         reward = self.compute_reward_v2(
             prev_score,
             score,
@@ -1033,21 +1096,24 @@ class BinaryPerturbationEnv:
             incremental = diff * scale
         
         elif diff <= 0:  # 退步
-            # 惩罚轻一点，鼓励探索
-            incremental = diff * 12.0 
+            # 退步惩罚略强，避免“坏动作”被大奖励稀释
+            incremental = diff * 20.0 
 
         # 关键决策：难度已经用于“采样更频繁”，这里不再二次放大奖励，
         # 避免对“难样本”重复加成导致训练不稳定。
         total_reward += incremental * self.reward_weights['incremental']
 
-        # === 2. 里程碑奖励 ===
-        milestone = self.milestone_tracker.compute_reward(current_score)
-        total_reward += milestone * self.reward_weights['milestone']
+        # === 2. 历史最优奖励（替代里程碑）===
+        if current_score < self.best_score:
+            if current_score >= self.target_score:
+                best_improvement = self.best_score - current_score
+                total_reward += 1.0 + best_improvement * 5.0
+            self.best_score = current_score
 
         # === 3. 终极成功奖励 ===
         if current_score < self.target_score:
             # 基础 10 + 质量加成 + 效率加成
-            base_reward = 10.0
+            base_reward = 30.0
             quality_bonus = (self.target_score - current_score) * 50
             efficiency_bonus = max(0, (self.max_steps - step_count) * 0.5)      # max_step - step_count
             
@@ -1058,9 +1124,9 @@ class BinaryPerturbationEnv:
         # === 4. 显式惩罚 ===
         penalty = 0.0
         if no_change:
-            penalty += 1.0
+            penalty += self.no_change_penalty
         if invalid_loc:
-            penalty += 2.0
+            penalty += self.invalid_loc_penalty
         if repeat_streak > 0:
             # Penalize repeated actions, but cap to avoid dominating the reward.
             penalty += self.repeat_action_penalty * min(repeat_streak, 4)
@@ -1071,7 +1137,25 @@ class BinaryPerturbationEnv:
         
         # === 5. 硬裁剪（不是归一化！）===
         # 只是防止极端值，不改变奖励的相对大小关系
-        return np.clip(total_reward, -5.0, 30.0)
+        clipped = float(np.clip(total_reward, -50.0, 100.0))
+        self._record_reward_clip(total_reward, clipped)
+        return clipped
+
+    def _record_reward_clip(self, raw_reward, clipped_reward):
+        self._reward_clip_total += 1
+        if raw_reward > 80.0:
+            self._reward_clip_hi += 1
+        elif raw_reward < -40.0:
+            self._reward_clip_lo += 1
+
+        if self.reward_clip_log_interval > 0 and self._reward_clip_total % self.reward_clip_log_interval == 0:
+            total = self._reward_clip_total
+            hi_ratio = self._reward_clip_hi / total
+            lo_ratio = self._reward_clip_lo / total
+            logger.info(
+                f"[reward_clip] total={total} hi={self._reward_clip_hi} ({hi_ratio:.1%}) "
+                f"lo={self._reward_clip_lo} ({lo_ratio:.1%})"
+            )
 
     def _switch_next_target(self):
         """
@@ -1084,6 +1168,8 @@ class BinaryPerturbationEnv:
         self.current_sample_data = self.dataset[self.current_sample_idx]
 
         self.episodes_on_current = 0
+        # Reset cached function address when switching targets.
+        self.original_func_addr = None
 
         # 计算当前难度 (1.0 - 成功率)
         s_id = self.idx_to_id[self.current_sample_idx]
@@ -1126,7 +1212,6 @@ class BinaryPerturbationEnv:
         self.mutation_history = []
         self.step_count = 0
         self.best_score = 1.0
-        self.milestone_tracker.reset()
         
         # 提取初始特征
         state = self.extract_features(self.original_binary)

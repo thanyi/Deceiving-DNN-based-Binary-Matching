@@ -13,6 +13,7 @@ import csv
 import hashlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -25,9 +26,10 @@ from ppo_agent import PPOAgent
 
 try:
     # Uses the project's asm2vec pipeline (bin2asm + compare_functions).
-    from run_utils import run_one
+    from run_utils import run_one, prepare_original_asm
 except Exception:
     run_one = None
+    prepare_original_asm = None
 
 
 def load_dataset(path: str) -> List[Dict]:
@@ -192,9 +194,10 @@ class RLAgentRunner:
                 actual_action,
                 _log_prob,
                 _value,
-            ) = self.agent.select_action(state, explore=False)
+            ) = self.agent.select_action(state, explore=True)
 
             next_state, _reward, done, info = self.env.step(actual_action, loc_idx)
+            # print(f"    Step {step+1}: action={actual_action}, loc={loc_idx}, info={info}")
             steps_used = step + 1
 
             if info.get("binary"):
@@ -386,6 +389,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--safe-checkpoint-dir", default=None)
     parser.add_argument("--safe-i2v-dir", default=None)
     parser.add_argument("--safe-use-gpu", action="store_true")
+    parser.add_argument(
+        "--retrieval-workers",
+        type=int,
+        default=1,
+        help="Parallel workers for candidate scoring (1 disables parallelism).",
+    )
     return parser
 
 
@@ -420,6 +429,9 @@ def asm2vec_topk_with_mode(
         asm_work_dir = retrieval_ctx.get("asm_work_dir")
         original_asm_cache = retrieval_ctx.get("original_asm_cache")
         sym_to_addr_cache = retrieval_ctx.get("sym_to_addr_cache")
+        retrieval_workers = retrieval_ctx.get("retrieval_workers", 1)
+    else:
+        retrieval_workers = 1
 
     scored: List[Dict] = []
     sym_to_addr_path = None
@@ -431,34 +443,77 @@ def asm2vec_topk_with_mode(
     else:
         sym_to_addr_path = _find_sym_to_addr(original_binary)
 
-    for cand in dataset:
-        cand_binary = cand.get("binary_path")
-        if not cand_binary or not os.path.exists(cand_binary):
-            continue
-        # print(f"    Comparing to candidate binary: {cand_binary} :: {cand.get('func_name')}")
-        # run_one/SAFE are heavy but accurate: they extract features and compare functions.
-        score, _grad = run_one(
-            original_binary,
-            cand_binary,
-            model_original=None,
-            checkdict={},
+    original_asm_path = None
+    use_original_asm_cache = original_asm_cache
+    if (
+        retrieval_mode == "run_one"
+        and retrieval_workers
+        and retrieval_workers > 1
+        and prepare_original_asm
+        and asm_work_dir
+    ):
+        original_asm_path, _orig_addr, _need_cleanup = prepare_original_asm(
+            original_binary=original_binary,
             function_name=str(func_name),
-            detection_method="safe" if retrieval_mode == "safe" else "asm2vec",
             asm_work_dir=asm_work_dir,
-            original_asm_cache=original_asm_cache,
-            simple_mode=True,
             original_func_addr=query.get("func_addr"),
-            mutated_func_addr=cand.get("func_addr"),
             sym_to_addr_path=sym_to_addr_path,
-            safe_checkpoint_dir=retrieval_ctx.get("safe_checkpoint_dir") if retrieval_ctx else None,
-            safe_i2v_dir=retrieval_ctx.get("safe_i2v_dir") if retrieval_ctx else None,
-            safe_use_gpu=bool(retrieval_ctx.get("safe_use_gpu")) if retrieval_ctx else True,
+            sym_to_addr_map=None,
+            simple_mode=True,
+            original_asm_cache=original_asm_cache,
         )
-        if score is None:
-            continue
+        if original_asm_path:
+            use_original_asm_cache = None
 
-        cand_id = str(cand.get("id") or cand.get("func_name") or "unknown_cand")
-        scored.append({"id": cand_id, "score": float(score)})
+    def _score_candidate(cand_idx: int, cand: Dict) -> Optional[Dict]:
+        try:
+            cand_binary = cand.get("binary_path")
+            if not cand_binary or not os.path.exists(cand_binary):
+                return None
+            worker_dir = asm_work_dir
+            if asm_work_dir and retrieval_workers and retrieval_workers > 1:
+                worker_dir = os.path.join(asm_work_dir, f"cand_{cand_idx}")
+            score, _grad = run_one(
+                original_binary,
+                cand_binary,
+                model_original=None,
+                checkdict={},
+                function_name=str(func_name),
+                detection_method="safe" if retrieval_mode == "safe" else "asm2vec",
+                asm_work_dir=worker_dir,
+                original_asm_cache=use_original_asm_cache,
+                simple_mode=True,
+                original_func_addr=query.get("func_addr"),
+                mutated_func_addr=cand.get("func_addr"),
+                sym_to_addr_path=sym_to_addr_path,
+                safe_checkpoint_dir=retrieval_ctx.get("safe_checkpoint_dir") if retrieval_ctx else None,
+                safe_i2v_dir=retrieval_ctx.get("safe_i2v_dir") if retrieval_ctx else None,
+                safe_use_gpu=bool(retrieval_ctx.get("safe_use_gpu")) if retrieval_ctx else True,
+                original_asm_path=original_asm_path,
+            )
+            if score is None:
+                return None
+            cand_id = str(cand.get("id") or cand.get("func_name") or "unknown_cand")
+            return {"id": cand_id, "score": float(score)}
+        except Exception:
+            return None
+
+    if retrieval_workers and retrieval_workers > 1:
+        max_workers = min(int(retrieval_workers), max(1, len(dataset)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_score_candidate, idx, cand)
+                for idx, cand in enumerate(dataset)
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    scored.append(result)
+    else:
+        for idx, cand in enumerate(dataset):
+            result = _score_candidate(idx, cand)
+            if result is not None:
+                scored.append(result)
 
     if not scored:
         return asm2vec_topk(query, dataset, k)
@@ -487,6 +542,7 @@ def main() -> None:
     retrieval_ctx["safe_checkpoint_dir"] = args.safe_checkpoint_dir
     retrieval_ctx["safe_i2v_dir"] = args.safe_i2v_dir
     retrieval_ctx["safe_use_gpu"] = args.safe_use_gpu
+    retrieval_ctx["retrieval_workers"] = args.retrieval_workers
 
     asr, rows = run_asr_simple(
         dataset_path=args.dataset,

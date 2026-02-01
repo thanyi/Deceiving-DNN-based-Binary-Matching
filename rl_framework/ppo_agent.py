@@ -251,7 +251,7 @@ class PPOAgent:
         for i in reversed(range(len(rewards))):
             mask = 1.0 - float(dones[i])
             delta = rewards[i] + self.gamma * mask * values[i + 1] - values[i]
-            gae = delta + self.gamma * 0.9 * mask * gae  # lambda=0.9
+            gae = delta + self.gamma * 0.95 * mask * gae  # lambda=0.95
             
             # 检查计算结果
             if np.isnan(gae) or np.isinf(gae):
@@ -331,7 +331,7 @@ class PPOAgent:
             surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
             
             # Stronger entropy bonus helps prevent early collapse to one action.
-            actor_loss = -torch.min(surr1, surr2).mean() - 0.08 * entropy
+            actor_loss = -torch.min(surr1, surr2).mean() - 0.05 * entropy
             
             # Critic Loss
             state_values_sq = state_values.squeeze()

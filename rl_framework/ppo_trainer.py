@@ -117,15 +117,17 @@ def train_ppo(args):
     PPO 训练主函数
     """
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    log_dir = os.path.join(project_root, 'log')
+    default_log_dir = os.path.join(project_root, 'log')
+    default_log_path = os.path.join(default_log_dir, 'train.log')
+    train_log_path = args.log_path or default_log_path
+    log_dir = os.path.dirname(os.path.abspath(train_log_path))
     os.makedirs(log_dir, exist_ok=True)
-    train_log_path = os.path.join(log_dir, 'train.log')
 
     def _console_log_filter(record):
         level = record["level"].name
         if level in ("WARNING", "ERROR", "CRITICAL", "SUCCESS"):
             return True
-        if record["name"] != "ppo_trainer":
+        if record["name"] not in ["ppo_trainer", 'run_one']:
             return False
         msg = record["message"]
         return (
@@ -176,6 +178,7 @@ def train_ppo(args):
     logger.info("PPO 训练启动 (Multi-Sample Mode)")
     logger.info(f"数据集: {args.dataset}")
     logger.info(f"保存路径: {args.save_path}")
+    logger.info(f"检测方法: {args.detection_method}")
     
     os.makedirs(args.save_path, exist_ok=True)
     os.makedirs(args.model_dir, exist_ok=True)
@@ -189,7 +192,11 @@ def train_ppo(args):
         save_path=args.save_path,
         dataset_path=args.dataset,
         sample_hold_interval=args.sample_hold_interval, # Hold-N 策略
-        max_steps=args.max_steps
+        max_steps=args.max_steps,
+        detection_method=args.detection_method,
+        safe_checkpoint_dir=args.safe_checkpoint_dir,
+        safe_i2v_dir=args.safe_i2v_dir,
+        safe_use_gpu=args.safe_use_gpu,
     )
     env.set_state_dim(args.state_dim)
 
@@ -277,9 +284,9 @@ def train_ppo(args):
                 episode_actions.append(actual_action)
                 prev_state = state
                 
-                logger.success(f"Step {step}: Loc {loc_idx}, Action {actual_action} (JointIdx {joint_idx})")
                 # 执行动作
                 next_state, reward, done, info = env.step(actual_action, loc_idx)
+                logger.success(f"Step {step}: Loc {loc_idx}, Action {actual_action} (JointIdx {joint_idx}), reward {reward:.4f}")
                 # input("step down, press enter to continue")
                 episode_reward += reward
                 state = next_state
@@ -473,7 +480,7 @@ if __name__ == "__main__":
     parser.add_argument('--save-path', required=True)
     parser.add_argument('--state-dim', type=int, default=256) # 默认256维
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--gamma', type=float, default=0.95)
+    parser.add_argument('--gamma', type=float, default=0.98)
     parser.add_argument('--epsilon', type=float, default=0.2)
     parser.add_argument('--n-locs', type=int, default=3)
     parser.add_argument('--episodes', type=int, default=6000)
@@ -483,6 +490,11 @@ if __name__ == "__main__":
     parser.add_argument('--model-dir', default='./rl_models')
     parser.add_argument('--resume', default=None)
     parser.add_argument('--use-gpu', action='store_true')
+    parser.add_argument('--log-path', default=None, help='训练日志路径（默认 log/train.log）')
+    parser.add_argument('--detection-method', choices=['asm2vec', 'safe'], default='asm2vec')
+    parser.add_argument('--safe-checkpoint-dir', default=None)
+    parser.add_argument('--safe-i2v-dir', default=None)
+    parser.add_argument('--safe-use-gpu', action='store_true')
     
     args = parser.parse_args()
     

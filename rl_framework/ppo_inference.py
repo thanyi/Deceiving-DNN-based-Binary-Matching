@@ -532,7 +532,7 @@ def evaluate_dataset(args):
         for step in range(args.max_steps):
             joint_idx, loc_idx, act_idx, actual_action, log_prob, value = agent.select_action(state, explore=True)
             next_state, reward, done, info = env.step(actual_action, loc_idx)
-            print(f"Step {step}: action={actual_action}, loc={loc_idx}, reward={reward:.4f}")
+            print(f"Step {step}: action={actual_action}, loc={loc_idx}")
             eval_score = info.get('score', 1.0)
             if info.get('binary') and args.detection_method != "asm2vec":
                 mutated_func_addr = None

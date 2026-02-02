@@ -18,9 +18,19 @@ import time
 import tempfile
 import shutil
 
-# 暂时禁用所有日志输出
-# logger.remove()  # 移除所有默认处理器，不输出任何日志
+# # 仅输出 WARNING/ERROR 级别日志（避免信息噪音）
+logger.remove()
+logger.add(sys.stderr, level="WARNING", format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
 
+
+# def only_success(record):
+#     return record["level"].name == "SUCCESS"
+
+# logger.add(
+#     sink=lambda msg: print(msg, end=""),  # 输出到 stdout（可替换为文件等）
+#     filter=only_success,
+#     format="{time} | {level} | {message}"
+# )
 
 # 添加 asm2vec-pytorch 路径到 sys.path
 _asm2vec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
@@ -93,7 +103,11 @@ def _resolve_function_addrs(
     """
     Resolve original/mutated function addresses using:
     - explicit addr params
-    - sym_to_addr.pickle (near original or mutated binary)
+    - sym_to_addr.pickle (maps original symbol -> current binary addr)
+
+    NOTE: sym_to_addr is typically generated for mutated binaries, so it should
+    be used to resolve mutated_addr, not original_addr. Original can fall back
+    to name-based lookup when asm2vec extracts by function name.
     """
     addr_map = sym_to_addr_map
     if addr_map is None:
@@ -104,25 +118,71 @@ def _resolve_function_addrs(
             addr_map = _load_sym_to_addr(auto_path) if auto_path else {}
 
     original_addr = original_func_addr
-    if function_name in addr_map:
-        original_addr = addr_map.get(function_name)
-
     mutated_addr = mutated_func_addr
     if not simple_mode and function_name in addr_map and mutated_addr is None:
         mutated_addr = addr_map.get(function_name)
 
-    # Original-mode fallback: try mapping near mutated binary.
+    # Fallback: try mapping near mutated binary for mutated_addr only.
     if not simple_mode and not addr_map:
         mutated_folder = os.path.dirname(mutated_binary)
         map_path = os.path.join(mutated_folder, "sym_to_addr.pickle")
         if os.path.exists(map_path):
             addr_map = _load_sym_to_addr(map_path)
-            if function_name in addr_map:
-                original_addr = addr_map.get(function_name)
-                if mutated_addr is None:
-                    mutated_addr = addr_map.get(function_name)
+            if function_name in addr_map and mutated_addr is None:
+                mutated_addr = addr_map.get(function_name)
 
     return _normalize_addr(original_addr), _normalize_addr(mutated_addr), addr_map or {}
+
+
+def prepare_original_asm(
+    original_binary,
+    function_name,
+    asm_work_dir=None,
+    original_func_addr=None,
+    sym_to_addr_path=None,
+    sym_to_addr_map=None,
+    simple_mode=False,
+    original_asm_cache=None,
+):
+    """Extract and cache original function asm once for reuse."""
+    original_addr_hex, _mutated_addr_hex, _addr_map = _resolve_function_addrs(
+        original_binary=original_binary,
+        mutated_binary=original_binary,
+        function_name=function_name,
+        simple_mode=simple_mode,
+        original_func_addr=original_func_addr,
+        mutated_func_addr=None,
+        sym_to_addr_path=sym_to_addr_path,
+        sym_to_addr_map=sym_to_addr_map,
+    )
+
+    if asm_work_dir is None:
+        asm_work_dir = tempfile.mkdtemp(prefix="asm2vec_", suffix="_tmp")
+        need_cleanup = True
+    else:
+        need_cleanup = False
+        os.makedirs(os.path.join(asm_work_dir, "original"), exist_ok=True)
+
+    cache_key = (os.path.abspath(original_binary), function_name, original_addr_hex)
+    if original_asm_cache is not None and cache_key in original_asm_cache:
+        return original_asm_cache[cache_key], original_addr_hex, need_cleanup
+
+    original_output_file = binfunc2asm(
+        ipath=original_binary,
+        target_func_name=function_name,
+        opath=os.path.join(asm_work_dir, "original"),
+        verbose=bool(os.environ.get("ASM2VEC_VERBOSE")),
+        current_sym_addr=original_addr_hex,
+    )
+    if not original_output_file:
+        logger.error(
+            f"无法提取原始函数 {function_name} 的汇编文件 (addr={original_addr_hex})"
+        )
+        return None, original_addr_hex, need_cleanup
+
+    if original_asm_cache is not None:
+        original_asm_cache[cache_key] = original_output_file
+    return original_output_file, original_addr_hex, need_cleanup
 
 
 # === SAFE helpers (lazy import) ===
@@ -206,6 +266,7 @@ def run_one(
     safe_checkpoint_dir=None,
     safe_i2v_dir=None,
     safe_use_gpu=True,
+    original_asm_path=None,
 ):
     """
     评估原始二进制文件和变异二进制文件之间的相似度
@@ -221,6 +282,7 @@ def run_one(
         *_func_addr: 可选的函数地址（优先于符号名）
         sym_to_addr_*: 可选映射文件/字典，用于解析变异后地址
         safe_*: SAFE 模型所需的 checkpoint 与 i2v 目录
+        original_asm_path: 可选的原始汇编文件路径（用于复用）
     
     返回:
         score: 余弦相似度 (float) - 范围[0,1]，越低表示越不相似
@@ -267,38 +329,48 @@ def run_one(
             else:
                 need_cleanup = False
                 os.makedirs(os.path.join(asm_work_dir, 'mutated'), exist_ok=True)
-                os.makedirs(os.path.join(asm_work_dir, 'original'), exist_ok=True)
+                if original_asm_path is None:
+                    os.makedirs(os.path.join(asm_work_dir, 'original'), exist_ok=True)
             
             try:
                 # 缓存原始文件汇编
-                cache_key = (os.path.abspath(original_binary), function_name, original_addr_hex)
-                if original_asm_cache is not None and cache_key in original_asm_cache:
-                    original_asm = original_asm_cache[cache_key]
-                    logger.debug(f"使用缓存的原始文件汇编: {original_asm}")
-                else:
-                    original_output_file = binfunc2asm(
-                        ipath=original_binary,
-                        target_func_name=function_name,
-                        opath=os.path.join(asm_work_dir, 'original'), 
-                        verbose=False,
-                        current_sym_addr=original_addr_hex
-                    )
-                    if not original_output_file:
-                        logger.error(
-                            f"无法提取原始函数 {function_name} 的汇编文件 "
-                            f"(addr={original_addr_hex})"
-                        )
+                if original_asm_path:
+                    if not os.path.exists(original_asm_path):
+                        logger.error(f"原始汇编文件不存在: {original_asm_path}")
                         return None, None
-                    original_asm = original_output_file
-                    if original_asm_cache is not None:
-                        original_asm_cache[cache_key] = original_asm
+                    original_asm = original_asm_path
+                else:
+                    cache_key = (os.path.abspath(original_binary), function_name, original_addr_hex)
+                    if original_asm_cache is not None and cache_key in original_asm_cache:
+                        original_asm = original_asm_cache[cache_key]
+                        logger.debug(f"使用缓存的原始文件汇编: {original_asm}")
+                    else:
+                        original_output_file = binfunc2asm(
+                            ipath=original_binary,
+                            target_func_name=function_name,
+                            opath=os.path.join(asm_work_dir, 'original'), 
+                            verbose=bool(os.environ.get("ASM2VEC_VERBOSE")),
+                            current_sym_addr=original_addr_hex
+                        )
+                        if not original_output_file:
+                            logger.error(
+                                f"无法提取原始函数 {function_name} 的汇编文件 "
+                                f"(addr={original_addr_hex})"
+                            )
+                            logger.error(
+                                f"提取失败上下文: binary={original_binary} exists={os.path.exists(original_binary)} sym_to_addr={sym_to_addr_path} simple_mode={simple_mode}"
+                            )
+                            return None, None
+                        original_asm = original_output_file
+                        if original_asm_cache is not None:
+                            original_asm_cache[cache_key] = original_asm
                 
                 # 提取变异文件的汇编
                 mutate_output_file = binfunc2asm(
                     ipath=mutated_binary,
                     target_func_name=function_name,
                     opath=os.path.join(asm_work_dir, 'mutated'), 
-                    verbose=False,
+                    verbose=bool(os.environ.get("ASM2VEC_VERBOSE")),
                     current_sym_addr=mutated_addr_hex
                 )
                 if not mutate_output_file:
@@ -306,8 +378,15 @@ def run_one(
                         f"无法提取变异函数 {function_name} 的汇编文件 "
                         f"(addr={mutated_addr_hex})"
                     )
+                    logger.error(
+                        "提取失败上下文: mutated_binary=%s exists=%s sym_to_addr=%s simple_mode=%s",
+                        mutated_binary,
+                        os.path.exists(mutated_binary),
+                        sym_to_addr_path,
+                        simple_mode,
+                    )
                     return None, None
-                
+                logger.info(f"提取到变异函数汇编: {mutate_output_file}")
                 # 计算相似度
                 score = compare_functions(original_asm, mutate_output_file)
                 grad = 0.0
@@ -348,7 +427,8 @@ def run_one(
             if addr1 is None or addr2 is None:
                 logger.error(f"SAFE地址解析失败: {original_addr_hex}, {mutated_addr_hex}")
                 return None, None
-
+            # print(f"SAFE function addrs: original={addr1}, mutated={addr2}")
+            # input("[run_one]:Press Enter to continue...")
             emb1 = _safe_get_embedding(original_binary, addr1, ckpt_dir, i2v_dir, use_gpu=safe_use_gpu)
             if emb1 is None:
                 logger.error(f"SAFE无法提取原始函数嵌入: {function_name} @ {original_addr_hex}")

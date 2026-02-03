@@ -197,8 +197,26 @@ def train_ppo(args):
         safe_checkpoint_dir=args.safe_checkpoint_dir,
         safe_i2v_dir=args.safe_i2v_dir,
         safe_use_gpu=args.safe_use_gpu,
+        safe_cache_enabled=(args.detection_method == "safe" and not args.no_safe_cache),
+        jtrans_model_dir=args.jtrans_model_dir,
+        jtrans_tokenizer_dir=args.jtrans_tokenizer_dir,
+        jtrans_use_gpu=args.jtrans_use_gpu,
+        stall_limit=args.stall_limit,
+        progress_eps=args.progress_eps,
+        hold_min=args.hold_min,
+        hold_max=args.hold_max,
     )
     env.set_state_dim(args.state_dim)
+    if args.detection_method == "safe":
+        safe_target_start = 0.9
+        safe_target_end = 0.6
+        safe_target_decay_episodes = 600
+        env.target_score = safe_target_start
+        env.no_change_penalty = 0.05
+        logger.success(
+            f"[SAFE train] target_score linear decay {safe_target_start}->{safe_target_end} over {safe_target_decay_episodes} eps; "
+            f"no_change_penalty={env.no_change_penalty}"
+        )
 
     agent = PPOAgent(
         state_dim=args.state_dim,
@@ -264,6 +282,11 @@ def train_ppo(args):
         for episode in range(start_episode, args.episodes):
             logger.info("=" * 60)
             logger.info(f"回合 {episode + 1}/{args.episodes}")
+            if args.detection_method == "safe":
+                progress = min(1.0, episode / max(1, safe_target_decay_episodes))
+                env.target_score = safe_target_start + (safe_target_end - safe_target_start) * progress
+                if episode % 10 == 0:
+                    logger.success(f"[SAFE train] target_score={env.target_score:.4f} (ep={episode})")
             
             state = env.reset()
             
@@ -339,7 +362,7 @@ def train_ppo(args):
             final_score = last_binary_info['score'] if last_binary_info else 1.0
             target_func = last_binary_info['func'] if last_binary_info else "unknown"
 
-            is_success = final_score < 0.40
+            is_success = final_score < env.target_score
             success_window.append(1 if is_success else 0)
             similarity_drop_window.append(max(0.0, initial_score - final_score))
 
@@ -487,14 +510,22 @@ if __name__ == "__main__":
     parser.add_argument('--max-steps', type=int, default=30)
     parser.add_argument('--save-interval', type=int, default=50)
     parser.add_argument('--sample-hold-interval', type=int, default=10)
+    parser.add_argument('--stall-limit', type=int, default=3)
+    parser.add_argument('--progress-eps', type=float, default=1e-4)
+    parser.add_argument('--hold-min', type=int, default=None)
+    parser.add_argument('--hold-max', type=int, default=None)
     parser.add_argument('--model-dir', default='./rl_models')
     parser.add_argument('--resume', default=None)
     parser.add_argument('--use-gpu', action='store_true')
     parser.add_argument('--log-path', default=None, help='训练日志路径（默认 log/train.log）')
-    parser.add_argument('--detection-method', choices=['asm2vec', 'safe'], default='asm2vec')
+    parser.add_argument('--detection-method', choices=['asm2vec', 'safe', 'jtrans'], default='asm2vec')
     parser.add_argument('--safe-checkpoint-dir', default=None)
     parser.add_argument('--safe-i2v-dir', default=None)
     parser.add_argument('--safe-use-gpu', action='store_true')
+    parser.add_argument('--no-safe-cache', action='store_true', help='Disable SAFE cache reuse during training')
+    parser.add_argument('--jtrans-model-dir', default=None)
+    parser.add_argument('--jtrans-tokenizer-dir', default=None)
+    parser.add_argument('--jtrans-use-gpu', action='store_true')
     
     args = parser.parse_args()
     

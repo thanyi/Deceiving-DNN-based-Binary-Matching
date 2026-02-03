@@ -29,25 +29,6 @@ from run_utils import run_one
 import run_objdump
 from rl_framework.utils.acfg.r2_acfg_features import RadareACFGExtractor
 
-class MilestoneRewardTracker:
-    """里程碑追踪器（他的实现很好，我完全同意）"""
-    def __init__(self):
-        self.milestones = [0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.42, 0.40]
-        self.milestone_rewards = [1.0, 2.0, 4.0, 6.0, 10.0, 15.0, 20.0, 30.0]
-        self.achieved = set()
-    
-    def compute_reward(self, current_score):
-        reward = 0.0
-        for i, threshold in enumerate(self.milestones):
-            if current_score < threshold and threshold not in self.achieved:
-                reward += self.milestone_rewards[i]
-                self.achieved.add(threshold)
-        return reward
-    
-    def reset(self):
-        self.achieved.clear()
-
-
 class BinaryPerturbationEnv:
     """
     二进制代码变异环境 (Python 3)
@@ -66,6 +47,15 @@ class BinaryPerturbationEnv:
         safe_checkpoint_dir=None,
         safe_i2v_dir=None,
         safe_use_gpu=False,
+        safe_cache_enabled=False,
+        jtrans_model_dir=None,
+        jtrans_tokenizer_dir=None,
+        jtrans_use_gpu=False,
+        adaptive_hold=True,
+        hold_min=None,
+        hold_max=None,
+        stall_limit=6,
+        progress_eps=1e-4,
     ):
         """
         参数:
@@ -92,6 +82,16 @@ class BinaryPerturbationEnv:
         
         # 切换策略控制
         self.sample_hold_interval = sample_hold_interval
+        self.adaptive_hold = adaptive_hold
+        self.hold_max = int(hold_max) if hold_max is not None else int(sample_hold_interval)
+        if hold_min is None:
+            self.hold_min = max(1, int(round(self.hold_max * 0.4)))
+        else:
+            self.hold_min = int(hold_min)
+        self.hold_min = max(1, min(self.hold_min, self.hold_max))
+        self.stall_limit = int(stall_limit)
+        self.progress_eps = float(progress_eps)
+        self.current_hold_limit = self.hold_max
         self.episodes_on_current = 0
         self.current_sample_data = None # 存储当前样本的元数据
         
@@ -104,10 +104,18 @@ class BinaryPerturbationEnv:
         # 不再需要加载模型（默认使用 asm2vec 方法）
         self.model_original = None
         self.detection_method = detection_method
+        
         self.safe_checkpoint_dir = safe_checkpoint_dir
         self.safe_i2v_dir = safe_i2v_dir
         self.safe_use_gpu = safe_use_gpu
-        logger.info(f"Using {self.detection_method} detection method (no model loading required)")
+        self.safe_cache_enabled = bool(safe_cache_enabled)
+        self.safe_cache = {} if self.safe_cache_enabled else None
+
+        self.jtrans_model_dir = jtrans_model_dir
+        self.jtrans_tokenizer_dir = jtrans_tokenizer_dir
+        self.jtrans_use_gpu = jtrans_use_gpu
+        self._jtrans_cache = {}
+        logger.info(f"Using {self.detection_method} detection method")
         
         # 变异历史
         self.mutation_history = []
@@ -126,21 +134,15 @@ class BinaryPerturbationEnv:
         self.hist_action_id_to_index = {aid: idx for idx, aid in enumerate(self.hist_action_ids)}
         self.hist_action_dim = len(self.hist_action_ids)
         self.n_actions = len(self.action_ids)
-        # 记录当前目标下的历史最优分数，用于奖励塑形
-        self.best_score = 1.0
         # 奖励塑形超参：显式惩罚“无变化/无效位置”
-        self.no_change_eps = 1e-3
-        self.no_change_penalty = 0.2
-        self.invalid_loc_penalty = 2.0
-        # Small penalty when the policy keeps repeating the same action.
-        self.repeat_action_penalty = 1.0
-        
-        # 【性能优化】Radare2 特征提取缓存
-        # 缓存键: (binary_path, function_name, function_addr)
-        # 缓存值: acfg_data (dict)
-        self._acfg_cache = {}
-        self._cache_hits = 0
-        self._cache_misses = 0
+        self.no_change_eps = 1e-4
+        self.no_change_penalty = 0.1
+        self.invalid_loc_penalty = 0.5
+        # 分数降幅奖励（越降越多）
+        self.drop_bonus_scale = 3.0
+        self.drop_bonus_cap = 2.0
+        # 任何有效变异（分数下降）给予小正奖，避免长期负反馈
+        self.effective_mutation_bonus = 0.1
         
         # 【性能优化】原始文件汇编缓存（原始文件不变，可复用）
         # 缓存键: (original_binary, function_name, ori_sym_addr)
@@ -183,11 +185,17 @@ class BinaryPerturbationEnv:
             s_id = f"{item['binary_name']}::{item['func_name']}::{item['version']}"
             self.idx_to_id[idx] = s_id
             self.sample_history[s_id] = deque(maxlen=10) # 只看最近10次
+        # 记录每个样本的历史最优与停滞计数（自适应切换）
+        self.sample_best_score = {s_id: None for s_id in self.idx_to_id.values()}
+        self.sample_no_progress = {s_id: 0 for s_id in self.idx_to_id.values()}
 
         self.current_sample_idx = 0 # 追踪当前样本在数据集中的索引
         self.current_difficulty = 0.5
 
-        logger.info(f"Environment initialized (Hold Strategy: {self.sample_hold_interval} eps)")
+        logger.info(
+            f"Environment initialized (Hold Strategy: adaptive={self.adaptive_hold}, "
+            f"hold_min={self.hold_min}, hold_max={self.hold_max}, stall_limit={self.stall_limit})"
+        )
 
     def _find_sym_to_addr(self, binary_path):
         base_dir = os.path.dirname(os.path.abspath(binary_path))
@@ -252,7 +260,7 @@ class BinaryPerturbationEnv:
         try:
             with open(pickle_path, 'rb') as f:
                 addr_map = pickle.load(f)
-            
+
             # 尝试获取目标函数的地址
             # Uroboros 的 map key 可能是原始函数名
             if self.function_name in addr_map:
@@ -314,27 +322,10 @@ class BinaryPerturbationEnv:
             target_addr = None
             # print(f"binary_path: {binary_path}")
             # print(f"[env_wrapper.py:extract_features_from_function] target_name: {target_name}, target_addr: {target_addr}")
-            # 2. 【性能优化】检查缓存
-            cache_key = (os.path.abspath(binary_path), target_name, target_addr)
-            acfg_data = self._acfg_cache.get(cache_key)
-            
-            if acfg_data is None:
-                # 缓存未命中：调用 R2 提取
-                self._cache_misses += 1
-                r2_ext = RadareACFGExtractor(binary_path)
-                acfg_data = r2_ext.get_acfg_features(function_name=target_name, function_addr=target_addr)
-                r2_ext.close()
-                
-                # 存入缓存（只缓存成功提取的数据）
-                if acfg_data:
-                    self._acfg_cache[cache_key] = acfg_data
-            else:
-                # 缓存命中
-                self._cache_hits += 1
-                if self._cache_hits % 100 == 0:
-                    total = self._cache_hits + self._cache_misses
-                    hit_rate = self._cache_hits / total if total > 0 else 0.0
-                    logger.debug(f"ACFG 缓存统计: 命中率={hit_rate:.2%} (命中={self._cache_hits}, 未命中={self._cache_misses})")
+            # 2. 调用 R2 提取
+            r2_ext = RadareACFGExtractor(binary_path)
+            acfg_data = r2_ext.get_acfg_features(function_name=target_name, function_addr=target_addr)
+            r2_ext.close()
             
             if acfg_data:
                 # logger.debug(f"acfg_data: {acfg_data}")
@@ -390,21 +381,6 @@ class BinaryPerturbationEnv:
 
         return (counts / total).tolist()
 
-    def _repeat_action_streak(self, action_id):
-        """
-        Count how many immediately previous steps used the same action_id.
-        0 means this action is different from the last step.
-        """
-        streak = 0
-        for m in reversed(self.mutation_history):
-            if m.get('action') != action_id:
-                break
-            streak += 1
-        return streak
-
-
-
-
     def extract_features(self, binary_path):
         """
         特征提取函数
@@ -446,27 +422,10 @@ class BinaryPerturbationEnv:
             # print("[extract_features]:binary_path:", binary_path)
             target_addr, target_name = self._resolve_mutated_address(binary_path)
             # print(f"target_addr: {target_addr}, target_name: {target_name}")
-            # 2. 【性能优化】检查缓存
-            cache_key = (os.path.abspath(binary_path), target_name, target_addr)
-            acfg_data = self._acfg_cache.get(cache_key)
-            
-            if acfg_data is None:
-                # 缓存未命中：调用 R2 提取
-                self._cache_misses += 1
-                r2_ext = RadareACFGExtractor(binary_path)
-                acfg_data = r2_ext.get_acfg_features(function_name=target_name, function_addr=target_addr)
-                r2_ext.close()
-                
-                # 存入缓存（只缓存成功提取的数据）
-                if acfg_data:
-                    self._acfg_cache[cache_key] = acfg_data
-            else:
-                # 缓存命中
-                self._cache_hits += 1
-                if self._cache_hits % 100 == 0:
-                    total = self._cache_hits + self._cache_misses
-                    hit_rate = self._cache_hits / total if total > 0 else 0.0
-                    logger.debug(f"ACFG 缓存统计: 命中率={hit_rate:.2%} (命中={self._cache_hits}, 未命中={self._cache_misses})")
+            # 2. 调用 R2 提取
+            r2_ext = RadareACFGExtractor(binary_path)
+            acfg_data = r2_ext.get_acfg_features(function_name=target_name, function_addr=target_addr)
+            r2_ext.close()
             
             if acfg_data:
                 self.current_critical_blocks = acfg_data.get('top_critical_blocks', [])[:3]
@@ -876,9 +835,16 @@ class BinaryPerturbationEnv:
                 safe_checkpoint_dir=self.safe_checkpoint_dir,
                 safe_i2v_dir=self.safe_i2v_dir,
                 safe_use_gpu=self.safe_use_gpu,
+                safe_cache=self.safe_cache,
+                jtrans_model_dir=self.jtrans_model_dir,
+                jtrans_tokenizer_dir=self.jtrans_tokenizer_dir,
+                jtrans_use_gpu=self.jtrans_use_gpu,
+                jtrans_cache=self._jtrans_cache,
             )
             if self.detection_method == "safe":
                 logger.success(f"[SAFE] eval_score={score}")
+            elif self.detection_method == "jtrans":
+                logger.success(f"[JTRANS] eval_score={score}")
             else:
                 logger.debug(f"[ASM2VEC] eval_score={score}")
             if score is None or grad is None:
@@ -909,7 +875,6 @@ class BinaryPerturbationEnv:
         self.step_count += 1
         # 记录上一步分数，用于计算差分奖励
         prev_score = self.mutation_history[-1]['score'] if self.mutation_history else 1.0
-        repeat_streak = self._repeat_action_streak(action)
         # === 【核心逻辑】解析攻击位置 ===
         target_addr = None
 
@@ -984,7 +949,6 @@ class BinaryPerturbationEnv:
             self.step_count,
             invalid_loc=not loc_valid,
             no_change=no_change,
-            repeat_streak=repeat_streak,
         )
         # reward = self.compute_reward(score, grad)
         
@@ -1000,7 +964,6 @@ class BinaryPerturbationEnv:
             'loc_valid': loc_valid,
             'no_change': no_change,
             'score_delta': score_delta,
-            'repeat_streak': repeat_streak,
         }
         
         # === 核心修改：更新难度权重 ===
@@ -1025,57 +988,22 @@ class BinaryPerturbationEnv:
             # 更新到全局权重数组
             self.sample_weights[self.current_sample_idx] = new_weight
 
+            # 3. 记录进步/停滞（用于自适应切换）
+            best_score = self.sample_best_score.get(s_id)
+            if is_success or best_score is None or final_score < (best_score - self.progress_eps):
+                self.sample_best_score[s_id] = final_score
+                self.sample_no_progress[s_id] = 0
+            else:
+                self.sample_no_progress[s_id] = self.sample_no_progress.get(s_id, 0) + 1
+
         
         return state, reward, done, info
-    
-    # def compute_reward_diff(self, prev_score, current_score, grad, invalid_loc=False, no_change=False):
-    #     """
-    #     差分奖励函数：适合多样本训练
-    #     """
-    #     # 防御：确保 best_score 初始化
-    #     if self.best_score is None:
-    #         self.best_score = prev_score
-
-    #     # 1. 进步奖励 (关键)：分数下降了多少
-    #     improvement = prev_score - current_score
-        
-    #     # 如果进步了，给正奖励；退步了，给负奖励
-    #     # 放大系数 20，让 Agent 对微小的进步也敏感
-    #     reward = improvement * 20.0
-        
-    #     # 2. 成功奖励 (Jackpot)
-    #     if current_score < self.target_score:
-    #         reward += 50.0 
-
-    #     # 3. 历史最优奖励：鼓励持续突破，而不是只盯着上一步
-    #     if current_score < self.best_score:
-    #         best_improvement = self.best_score - current_score
-    #         reward += 5.0 + best_improvement * 30.0
-    #         self.best_score = current_score
-
-    #     # 4. 停滞惩罚：分数几乎不变时给额外负反馈，防止奖励塌缩
-    #     if no_change or abs(improvement) < self.no_change_eps:
-    #         reward -= self.no_change_penalty
-    #     elif improvement < 0:
-    #         # 小幅退步额外惩罚，拉开正负差距
-    #         reward -= 0.1
-        
-    #     # 4.5 无效位置惩罚：location 无效时显式惩罚
-    #     if invalid_loc:
-    #         reward -= self.invalid_loc_penalty
-        
-    #     # 5. 步数惩罚 (Time Penalty)
-    #     reward -= 0.1
-        
-    #     # 【修复】限制奖励范围，防止梯度爆炸
-    #     reward = np.clip(reward, -25.0, 60.0) 
-    #     return reward
 
 
 
 
     def compute_reward_v2(self, prev_score, current_score, step_count,
-                          invalid_loc=False, no_change=False, repeat_streak=0):
+                          invalid_loc=False, no_change=False):
         """计算奖励"""
         # 基础奖励
         total_reward = 0.0
@@ -1083,34 +1011,24 @@ class BinaryPerturbationEnv:
         diff = prev_score - current_score
        
         if diff > 0:  # 进步
-            # 分段权重：越难的区域给越高奖励
-            if current_score > 0.7:
-                scale = 12.0
-            elif current_score > 0.5:
-                scale = 16.0
-            elif current_score > 0.42:
-                scale = 20.0
-            else:
-                scale = 24.0  # 临门一脚最重要
-            
+            # 固定权重：简化奖励，避免分段重复放大
+            scale = 16.0
             incremental = diff * scale
+            # 额外降幅奖励：按“相对降幅”给 bonus，保证降得越多奖励越多
+            rel_drop = diff / max(prev_score, 1e-6)
+            drop_bonus = min(self.drop_bonus_cap, rel_drop * self.drop_bonus_scale)
+            total_reward += drop_bonus
+            total_reward += self.effective_mutation_bonus
         
         elif diff <= 0:  # 退步
-            # 退步惩罚略强，避免“坏动作”被大奖励稀释
-            incremental = diff * 20.0 
+            # 对称处理，避免过度惩罚导致探索受限
+            incremental = diff * 16.0 
 
         # 关键决策：难度已经用于“采样更频繁”，这里不再二次放大奖励，
         # 避免对“难样本”重复加成导致训练不稳定。
         total_reward += incremental * self.reward_weights['incremental']
 
-        # === 2. 历史最优奖励（替代里程碑）===
-        if current_score < self.best_score:
-            if current_score >= self.target_score:
-                best_improvement = self.best_score - current_score
-                total_reward += 1.0 + best_improvement * 5.0
-            self.best_score = current_score
-
-        # === 3. 终极成功奖励 ===
+        # === 2. 终极成功奖励 ===
         if current_score < self.target_score:
             # 基础 10 + 质量加成 + 效率加成
             base_reward = 30.0
@@ -1121,16 +1039,13 @@ class BinaryPerturbationEnv:
 
             total_reward += ultimate * self.reward_weights['ultimate']
 
-        # === 4. 显式惩罚 ===
+        # === 3. 显式惩罚 ===
         penalty = 0.0
         if no_change:
             penalty += self.no_change_penalty
         if invalid_loc:
             penalty += self.invalid_loc_penalty
-        if repeat_streak > 0:
-            # Penalize repeated actions, but cap to avoid dominating the reward.
-            penalty += self.repeat_action_penalty * min(repeat_streak, 4)
-        penalty += 0.1  # 时间成本
+        penalty += 0.05  # 时间成本
 
 
         total_reward -= penalty * self.reward_weights['penalty']
@@ -1157,6 +1072,25 @@ class BinaryPerturbationEnv:
                 f"lo={self._reward_clip_lo} ({lo_ratio:.1%})"
             )
 
+    def _refresh_current_difficulty(self):
+        if self.current_sample_data is None:
+            self.current_difficulty = 0.5
+            return
+        s_id = self.idx_to_id[self.current_sample_idx]
+        history = self.sample_history.get(s_id, [])
+        if len(history) > 0:
+            success_rate = sum(history) / len(history)
+            self.current_difficulty = 1.0 - success_rate
+            self.current_difficulty = max(0.1, self.current_difficulty)
+        else:
+            self.current_difficulty = 0.5
+
+    def _adaptive_hold_limit(self):
+        if not self.adaptive_hold:
+            return max(1, int(self.sample_hold_interval))
+        hold = int(round(self.hold_min + self.current_difficulty * (self.hold_max - self.hold_min)))
+        return max(self.hold_min, min(self.hold_max, hold))
+
     def _switch_next_target(self):
         """
         [辅助函数] 根据难度权重采样下一个目标
@@ -1172,15 +1106,8 @@ class BinaryPerturbationEnv:
         self.original_func_addr = None
 
         # 计算当前难度 (1.0 - 成功率)
-        s_id = self.idx_to_id[self.current_sample_idx]
-        history = self.sample_history[s_id]
-        if len(history) > 0:
-            success_rate = sum(history) / len(history)
-            self.current_difficulty = 1.0 - success_rate
-            # 保护：最低难度设为 0.1，防止完全不被采样
-            self.current_difficulty = max(0.1, self.current_difficulty)
-        else:
-            self.current_difficulty = 0.5 # 新样本默认中等难度
+        self._refresh_current_difficulty()
+        self.current_hold_limit = self._adaptive_hold_limit()
 
         self.original_binary = self.current_sample_data['binary_path']
         self.function_name = self.current_sample_data['func_name']
@@ -1198,20 +1125,40 @@ class BinaryPerturbationEnv:
             logger.warning(f"🔄 FORCE SWITCH (Error Recovery) -> {os.path.basename(self.original_binary)}::{self.function_name}")
             logger.warning(f"   Version: {self.current_sample_data.get('version')} | Opt: {self.current_sample_data.get('opt_level')}")
         # 正常切换：检查是否需要切换目标
-        elif self.current_sample_data is None or self.episodes_on_current >= self.sample_hold_interval:
+        elif self.current_sample_data is None:
             self._switch_next_target()
             logger.success(f"🔄 SWITCH TARGET -> {os.path.basename(self.original_binary)}::{self.function_name}")
             logger.success(f"   Version: {self.current_sample_data.get('version')} | Opt: {self.current_sample_data.get('opt_level')}")
         else:
-            # 保持当前目标，增加计数
-            self.episodes_on_current += 1
-            logger.info(f"🔄 KEEP TARGET ({self.episodes_on_current}/{self.sample_hold_interval}) -> {self.function_name}")
+            # 更新当前难度与自适应 hold 限制
+            self._refresh_current_difficulty()
+            self.current_hold_limit = self._adaptive_hold_limit()
+            s_id = self.idx_to_id[self.current_sample_idx]
+            stall_count = self.sample_no_progress.get(s_id, 0)
+            should_switch = (
+                self.episodes_on_current >= self.current_hold_limit or
+                stall_count >= self.stall_limit
+            )
+            if should_switch:
+                self._switch_next_target()
+                reason = "stall" if stall_count >= self.stall_limit else "hold"
+                logger.success(
+                    f"🔄 SWITCH TARGET ({reason}) -> {os.path.basename(self.original_binary)}::{self.function_name} "
+                    f"(hold={self.current_hold_limit}, stall={stall_count})"
+                )
+                logger.success(f"   Version: {self.current_sample_data.get('version')} | Opt: {self.current_sample_data.get('opt_level')}")
+            else:
+                # 保持当前目标，增加计数
+                self.episodes_on_current += 1
+                logger.info(
+                    f"🔄 KEEP TARGET ({self.episodes_on_current}/{self.current_hold_limit}) -> {self.function_name} "
+                    f"(stall={stall_count})"
+                )
 
         # 重置环境状态
         self.current_binary = self.original_binary
         self.mutation_history = []
         self.step_count = 0
-        self.best_score = 1.0
         
         # 提取初始特征
         state = self.extract_features(self.original_binary)
@@ -1223,9 +1170,7 @@ class BinaryPerturbationEnv:
         
         用于释放内存，通常在切换大量不同目标时调用
         """
-        cache_size = len(self._acfg_cache)
-        self._acfg_cache.clear()
-        logger.info(f"已清理 ACFG 缓存: 释放 {cache_size} 个条目")
+        logger.info("ACFG 缓存已禁用，无需清理")
     
     def get_cache_stats(self):
         """
@@ -1234,13 +1179,11 @@ class BinaryPerturbationEnv:
         返回:
             dict: 包含命中率、命中数、未命中数等统计信息
         """
-        total = self._cache_hits + self._cache_misses
-        hit_rate = self._cache_hits / total if total > 0 else 0.0
         return {
-            'cache_size': len(self._acfg_cache),
-            'cache_hits': self._cache_hits,
-            'cache_misses': self._cache_misses,
-            'hit_rate': hit_rate
+            'cache_size': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'hit_rate': 0.0
         }
 
 if __name__ == '__main__':

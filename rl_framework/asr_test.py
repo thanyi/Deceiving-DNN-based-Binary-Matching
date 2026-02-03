@@ -10,9 +10,10 @@ import hashlib
 import json
 import os
 import pickle
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
-
 import torch
 from tqdm import tqdm
 
@@ -172,6 +173,17 @@ class Asm2VecRetriever(RetrievalBase):
         super().__init__(log_every=log_every)
         self.asm_work_dir = asm_work_dir
         self.retrieval_workers = int(retrieval_workers or 1)
+        self.original_asm_cache: Dict = {}
+        self.mutated_asm_cache: Dict = {}
+
+    def _get_worker_dir(self, cand_idx: int) -> Optional[str]:
+        if not self.asm_work_dir:
+            return None
+        if self.retrieval_workers <= 1:
+            return self.asm_work_dir
+        worker_dir = os.path.join(self.asm_work_dir, f"cand_{cand_idx}")
+        os.makedirs(worker_dir, exist_ok=True)
+        return worker_dir
 
     def _get_query_addr(self, query: Dict, query_kind: str) -> Optional[int]:
         if query_kind == "original":
@@ -183,7 +195,13 @@ class Asm2VecRetriever(RetrievalBase):
             return _resolve_mutated_addr(query.get("binary_path", ""), query.get("func_name"))
         raise ValueError(f"query_kind must be original/mutated, got {query_kind}")
 
-    def _score_candidate(self, query: Dict, cand: Dict, query_kind: str) -> Optional[Dict]:
+    def _score_candidate(
+        self,
+        query: Dict,
+        cand: Dict,
+        query_kind: str,
+        worker_dir: Optional[str],
+    ) -> Optional[Dict]:
         query_addr = self._get_query_addr(query, query_kind)
         cand_addr = _parse_addr(cand.get("func_addr"))
         if cand_addr is None:
@@ -196,8 +214,8 @@ class Asm2VecRetriever(RetrievalBase):
             checkdict={},
             function_name=str(query.get("func_name")),
             detection_method="asm2vec",
-            asm_work_dir=self.asm_work_dir,
-            original_asm_cache=None,
+            asm_work_dir=worker_dir,
+            original_asm_cache=self.original_asm_cache,
             simple_mode=True,
             original_func_addr=query_addr,
             mutated_func_addr=cand_addr,
@@ -207,6 +225,7 @@ class Asm2VecRetriever(RetrievalBase):
             safe_i2v_dir=None,
             safe_use_gpu=False,
             original_asm_path=None,
+            mutated_asm_cache=self.mutated_asm_cache,
         )
         if score is None:
             return None
@@ -214,22 +233,48 @@ class Asm2VecRetriever(RetrievalBase):
         return {"id": cand_id, "score": float(score)}
 
     def topk(self, query: Dict, dataset: List[Dict], k: int, query_kind: str) -> List[Dict]:
-        if self.retrieval_workers > 1:
-            print("[ASR] retrieval_workers>1 not supported yet, using 1")
         scored: List[Dict] = []
         total = len(dataset)
         self._log_start(total, query_kind)
-        for idx, cand in enumerate(dataset, start=1):
-            result = self._score_candidate(query, cand, query_kind)
-            if result is not None:
-                scored.append(result)
-                self._log_candidate(
-                    idx=idx,
-                    total=total,
-                    cand_id=str(result.get("id")),
-                    score=float(result.get("score", 0.0)),
-                    query_kind=query_kind,
+        if self.retrieval_workers > 1 and total > 0:
+            max_workers = min(self.retrieval_workers, total)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._score_candidate,
+                        query,
+                        cand,
+                        query_kind,
+                        self._get_worker_dir(idx),
+                    ): idx
+                    for idx, cand in enumerate(dataset, start=1)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    result = future.result()
+                    if result is not None:
+                        scored.append(result)
+                        self._log_candidate(
+                            idx=idx,
+                            total=total,
+                            cand_id=str(result.get("id")),
+                            score=float(result.get("score", 0.0)),
+                            query_kind=query_kind,
+                        )
+        else:
+            for idx, cand in enumerate(dataset, start=1):
+                result = self._score_candidate(
+                    query, cand, query_kind, self._get_worker_dir(idx)
                 )
+                if result is not None:
+                    scored.append(result)
+                    self._log_candidate(
+                        idx=idx,
+                        total=total,
+                        cand_id=str(result.get("id")),
+                        score=float(result.get("score", 0.0)),
+                        query_kind=query_kind,
+                    )
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:k]
 
@@ -253,6 +298,26 @@ class SafeRetriever(RetrievalBase):
         self.use_gpu = bool(use_gpu)
         self.asm_work_dir = asm_work_dir
         self.retrieval_workers = int(retrieval_workers or 1)
+        self.safe_cache: Dict = {}
+        self._thread_local = threading.local()
+
+    def _get_worker_dir(self, cand_idx: int) -> Optional[str]:
+        if not self.asm_work_dir:
+            return None
+        if self.retrieval_workers <= 1:
+            return self.asm_work_dir
+        worker_dir = os.path.join(self.asm_work_dir, f"cand_{cand_idx}")
+        os.makedirs(worker_dir, exist_ok=True)
+        return worker_dir
+
+    def _get_safe_cache(self) -> Dict:
+        if self.retrieval_workers > 1:
+            cache = getattr(self._thread_local, "safe_cache", None)
+            if cache is None:
+                cache = {}
+                self._thread_local.safe_cache = cache
+            return cache
+        return self.safe_cache
 
     def _get_query_addr(self, query: Dict, query_kind: str) -> int:
         if query_kind == "original":
@@ -267,7 +332,13 @@ class SafeRetriever(RetrievalBase):
             return addr
         raise ValueError(f"query_kind must be original/mutated, got {query_kind}")
 
-    def _score_candidate(self, query: Dict, cand: Dict, query_kind: str) -> Optional[Dict]:
+    def _score_candidate(
+        self,
+        query: Dict,
+        cand: Dict,
+        query_kind: str,
+        worker_dir: Optional[str],
+    ) -> Optional[Dict]:
         query_addr = self._get_query_addr(query, query_kind)
         cand_addr = _parse_addr(cand.get("func_addr"))
         if cand_addr is None:
@@ -280,7 +351,7 @@ class SafeRetriever(RetrievalBase):
             checkdict={},
             function_name=str(query.get("func_name")),
             detection_method="safe",
-            asm_work_dir=self.asm_work_dir,
+            asm_work_dir=worker_dir,
             original_asm_cache=None,
             simple_mode=True,
             original_func_addr=query_addr,
@@ -291,6 +362,7 @@ class SafeRetriever(RetrievalBase):
             safe_i2v_dir=self.i2v_dir,
             safe_use_gpu=self.use_gpu,
             original_asm_path=None,
+            safe_cache=self._get_safe_cache(),
         )
         if score is None:
             return None
@@ -298,22 +370,48 @@ class SafeRetriever(RetrievalBase):
         return {"id": cand_id, "score": float(score)}
 
     def topk(self, query: Dict, dataset: List[Dict], k: int, query_kind: str) -> List[Dict]:
-        if self.retrieval_workers > 1:
-            print("[ASR] retrieval_workers>1 not supported yet, using 1")
         scored: List[Dict] = []
         total = len(dataset)
         self._log_start(total, query_kind)
-        for idx, cand in enumerate(dataset, start=1):
-            result = self._score_candidate(query, cand, query_kind)
-            if result is not None:
-                scored.append(result)
-                self._log_candidate(
-                    idx=idx,
-                    total=total,
-                    cand_id=str(result.get("id")),
-                    score=float(result.get("score", 0.0)),
-                    query_kind=query_kind,
+        if self.retrieval_workers > 1 and total > 0:
+            max_workers = min(self.retrieval_workers, total)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._score_candidate,
+                        query,
+                        cand,
+                        query_kind,
+                        self._get_worker_dir(idx),
+                    ): idx
+                    for idx, cand in enumerate(dataset, start=1)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    result = future.result()
+                    if result is not None:
+                        scored.append(result)
+                        self._log_candidate(
+                            idx=idx,
+                            total=total,
+                            cand_id=str(result.get("id")),
+                            score=float(result.get("score", 0.0)),
+                            query_kind=query_kind,
+                        )
+        else:
+            for idx, cand in enumerate(dataset, start=1):
+                result = self._score_candidate(
+                    query, cand, query_kind, self._get_worker_dir(idx)
                 )
+                if result is not None:
+                    scored.append(result)
+                    self._log_candidate(
+                        idx=idx,
+                        total=total,
+                        cand_id=str(result.get("id")),
+                        score=float(result.get("score", 0.0)),
+                        query_kind=query_kind,
+                    )
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:k]
 
@@ -354,6 +452,7 @@ class RLAgentRunner:
             safe_i2v_dir=safe_i2v_dir,
             safe_use_gpu=safe_use_gpu,
         )
+        self.env.target_score = 0.3
         self.env.set_state_dim(state_dim)
 
     def _pin_sample(self, sample_idx: int) -> None:
@@ -619,7 +718,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--retrieval-workers",
         type=int,
         default=1,
-        help="Reserved for future parallel scoring.",
+        help="Parallel workers for candidate scoring (1 disables parallelism).",
     )
     parser.add_argument(
         "--retrieval-log-every",

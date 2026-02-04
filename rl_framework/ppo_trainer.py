@@ -210,12 +210,20 @@ def train_ppo(args):
     if args.detection_method == "safe":
         safe_target_start = 0.9
         safe_target_end = 0.6
-        safe_target_decay_episodes = 600
+        safe_target_decay_episodes = 1200
         env.target_score = safe_target_start
         env.no_change_penalty = 0.05
         logger.success(
             f"[SAFE train] target_score linear decay {safe_target_start}->{safe_target_end} over {safe_target_decay_episodes} eps; "
             f"no_change_penalty={env.no_change_penalty}"
+        )
+    elif args.detection_method == "jtrans":
+        jtrans_target_start = 0.92
+        jtrans_target_end = 0.6
+        jtrans_target_decay_episodes = 1200
+        env.target_score = jtrans_target_start
+        logger.success(
+            f"[JTRANS train] target_score linear decay {jtrans_target_start}->{jtrans_target_end} over {jtrans_target_decay_episodes} eps"
         )
 
     agent = PPOAgent(
@@ -287,6 +295,11 @@ def train_ppo(args):
                 env.target_score = safe_target_start + (safe_target_end - safe_target_start) * progress
                 if episode % 10 == 0:
                     logger.success(f"[SAFE train] target_score={env.target_score:.4f} (ep={episode})")
+            elif args.detection_method == "jtrans":
+                progress = min(1.0, episode / max(1, jtrans_target_decay_episodes))
+                env.target_score = jtrans_target_start + (jtrans_target_end - jtrans_target_start) * progress
+                if episode % 10 == 0:
+                    logger.success(f"[JTRANS train] target_score={env.target_score:.4f} (ep={episode})")
             
             state = env.reset()
             
@@ -528,6 +541,14 @@ if __name__ == "__main__":
     parser.add_argument('--jtrans-use-gpu', action='store_true')
     
     args = parser.parse_args()
+
+    if args.detection_method == "jtrans":
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        jtrans_root = os.path.join(project_root, "detection_model", "jTrans")
+        if args.jtrans_model_dir is None:
+            args.jtrans_model_dir = os.path.join(jtrans_root, "models", "jTrans-finetune")
+        if args.jtrans_tokenizer_dir is None:
+            args.jtrans_tokenizer_dir = os.path.join(jtrans_root, "jtrans_tokenizer")
     
     # 清理旧日志
     log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log/uroboro.log')

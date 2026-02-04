@@ -18,6 +18,11 @@ import time
 import tempfile
 import shutil
 
+# Force transformers to skip TensorFlow; also drop any broken placeholder module.
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+if "tensorflow" in sys.modules and getattr(sys.modules["tensorflow"], "__spec__", None) is None:
+    del sys.modules["tensorflow"]
+
 # # 仅输出 WARNING/ERROR 级别日志（避免信息噪音）
 logger.remove()
 logger.add(sys.stderr, level="WARNING", format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
@@ -186,11 +191,6 @@ def prepare_original_asm(
 
 
 # === SAFE helpers (lazy import) ===
-_SAFE_SESSION = None
-_SAFE_SESSION_KEY = None
-_SAFE_GET_FUNCTIONS = None
-_SAFE_EMB_CACHE = {}
-_SAFE_INSTR_CACHE = {}
 
 
 def _get_safe_paths(safe_root=None, checkpoint_dir=None, i2v_dir=None):
@@ -203,18 +203,19 @@ def _get_safe_paths(safe_root=None, checkpoint_dir=None, i2v_dir=None):
     return base, ckpt, i2v
 
 
-def _get_safe_session(checkpoint_dir, i2v_dir, use_gpu=True):
-    global _SAFE_SESSION, _SAFE_SESSION_KEY, _SAFE_GET_FUNCTIONS
-    key = (checkpoint_dir, i2v_dir, bool(use_gpu))
-    if _SAFE_SESSION is not None and _SAFE_SESSION_KEY == key and _SAFE_GET_FUNCTIONS is not None:
-        return _SAFE_SESSION, _SAFE_GET_FUNCTIONS
+def _get_safe_session(checkpoint_dir, i2v_dir, use_gpu=True, safe_cache=None):
+    if safe_cache is not None:
+        key = (checkpoint_dir, i2v_dir, bool(use_gpu))
+        sess = safe_cache.get("session")
+        get_functions = safe_cache.get("get_functions")
+        if sess is not None and safe_cache.get("session_key") == key and get_functions is not None:
+            return sess, get_functions, False
 
-    # Close old session if any
-    try:
-        if _SAFE_SESSION is not None:
-            _SAFE_SESSION.close()
-    except Exception:
-        pass
+        try:
+            if sess is not None:
+                sess.close()
+        except Exception:
+            pass
 
     safe_root, _, _ = _get_safe_paths(checkpoint_dir=checkpoint_dir, i2v_dir=i2v_dir)
     if safe_root not in sys.path:
@@ -224,29 +225,180 @@ def _get_safe_session(checkpoint_dir, i2v_dir, use_gpu=True):
     from inference_example import SAFEInferenceSession, get_functions_from_binary
 
     sess = SAFEInferenceSession(checkpoint_dir, i2v_dir, use_gpu=use_gpu)
-    _SAFE_SESSION = sess
-    _SAFE_SESSION_KEY = key
-    _SAFE_GET_FUNCTIONS = get_functions_from_binary
-    return sess, get_functions_from_binary
+    if safe_cache is not None:
+        safe_cache["session"] = sess
+        safe_cache["session_key"] = (checkpoint_dir, i2v_dir, bool(use_gpu))
+        safe_cache["get_functions"] = get_functions_from_binary
+        safe_cache.setdefault("emb_cache", {})
+        safe_cache.setdefault("instr_cache", {})
+        return sess, get_functions_from_binary, False
+
+    return sess, get_functions_from_binary, True
 
 
-def _safe_get_embedding(binary_path, addr_int, checkpoint_dir, i2v_dir, use_gpu=True):
+# === jTrans helpers (lazy import) ===
+
+
+def _get_jtrans_paths(model_dir=None, tokenizer_dir=None):
+    base = os.environ.get(
+        "JTRANS_ROOT",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "detection_model", "jTrans"),
+    )
+    model = model_dir or os.environ.get(
+        "JTRANS_MODEL_DIR", os.path.join(base, "models", "jTrans-finetune")
+    )
+    tokenizer = tokenizer_dir or os.environ.get(
+        "JTRANS_TOKENIZER_DIR", os.path.join(base, "jtrans_tokenizer")
+    )
+    return base, model, tokenizer
+
+
+def _get_jtrans_session(model_dir, tokenizer_dir, use_gpu=True, jtrans_cache=None):
+    os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+    if "tensorflow" in sys.modules and getattr(sys.modules["tensorflow"], "__spec__", None) is None:
+        del sys.modules["tensorflow"]
+    if jtrans_cache is not None:
+        key = (model_dir, tokenizer_dir, bool(use_gpu))
+        model = jtrans_cache.get("model")
+        tokenizer = jtrans_cache.get("tokenizer")
+        device = jtrans_cache.get("device")
+        if model is not None and tokenizer is not None and jtrans_cache.get("session_key") == key:
+            return model, tokenizer, device
+
+    try:
+        import torch
+        from transformers import BertTokenizer, BertModel
+    except Exception as e:
+        logger.error(f"jTrans依赖缺失: {e}")
+        return None, None, None
+
+    class BinBertModel(BertModel):
+        def __init__(self, config, add_pooling_layer=True):
+            super().__init__(config)
+            self.config = config
+            self.embeddings.position_embeddings = self.embeddings.word_embeddings
+
+    device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
+    model = BinBertModel.from_pretrained(model_dir)
+    model.eval()
+    model.to(device)
+    tokenizer = BertTokenizer.from_pretrained(tokenizer_dir)
+    if jtrans_cache is not None:
+        jtrans_cache["model"] = model
+        jtrans_cache["tokenizer"] = tokenizer
+        jtrans_cache["device"] = device
+        jtrans_cache["session_key"] = (model_dir, tokenizer_dir, bool(use_gpu))
+        jtrans_cache.setdefault("emb_cache", {})
+    return model, tokenizer, device
+
+
+def _jtrans_tokens_from_asm(asm_path):
+    try:
+        from readidadata import parse_asm
+    except Exception as e:
+        logger.error(f"jTrans解析模块加载失败: {e}")
+        return []
+
+    tokens = []
+    try:
+        with open(asm_path, "r", errors="ignore") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.endswith(":"):
+                    continue
+                operator, op1, op2, op3, _ann = parse_asm(line)
+                if operator:
+                    tokens.append(operator)
+                if op1:
+                    tokens.append(op1)
+                if op2:
+                    tokens.append(op2)
+                if op3:
+                    tokens.append(op3)
+    except Exception as e:
+        logger.error(f"jTrans读取汇编失败: {asm_path}, {e}")
+    return tokens
+
+
+def _jtrans_embed_from_asm(asm_path, model, tokenizer, device, jtrans_cache=None):
+    try:
+        import torch
+    except Exception as e:
+        logger.error(f"jTrans依赖缺失: {e}")
+        return None
+
+    cache_key = None
+    if jtrans_cache is not None:
+        try:
+            cache_key = (os.path.abspath(asm_path), os.path.getmtime(asm_path))
+            emb_cache = jtrans_cache.setdefault("emb_cache", {})
+            if cache_key in emb_cache:
+                return emb_cache[cache_key]
+        except Exception:
+            cache_key = None
+
+    tokens = _jtrans_tokens_from_asm(asm_path)
+    if not tokens:
+        return None
+    text = " ".join(tokens)
+    encoded = tokenizer(
+        [text],
+        add_special_tokens=True,
+        max_length=512,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+    )
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+    with torch.no_grad():
+        output = model(input_ids=input_ids, attention_mask=attention_mask)
+        emb = output.pooler_output[0].detach().cpu().numpy()
+
+    if jtrans_cache is not None and cache_key is not None:
+        jtrans_cache.setdefault("emb_cache", {})[cache_key] = emb
+    return emb
+
+
+def _safe_get_embedding(
+    binary_path,
+    addr_int,
+    checkpoint_dir,
+    i2v_dir,
+    use_gpu=True,
+    safe_cache=None,
+    session=None,
+    get_functions=None,
+):
     cache_key = (os.path.abspath(binary_path), addr_int)
-    if cache_key in _SAFE_EMB_CACHE:
-        return _SAFE_EMB_CACHE[cache_key]
+    if safe_cache is not None:
+        emb_cache = safe_cache.setdefault("emb_cache", {})
+        if cache_key in emb_cache:
+            return emb_cache[cache_key]
 
-    sess, get_functions_from_binary = _get_safe_session(checkpoint_dir, i2v_dir, use_gpu=use_gpu)
-    # Reuse instruction extraction cache.
-    instr = _SAFE_INSTR_CACHE.get(cache_key)
+    if session is None or get_functions is None:
+        session, get_functions, _ephemeral = _get_safe_session(
+            checkpoint_dir, i2v_dir, use_gpu=use_gpu, safe_cache=safe_cache
+        )
+
+    if safe_cache is not None:
+        instr_cache = safe_cache.setdefault("instr_cache", {})
+        instr = instr_cache.get(cache_key)
+    else:
+        instr = None
+
     if instr is None:
-        instr_list = get_functions_from_binary(binary_path, addr_int)
+        instr_list = get_functions(binary_path, addr_int)
         instr = instr_list[0] if instr_list else None
-        _SAFE_INSTR_CACHE[cache_key] = instr
+        if safe_cache is not None:
+            instr_cache[cache_key] = instr
+
     if instr is None:
         return None
 
-    emb = sess.get_embedding(instr, verbose=False)
-    _SAFE_EMB_CACHE[cache_key] = emb
+    emb = session.get_embedding(instr, verbose=False)
+    if safe_cache is not None:
+        emb_cache[cache_key] = emb
     return emb
 
 def run_one(
@@ -267,6 +419,12 @@ def run_one(
     safe_i2v_dir=None,
     safe_use_gpu=True,
     original_asm_path=None,
+    mutated_asm_cache=None,
+    safe_cache=None,
+    jtrans_model_dir=None,
+    jtrans_tokenizer_dir=None,
+    jtrans_use_gpu=True,
+    jtrans_cache=None,
 ):
     """
     评估原始二进制文件和变异二进制文件之间的相似度
@@ -278,11 +436,15 @@ def run_one(
         checkdict: 函数映射字典（simple_mode=True 时不使用）
         function_name: 目标函数名
         simple_mode: 简单模式，直接用函数名提取汇编，不依赖 pickle 文件
-        detection_method: "asm2vec" 或 "safe"
+        detection_method: "asm2vec" / "safe" / "jtrans"
         *_func_addr: 可选的函数地址（优先于符号名）
         sym_to_addr_*: 可选映射文件/字典，用于解析变异后地址
         safe_*: SAFE 模型所需的 checkpoint 与 i2v 目录
         original_asm_path: 可选的原始汇编文件路径（用于复用）
+        mutated_asm_cache: 可选的变异函数汇编缓存 dict
+        safe_cache: 可选的 SAFE 缓存 dict（session/embedding/instr）
+        jtrans_*: jTrans 模型与 tokenizer 路径/开关
+        jtrans_cache: 可选的 jTrans 缓存 dict（model/tokenizer/emb）
     
     返回:
         score: 余弦相似度 (float) - 范围[0,1]，越低表示越不相似
@@ -365,37 +527,54 @@ def run_one(
                         if original_asm_cache is not None:
                             original_asm_cache[cache_key] = original_asm
                 
-                # 提取变异文件的汇编
-                mutate_output_file = binfunc2asm(
-                    ipath=mutated_binary,
-                    target_func_name=function_name,
-                    opath=os.path.join(asm_work_dir, 'mutated'), 
-                    verbose=bool(os.environ.get("ASM2VEC_VERBOSE")),
-                    current_sym_addr=mutated_addr_hex
-                )
-                if not mutate_output_file:
-                    logger.error(
-                        f"无法提取变异函数 {function_name} 的汇编文件 "
-                        f"(addr={mutated_addr_hex})"
+                # 提取/复用变异文件的汇编
+                mutate_output_file = None
+                mutate_cache_key = None
+                if mutated_asm_cache is not None:
+                    mutate_cache_key = (
+                        os.path.abspath(mutated_binary),
+                        function_name,
+                        mutated_addr_hex,
                     )
-                    logger.error(
-                        "提取失败上下文: mutated_binary=%s exists=%s sym_to_addr=%s simple_mode=%s",
-                        mutated_binary,
-                        os.path.exists(mutated_binary),
-                        sym_to_addr_path,
-                        simple_mode,
+                    mutate_output_file = mutated_asm_cache.get(mutate_cache_key)
+                    if mutate_output_file and not os.path.exists(mutate_output_file):
+                        mutate_output_file = None
+                        mutated_asm_cache.pop(mutate_cache_key, None)
+
+                if mutate_output_file is None:
+                    mutate_output_file = binfunc2asm(
+                        ipath=mutated_binary,
+                        target_func_name=function_name,
+                        opath=os.path.join(asm_work_dir, 'mutated'),
+                        verbose=bool(os.environ.get("ASM2VEC_VERBOSE")),
+                        current_sym_addr=mutated_addr_hex
                     )
-                    return None, None
+                    if not mutate_output_file:
+                        logger.error(
+                            f"无法提取变异函数 {function_name} 的汇编文件 "
+                            f"(addr={mutated_addr_hex})"
+                        )
+                        logger.error(
+                            "提取失败上下文: mutated_binary=%s exists=%s sym_to_addr=%s simple_mode=%s",
+                            mutated_binary,
+                            os.path.exists(mutated_binary),
+                            sym_to_addr_path,
+                            simple_mode,
+                        )
+                        return None, None
+                    if mutated_asm_cache is not None and mutate_cache_key is not None:
+                        mutated_asm_cache[mutate_cache_key] = mutate_output_file
                 logger.info(f"提取到变异函数汇编: {mutate_output_file}")
                 # 计算相似度
                 score = compare_functions(original_asm, mutate_output_file)
                 grad = 0.0
                 
                 # 清理变异文件
-                try:
-                    os.remove(mutate_output_file)
-                except Exception as e:
-                    logger.debug(f"清理变异汇编文件失败: {mutate_output_file}, {e}")
+                if mutated_asm_cache is None:
+                    try:
+                        os.remove(mutate_output_file)
+                    except Exception as e:
+                        logger.debug(f"清理变异汇编文件失败: {mutate_output_file}, {e}")
                 
                 return abs(score), abs(grad)
             finally:
@@ -429,17 +608,138 @@ def run_one(
                 return None, None
             # print(f"SAFE function addrs: original={addr1}, mutated={addr2}")
             # input("[run_one]:Press Enter to continue...")
-            emb1 = _safe_get_embedding(original_binary, addr1, ckpt_dir, i2v_dir, use_gpu=safe_use_gpu)
+            sess = None
+            get_functions = None
+            ephemeral = False
+            if safe_cache is None:
+                sess, get_functions, ephemeral = _get_safe_session(
+                    ckpt_dir, i2v_dir, use_gpu=safe_use_gpu, safe_cache=None
+                )
+
+            emb1 = _safe_get_embedding(
+                original_binary,
+                addr1,
+                ckpt_dir,
+                i2v_dir,
+                use_gpu=safe_use_gpu,
+                safe_cache=safe_cache,
+                session=sess,
+                get_functions=get_functions,
+            )
             if emb1 is None:
                 logger.error(f"SAFE无法提取原始函数嵌入: {function_name} @ {original_addr_hex}")
+                if ephemeral and sess is not None:
+                    try:
+                        sess.close()
+                    except Exception:
+                        pass
                 return None, None
-            emb2 = _safe_get_embedding(mutated_binary, addr2, ckpt_dir, i2v_dir, use_gpu=safe_use_gpu)
+            emb2 = _safe_get_embedding(
+                mutated_binary,
+                addr2,
+                ckpt_dir,
+                i2v_dir,
+                use_gpu=safe_use_gpu,
+                safe_cache=safe_cache,
+                session=sess,
+                get_functions=get_functions,
+            )
             if emb2 is None:
                 logger.error(f"SAFE无法提取变异函数嵌入: {function_name} @ {mutated_addr_hex}")
+                if ephemeral and sess is not None:
+                    try:
+                        sess.close()
+                    except Exception:
+                        pass
                 return None, None
+            if ephemeral and sess is not None:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
 
             score = float(np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2)))
             return abs(score), 0.0
+        elif detection_method == "jtrans":
+            logger.info(f"[*] detection_method: {detection_method}")
+
+            jtrans_root, model_dir, tokenizer_dir = _get_jtrans_paths(
+                model_dir=jtrans_model_dir, tokenizer_dir=jtrans_tokenizer_dir
+            )
+            if jtrans_root not in sys.path:
+                sys.path.insert(0, jtrans_root)
+            if not os.path.isdir(model_dir) or not os.path.isdir(tokenizer_dir):
+                logger.error(f"jTrans模型路径无效: model={model_dir}, tokenizer={tokenizer_dir}")
+                return None, None
+
+            model, tokenizer, device = _get_jtrans_session(
+                model_dir, tokenizer_dir, use_gpu=jtrans_use_gpu, jtrans_cache=jtrans_cache
+            )
+            if model is None or tokenizer is None:
+                return None, None
+
+            if asm_work_dir is None:
+                jtrans_work_dir = tempfile.mkdtemp(prefix="jtrans_", suffix="_tmp")
+                need_cleanup = True
+            else:
+                jtrans_work_dir = os.path.join(asm_work_dir, "jtrans")
+                os.makedirs(os.path.join(jtrans_work_dir, "original"), exist_ok=True)
+                os.makedirs(os.path.join(jtrans_work_dir, "mutated"), exist_ok=True)
+                need_cleanup = False
+
+            try:
+                # 原始汇编（可复用 asm2vec 的缓存）
+                if original_asm_path:
+                    if not os.path.exists(original_asm_path):
+                        logger.error(f"原始汇编文件不存在: {original_asm_path}")
+                        return None, None
+                    original_asm = original_asm_path
+                else:
+                    original_asm, _ori_addr, _ = prepare_original_asm(
+                        original_binary=original_binary,
+                        function_name=function_name,
+                        asm_work_dir=jtrans_work_dir,
+                        original_func_addr=original_func_addr,
+                        sym_to_addr_path=sym_to_addr_path,
+                        sym_to_addr_map=sym_to_addr_map,
+                        simple_mode=simple_mode,
+                        original_asm_cache=original_asm_cache,
+                    )
+                    if not original_asm:
+                        return None, None
+
+                mutate_output_file = binfunc2asm(
+                    ipath=mutated_binary,
+                    target_func_name=function_name,
+                    opath=os.path.join(jtrans_work_dir, "mutated"),
+                    verbose=bool(os.environ.get("ASM2VEC_VERBOSE")),
+                    current_sym_addr=mutated_addr_hex,
+                )
+                if not mutate_output_file:
+                    logger.error(f"无法提取变异函数 {function_name} 的汇编文件")
+                    return None, None
+
+                emb1 = _jtrans_embed_from_asm(
+                    original_asm, model, tokenizer, device, jtrans_cache=jtrans_cache
+                )
+                emb2 = _jtrans_embed_from_asm(
+                    mutate_output_file, model, tokenizer, device, jtrans_cache=jtrans_cache
+                )
+                if emb1 is None or emb2 is None:
+                    return None, None
+                score = float(np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2)))
+                if not need_cleanup:
+                    try:
+                        os.remove(mutate_output_file)
+                    except Exception:
+                        pass
+                return abs(score), 0.0
+            finally:
+                if need_cleanup:
+                    try:
+                        shutil.rmtree(jtrans_work_dir)
+                    except Exception as e:
+                        logger.warning(f"清理jTrans临时目录失败: {jtrans_work_dir}, {e}")
         else:
             logger.error(f"Unsupported detection_method: {detection_method}")
             return None, None
@@ -447,18 +747,3 @@ def run_one(
     except Exception as e:
         logger.error(f"run_one函数出错: {e}")
         return None, None
-
-
-# def train_pickle(asm_file):
-    # TODO
-
-
-# if __name__ == '__main__':
-#     # compare_functions(ipath1="/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/changed_asm/0092b83bfab97f48a5e10cb3830436481e33baa977c175dbe0c63dbe9b5575fc",
-#                 # ipath2='/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd_asm/original_asm/1c359ba4755040359222334bb638b769f9f58a6fd6ca9a312914f67ea70fb5b6')
-#     run_one(original_binary="/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/bin_bk/pwd",
-#             mutated_binary="/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/function_container_usage_pwd/f906ab2da901dbb8d4ecabd3f95409b1_container/f906ab2da901dbb8d4ecabd3f95409b1",
-#             model_original=None,
-#             checkdict=None,
-#             function_name="usage",
-#             detection_method="asm2vec")

@@ -458,6 +458,7 @@ def _pin_sample(env, sample_idx, sample):
     env.current_sample_idx = sample_idx
     env.current_sample_data = sample
     env.episodes_on_current = 0
+    env.original_func_addr = None
     env.original_binary = sample.get("binary_path")
     env.function_name = sample.get("func_name")
 

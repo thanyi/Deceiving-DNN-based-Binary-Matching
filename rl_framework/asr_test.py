@@ -130,6 +130,16 @@ def make_mutated_query(sample: Dict, mutated_binary: Optional[str]) -> Dict:
     return mutated
 
 
+def _get_variant_set(sample: Dict) -> Optional[set]:
+    variants = sample.get("variants")
+    if not variants or not isinstance(variants, list):
+        return None
+    cleaned = [str(v) for v in variants if v]
+    if not cleaned:
+        return None
+    return set(cleaned)
+
+
 class RetrievalBase:
     name = "base"
 
@@ -451,6 +461,7 @@ class RLAgentRunner:
             safe_checkpoint_dir=safe_checkpoint_dir,
             safe_i2v_dir=safe_i2v_dir,
             safe_use_gpu=safe_use_gpu,
+            safe_cache_enabled=(detection_method == "safe"),
         )
         self.env.target_score = 0.3
         self.env.set_state_dim(state_dim)
@@ -482,7 +493,7 @@ class RLAgentRunner:
                 actual_action,
                 _log_prob,
                 _value,
-            ) = self.agent.select_action(state, explore=False)
+            ) = self.agent.select_action(state, explore=True)
 
             next_state, _reward, done, info = self.env.step(actual_action, loc_idx)
             score = info.get("score", 1.0)
@@ -663,6 +674,122 @@ def run_asr_simple(
     return asr, rows
 
 
+def run_asr_multi_variant(
+    dataset_path: str,
+    model_path: str,
+    k: int,
+    budget: int,
+    limit: Optional[int],
+    save_path: str,
+    use_gpu: bool,
+    env_detection: str,
+    retriever: RetrievalBase,
+) -> Dict[str, float]:
+    dataset = load_dataset(dataset_path)
+    if limit is not None:
+        dataset = dataset[:limit]
+
+    print(
+        f"[ASR-MV] Dataset loaded: {dataset_path} samples={len(dataset)} "
+        f"topk={k} budget={budget} retrieval={retriever.name}"
+    )
+    runner = RLAgentRunner(
+        dataset_path=dataset_path,
+        model_path=model_path,
+        save_path=save_path,
+        max_steps=budget,
+        use_gpu=use_gpu,
+        detection_method=env_detection,
+        safe_checkpoint_dir=getattr(retriever, "checkpoint_dir", None),
+        safe_i2v_dir=getattr(retriever, "i2v_dir", None),
+        safe_use_gpu=getattr(retriever, "use_gpu", False),
+    )
+    print("[ASR-MV] Environment ready. Start mutation.")
+
+    total = 0
+    skipped = 0
+    errors = 0
+    sum_asr1 = 0.0
+    sum_asr3 = 0.0
+    sum_asr5 = 0.0
+    sum_wasr = 0.0
+    sum_recall_pre = 0.0
+    sum_recall_post = 0.0
+
+    pbar = tqdm(enumerate(dataset), total=len(dataset), desc=f"ASR-MV@{k}", unit="sample")
+    for idx, sample in pbar:
+        variants = _get_variant_set(sample)
+        if not variants:
+            skipped += 1
+            continue
+
+        sample_id = str(sample.get("id") or f"sample_{idx}")
+        tqdm.write(
+            f"[ASR-MV] Start sample={idx} id={sample_id} func={sample.get('func_name')} variants={len(variants)}"
+        )
+
+        try:
+            topk_before = retriever.topk(sample, dataset, k, query_kind="original")
+            if not topk_before:
+                raise ValueError("retrieval_before_empty")
+        except Exception as e:
+            errors += 1
+            tqdm.write(f"[ASR-MV] retrieval_before_failed:{e}")
+            continue
+
+        attack_info = runner.attack_sample(sample_idx=idx, max_steps=budget)
+        mutated_query = make_mutated_query(sample, attack_info["final_binary"])
+
+        try:
+            topk_after = retriever.topk(mutated_query, dataset, k, query_kind="mutated")
+            if not topk_after:
+                raise ValueError("retrieval_after_empty")
+        except Exception as e:
+            errors += 1
+            tqdm.write(f"[ASR-MV] retrieval_after_failed:{e}")
+            continue
+
+        topk_pre_ids = {str(item.get("id")) for item in topk_before if item.get("id") is not None}
+        topk_post_ids = {str(item.get("id")) for item in topk_after if item.get("id") is not None}
+
+        hits_pre = len(topk_pre_ids & variants)
+        hits_post = len(topk_post_ids & variants)
+        pushed_out = max(hits_pre - hits_post, 0)
+
+        total += 1
+        sum_asr1 += 1.0 if pushed_out >= 1 else 0.0
+        sum_asr3 += 1.0 if pushed_out >= 3 else 0.0
+        sum_asr5 += 1.0 if pushed_out >= 5 else 0.0
+        sum_wasr += min(max(pushed_out, 0), 5) / 5.0
+        sum_recall_pre += hits_pre / max(len(variants), 1)
+        sum_recall_post += hits_post / max(len(variants), 1)
+
+        tqdm.write(
+            f"[ASR-MV] hits_pre={hits_pre} hits_post={hits_post} pushed_out={pushed_out}"
+        )
+
+    denom = max(total, 1)
+    metrics = {
+        "ASR@1": sum_asr1 / denom,
+        "ASR@3": sum_asr3 / denom,
+        "ASR@5": sum_asr5 / denom,
+        "wASR": sum_wasr / denom,
+        "recall_pre": sum_recall_pre / denom,
+        "recall_post": sum_recall_post / denom,
+    }
+    print(f"[ASR-MV] samples={total} skipped={skipped} errors={errors}")
+    print(
+        "[ASR-MV] "
+        f"ASR@1={metrics['ASR@1']:.4f} "
+        f"ASR@3={metrics['ASR@3']:.4f} "
+        f"ASR@5={metrics['ASR@5']:.4f} "
+        f"wASR={metrics['wASR']:.4f} "
+        f"recall_pre={metrics['recall_pre']:.4f} "
+        f"recall_post={metrics['recall_post']:.4f}"
+    )
+    return metrics
+
+
 def save_csv(rows: List[Dict], path: str) -> None:
     if not rows:
         return
@@ -699,6 +826,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-path", default=default_save)
     parser.add_argument("--csv", default="asr_test.csv")
     parser.add_argument("--use-gpu", action="store_true")
+    parser.add_argument(
+        "--mode",
+        choices=["single", "multi_variant"],
+        default="single",
+        help="single uses target id; multi_variant uses variants list for robustness.",
+    )
     parser.add_argument(
         "--retrieval-model",
         choices=["asm2vec", "safe"],
@@ -740,21 +873,34 @@ def main() -> None:
 
     retriever = build_retriever(args, args.save_path)
     print(f"[ASR] Retrieval model: {retriever.name}")
-    asr, rows = run_asr_simple(
-        dataset_path=args.dataset,
-        model_path=args.model_path,
-        k=args.topk,
-        budget=args.budget,
-        limit=args.limit,
-        save_path=args.save_path,
-        csv_path=csv_path,
-        use_gpu=args.use_gpu,
-        env_detection=args.env_detection,
-        retriever=retriever,
-    )
+    if args.mode == "single":
+        asr, rows = run_asr_simple(
+            dataset_path=args.dataset,
+            model_path=args.model_path,
+            k=args.topk,
+            budget=args.budget,
+            limit=args.limit,
+            save_path=args.save_path,
+            csv_path=csv_path,
+            use_gpu=args.use_gpu,
+            env_detection=args.env_detection,
+            retriever=retriever,
+        )
 
-    print(f"ASR@{args.topk}: {asr:.4f} ({sum(r['success'] for r in rows)}/{len(rows)})")
-    print(f"CSV saved to: {csv_path}")
+        print(f"ASR@{args.topk}: {asr:.4f} ({sum(r['success'] for r in rows)}/{len(rows)})")
+        print(f"CSV saved to: {csv_path}")
+    else:
+        run_asr_multi_variant(
+            dataset_path=args.dataset,
+            model_path=args.model_path,
+            k=args.topk,
+            budget=args.budget,
+            limit=args.limit,
+            save_path=args.save_path,
+            use_gpu=args.use_gpu,
+            env_detection=args.env_detection,
+            retriever=retriever,
+        )
 
 
 if __name__ == "__main__":

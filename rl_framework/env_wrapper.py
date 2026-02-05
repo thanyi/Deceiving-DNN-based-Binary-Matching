@@ -51,6 +51,8 @@ class BinaryPerturbationEnv:
         jtrans_model_dir=None,
         jtrans_tokenizer_dir=None,
         jtrans_use_gpu=False,
+        feature_mode="full",
+        seed=None,
         adaptive_hold=True,
         hold_min=None,
         hold_max=None,
@@ -115,6 +117,11 @@ class BinaryPerturbationEnv:
         self.jtrans_tokenizer_dir = jtrans_tokenizer_dir
         self.jtrans_use_gpu = jtrans_use_gpu
         self._jtrans_cache = {}
+        self.feature_mode = feature_mode
+        self.seed = seed
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
         logger.info(f"Using {self.detection_method} detection method")
         
         # 变异历史
@@ -142,7 +149,7 @@ class BinaryPerturbationEnv:
         self.drop_bonus_scale = 3.0
         self.drop_bonus_cap = 2.0
         # 任何有效变异（分数下降）给予小正奖，避免长期负反馈
-        self.effective_mutation_bonus = 0.1
+        self.effective_mutation_bonus = 0.2
         
         # 【性能优化】原始文件汇编缓存（原始文件不变，可复用）
         # 缓存键: (original_binary, function_name, ori_sym_addr)
@@ -352,6 +359,8 @@ class BinaryPerturbationEnv:
         # 2. 替换 NaN 为 0，替换 Infinity 为最大/最小有限值
         # 防止任何计算错误产生的 NaN 传入神经网络
         features = np.nan_to_num(features, nan=0.0, posinf=100.0, neginf=-100.0)
+
+        features = self._apply_feature_mode(features)
         
         # 3. 裁剪数值范围 (Clip)
         # 防止某些特征数值过大（比如 total_instr 突然很大），导致梯度爆炸
@@ -380,6 +389,26 @@ class BinaryPerturbationEnv:
                 counts[action_idx] += 1.0
 
         return (counts / total).tolist()
+
+    def _apply_feature_mode(self, features):
+        if self.feature_mode == "full":
+            return features
+        feats = features.copy()
+        if self.state_dim < 256 or len(feats) < 16:
+            return feats
+        if self.feature_mode in ("no_progress", "no_progress_api", "no_section_c"):
+            feats[12:16] = 0.0
+        if self.feature_mode in ("no_api", "no_progress_api"):
+            c_start = 16 + 40 + 160
+            api_start = c_start + 8
+            api_end = c_start + 30
+            if api_end < len(feats):
+                feats[api_start:api_end + 1] = 0.0
+        if self.feature_mode == "no_section_c":
+            c_start = 16 + 40 + 160
+            if c_start < len(feats):
+                feats[c_start:] = 0.0
+        return feats
 
     def extract_features(self, binary_path):
         """
@@ -454,6 +483,8 @@ class BinaryPerturbationEnv:
         # 2. 替换 NaN 为 0，替换 Infinity 为最大/最小有限值
         # 防止任何计算错误产生的 NaN 传入神经网络
         features = np.nan_to_num(features, nan=0.0, posinf=100.0, neginf=-100.0)
+
+        features = self._apply_feature_mode(features)
         
         # 3. 裁剪数值范围 (Clip)
         # 防止某些特征数值过大（比如 total_instr 突然很大），导致梯度爆炸
@@ -674,7 +705,7 @@ class BinaryPerturbationEnv:
         # 补 1 维
         vec.append(0.0) 
             
-        # 2. API & Strings (22 dims) - 这是最强的指纹，完全保留
+        # 2. API & Strings (22 dims)
         vec.append(np.log1p(fingerprints.get('n_calls', 0)))
         vec.append(np.log1p(fingerprints.get('n_strings', 0)))
         # 相对于有效指令的密度

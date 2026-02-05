@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import pickle
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -463,7 +464,7 @@ class RLAgentRunner:
             safe_use_gpu=safe_use_gpu,
             safe_cache_enabled=(detection_method == "safe"),
         )
-        self.env.target_score = 0.3
+        self.env.target_score = 0.4
         self.env.set_state_dim(state_dim)
 
     def _pin_sample(self, sample_idx: int) -> None:
@@ -550,12 +551,82 @@ def build_retriever(args: argparse.Namespace, save_path: str) -> RetrievalBase:
     raise ValueError(f"Unknown retrieval model: {args.retrieval_model}")
 
 
+def _apply_limit(
+    dataset: List[Dict],
+    limit: Optional[int],
+    limit_mode: str,
+    limit_seed: Optional[int],
+) -> List[Dict]:
+    if limit is None:
+        return dataset
+    total = len(dataset)
+    if total == 0:
+        return dataset
+    limit = max(0, min(int(limit), total))
+    if limit_mode == "head":
+        return dataset[:limit]
+    rng = random.Random(limit_seed)
+    if limit_mode == "random":
+        return rng.sample(dataset, limit)
+    if limit_mode == "variants":
+        id_to_item = {str(d.get("id")): d for d in dataset if d.get("id") is not None}
+        indices = list(range(total))
+        rng.shuffle(indices)
+        selected_ids = []
+        selected_set = set()
+        anchors = 0
+        for idx in indices:
+            if anchors >= limit:
+                break
+            item = dataset[idx]
+            item_id = item.get("id")
+            if item_id is None or item_id in selected_set:
+                continue
+            group_ids = [item_id] + [
+                vid for vid in item.get("variants", []) if vid in id_to_item
+            ]
+            for gid in group_ids:
+                if gid in selected_set:
+                    continue
+                selected_set.add(gid)
+                selected_ids.append(gid)
+            anchors += 1
+        return [id_to_item[i] for i in selected_ids if i in id_to_item]
+    if limit_mode == "variants_strict":
+        id_to_item = {str(d.get("id")): d for d in dataset if d.get("id") is not None}
+        indices = list(range(total))
+        rng.shuffle(indices)
+        selected_ids = []
+        selected_set = set()
+        for idx in indices:
+            if len(selected_ids) >= limit:
+                break
+            item = dataset[idx]
+            item_id = item.get("id")
+            if item_id is None or item_id in selected_set:
+                continue
+            group_ids = [item_id] + [
+                vid for vid in item.get("variants", []) if vid in id_to_item
+            ]
+            for gid in group_ids:
+                if len(selected_ids) >= limit:
+                    break
+                if gid in selected_set:
+                    continue
+                selected_set.add(gid)
+                selected_ids.append(gid)
+        return [id_to_item[i] for i in selected_ids if i in id_to_item]
+    raise ValueError(f"Unknown limit_mode: {limit_mode}")
+
+
 def run_asr_simple(
     dataset_path: str,
     model_path: str,
     k: int,
     budget: int,
     limit: Optional[int],
+    limit_mode: str,
+    limit_seed: Optional[int],
     save_path: str,
     csv_path: str,
     use_gpu: bool,
@@ -563,12 +634,12 @@ def run_asr_simple(
     retriever: RetrievalBase,
 ) -> Tuple[float, List[Dict]]:
     dataset = load_dataset(dataset_path)
-    if limit is not None:
-        dataset = dataset[:limit]
+    dataset = _apply_limit(dataset, limit, limit_mode, limit_seed)
 
     print(
         f"[ASR] Dataset loaded: {dataset_path} samples={len(dataset)} "
-        f"topk={k} budget={budget} retrieval={retriever.name}"
+        f"topk={k} budget={budget} retrieval={retriever.name} "
+        f"limit={limit} mode={limit_mode}"
     )
     runner = RLAgentRunner(
         dataset_path=dataset_path,
@@ -619,6 +690,21 @@ def run_asr_simple(
 
         attack_info = runner.attack_sample(sample_idx=idx, max_steps=budget)
         mutated_query = make_mutated_query(sample, attack_info["final_binary"])
+
+        if attack_info.get("error"):
+            rows.append(
+                {
+                    "sample_id": sample_id,
+                    "target_id": target_id or "",
+                    "rank_before": rank_before if rank_before is not None else "",
+                    "rank_after": "",
+                    "steps_used": attack_info["steps_used"],
+                    "final_score": attack_info["final_score"],
+                    "success": 0,
+                    "error": f"mutation_failed_skip_after:{attack_info['error']}",
+                }
+            )
+            continue
 
         try:
             topk_after = retriever.topk(mutated_query, dataset, k, query_kind="mutated")
@@ -680,18 +766,20 @@ def run_asr_multi_variant(
     k: int,
     budget: int,
     limit: Optional[int],
+    limit_mode: str,
+    limit_seed: Optional[int],
     save_path: str,
     use_gpu: bool,
     env_detection: str,
     retriever: RetrievalBase,
 ) -> Dict[str, float]:
     dataset = load_dataset(dataset_path)
-    if limit is not None:
-        dataset = dataset[:limit]
+    dataset = _apply_limit(dataset, limit, limit_mode, limit_seed)
 
     print(
         f"[ASR-MV] Dataset loaded: {dataset_path} samples={len(dataset)} "
-        f"topk={k} budget={budget} retrieval={retriever.name}"
+        f"topk={k} budget={budget} retrieval={retriever.name} "
+        f"limit={limit} mode={limit_mode}"
     )
     runner = RLAgentRunner(
         dataset_path=dataset_path,
@@ -706,6 +794,7 @@ def run_asr_multi_variant(
     )
     print("[ASR-MV] Environment ready. Start mutation.")
 
+    sampled_ids = {str(item.get("id")) for item in dataset if item.get("id") is not None}
     total = 0
     skipped = 0
     errors = 0
@@ -715,10 +804,15 @@ def run_asr_multi_variant(
     sum_wasr = 0.0
     sum_recall_pre = 0.0
     sum_recall_post = 0.0
+    checked = 0
 
     pbar = tqdm(enumerate(dataset), total=len(dataset), desc=f"ASR-MV@{k}", unit="sample")
     for idx, sample in pbar:
         variants = _get_variant_set(sample)
+        if not variants:
+            skipped += 1
+            continue
+        variants = set(v for v in variants if v in sampled_ids)
         if not variants:
             skipped += 1
             continue
@@ -734,11 +828,40 @@ def run_asr_multi_variant(
                 raise ValueError("retrieval_before_empty")
         except Exception as e:
             errors += 1
+            checked += 1
             tqdm.write(f"[ASR-MV] retrieval_before_failed:{e}")
+            if checked % 6 == 0:
+                denom = max(total, 1)
+                tqdm.write(
+                    "[ASR-MV] "
+                    f"ASR@1={sum_asr1 / denom:.4f} "
+                    f"ASR@3={sum_asr3 / denom:.4f} "
+                    f"ASR@5={sum_asr5 / denom:.4f} "
+                    f"wASR={sum_wasr / denom:.4f} "
+                    f"recall_pre={sum_recall_pre / denom:.4f} "
+                    f"recall_post={sum_recall_post / denom:.4f}"
+                )
             continue
 
         attack_info = runner.attack_sample(sample_idx=idx, max_steps=budget)
         mutated_query = make_mutated_query(sample, attack_info["final_binary"])
+
+        if attack_info.get("error"):
+            errors += 1
+            checked += 1
+            tqdm.write(f"[ASR-MV] mutation_failed_skip_after:{attack_info['error']}")
+            if checked % 6 == 0:
+                denom = max(total, 1)
+                tqdm.write(
+                    "[ASR-MV] "
+                    f"ASR@1={sum_asr1 / denom:.4f} "
+                    f"ASR@3={sum_asr3 / denom:.4f} "
+                    f"ASR@5={sum_asr5 / denom:.4f} "
+                    f"wASR={sum_wasr / denom:.4f} "
+                    f"recall_pre={sum_recall_pre / denom:.4f} "
+                    f"recall_post={sum_recall_post / denom:.4f}"
+                )
+            continue
 
         try:
             topk_after = retriever.topk(mutated_query, dataset, k, query_kind="mutated")
@@ -746,7 +869,19 @@ def run_asr_multi_variant(
                 raise ValueError("retrieval_after_empty")
         except Exception as e:
             errors += 1
+            checked += 1
             tqdm.write(f"[ASR-MV] retrieval_after_failed:{e}")
+            if checked % 6 == 0:
+                denom = max(total, 1)
+                tqdm.write(
+                    "[ASR-MV] "
+                    f"ASR@1={sum_asr1 / denom:.4f} "
+                    f"ASR@3={sum_asr3 / denom:.4f} "
+                    f"ASR@5={sum_asr5 / denom:.4f} "
+                    f"wASR={sum_wasr / denom:.4f} "
+                    f"recall_pre={sum_recall_pre / denom:.4f} "
+                    f"recall_post={sum_recall_post / denom:.4f}"
+                )
             continue
 
         topk_pre_ids = {str(item.get("id")) for item in topk_before if item.get("id") is not None}
@@ -763,10 +898,22 @@ def run_asr_multi_variant(
         sum_wasr += min(max(pushed_out, 0), 5) / 5.0
         sum_recall_pre += hits_pre / max(len(variants), 1)
         sum_recall_post += hits_post / max(len(variants), 1)
+        checked += 1
 
         tqdm.write(
             f"[ASR-MV] hits_pre={hits_pre} hits_post={hits_post} pushed_out={pushed_out}"
         )
+        if checked % 6 == 0:
+            denom = max(total, 1)
+            tqdm.write(
+                "[ASR-MV] "
+                f"ASR@1={sum_asr1 / denom:.4f} "
+                f"ASR@3={sum_asr3 / denom:.4f} "
+                f"ASR@5={sum_asr5 / denom:.4f} "
+                f"wASR={sum_wasr / denom:.4f} "
+                f"recall_pre={sum_recall_pre / denom:.4f} "
+                f"recall_post={sum_recall_post / denom:.4f}"
+            )
 
     denom = max(total, 1)
     metrics = {
@@ -823,6 +970,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-k", "--topk", type=int, default=10)
     parser.add_argument("-b", "--budget", type=int, default=30)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--limit-mode",
+        choices=["head", "random", "variants", "variants_strict"],
+        default="head",
+        help="How to apply --limit: head (slice), random, variants-first, or variants_strict (cap to limit).",
+    )
+    parser.add_argument("--limit-seed", type=int, default=None)
     parser.add_argument("--save-path", default=default_save)
     parser.add_argument("--csv", default="asr_test.csv")
     parser.add_argument("--use-gpu", action="store_true")
@@ -880,6 +1034,8 @@ def main() -> None:
             k=args.topk,
             budget=args.budget,
             limit=args.limit,
+            limit_mode=args.limit_mode,
+            limit_seed=args.limit_seed,
             save_path=args.save_path,
             csv_path=csv_path,
             use_gpu=args.use_gpu,
@@ -896,6 +1052,8 @@ def main() -> None:
             k=args.topk,
             budget=args.budget,
             limit=args.limit,
+            limit_mode=args.limit_mode,
+            limit_seed=args.limit_seed,
             save_path=args.save_path,
             use_gpu=args.use_gpu,
             env_detection=args.env_detection,

@@ -181,10 +181,11 @@ class PPOAgent:
             'rewards': [],
             'values': [],
             'log_probs': [],
-            'dones': []
+            'dones': [],
+            'loc_masks': []
         }
     
-    def select_action(self, state, explore=True):
+    def select_action(self, state, explore=True, loc_mask=None):
         """
        
         """
@@ -192,6 +193,8 @@ class PPOAgent:
         
         with torch.no_grad():
             action_logits, state_value = self.policy(state)
+        # 位置掩码（仅在采样时使用）
+        action_logits = self._apply_loc_mask(action_logits, loc_mask)
         
         dist = Categorical(logits=action_logits)
         
@@ -229,13 +232,16 @@ class PPOAgent:
             _, state_value = self.policy(state)  # 只需要 value，不需要 logits
         return state_value.item()
     
-    def store_transition(self, state, joint_action, reward, log_prob, value, done):
+    def store_transition(self, state, joint_action, reward, log_prob, value, done, loc_mask=None):
         self.memory['states'].append(state)
         self.memory['joint_actions'].append(joint_action)
         self.memory['rewards'].append(reward)
         self.memory['log_probs'].append(log_prob)
         self.memory['values'].append(value)
         self.memory['dones'].append(1.0 if done else 0.0)
+        if loc_mask is None:
+            loc_mask = [1] * self.n_locs
+        self.memory['loc_masks'].append(loc_mask)
     
     def compute_returns(self, next_value=0):
         """计算回报（使用 GAE - Generalized Advantage Estimation）"""
@@ -310,6 +316,11 @@ class PPOAgent:
             
             # ✅ 简单裁剪，不归一化
             action_logits = torch.clamp(action_logits, -20, 20)
+            # ✅ 位置掩码：屏蔽无效位置
+            if self.memory.get('loc_masks'):
+                loc_masks = self.memory['loc_masks']
+                loc_masks = torch.FloatTensor(np.array(loc_masks)).to(self.device)
+                action_logits = self._apply_loc_mask(action_logits, loc_masks)
             
             # ✅ NaN 检查
             if torch.isnan(action_logits).any():
@@ -445,8 +456,34 @@ class PPOAgent:
             'rewards': [],
             'values': [],
             'log_probs': [],
-            'dones': []
+            'dones': [],
+            'loc_masks': []
         }
+
+    def _apply_loc_mask(self, action_logits, loc_mask):
+        """
+        将位置掩码应用到 joint action logits 上。
+        loc_mask: shape [B, n_locs] 或 [n_locs]
+        """
+        if loc_mask is None:
+            return action_logits
+
+        if not torch.is_tensor(loc_mask):
+            loc_mask = torch.tensor(loc_mask, dtype=action_logits.dtype, device=action_logits.device)
+        if loc_mask.dim() == 1:
+            loc_mask = loc_mask.unsqueeze(0)
+        if loc_mask.size(-1) != self.n_locs:
+            logger.warning(
+                f"[ppo_agent.py:_apply_loc_mask] loc_mask size {loc_mask.size(-1)} "
+                f"!= n_locs {self.n_locs}, skip mask"
+            )
+            return action_logits
+
+        # 防止全 0 掩码导致无法采样：全 0 行改为全 1
+        mask_sum = loc_mask.sum(dim=1, keepdim=True)
+        loc_mask = torch.where(mask_sum > 0, loc_mask, torch.ones_like(loc_mask))
+        joint_mask = loc_mask.repeat_interleave(self.n_actions, dim=1)
+        return action_logits.masked_fill(joint_mask <= 0, -1e9)
     
     def save(self, path, extra_state=None):
         """保存模型（完整版）"""

@@ -150,6 +150,11 @@ class BinaryPerturbationEnv:
         self.drop_bonus_cap = 2.0
         # 任何有效变异（分数下降）给予小正奖，避免长期负反馈
         self.effective_mutation_bonus = 0.2
+        # 奖励尺度（更均衡，避免只靠终极奖励）
+        self.incremental_scale = 24.0
+        self.ultimate_base_reward = 20.0
+        self.ultimate_quality_scale = 30.0
+        self.ultimate_efficiency_scale = 0.3
         
         # 【性能优化】原始文件汇编缓存（原始文件不变，可复用）
         # 缓存键: (original_binary, function_name, ori_sym_addr)
@@ -457,7 +462,9 @@ class BinaryPerturbationEnv:
             r2_ext.close()
             
             if acfg_data:
-                self.current_critical_blocks = acfg_data.get('top_critical_blocks', [])[:3]
+                top_blocks = acfg_data.get('top_critical_blocks', [])[:3]
+                # 重要性筛选后按地址排序，保证特征与动作位点稳定对齐
+                self.current_critical_blocks = sorted(top_blocks)
                 self.current_all_blocks = list(acfg_data.get('basic_blocks', {}).keys())
                 acfg_vec = self._vectorize_acfg(acfg_data)
                 
@@ -509,7 +516,9 @@ class BinaryPerturbationEnv:
         n_edges = data.get('num_edges', 0)
         complexity = data.get('cyclomatic_complexity', 0)
         bbs = list(data.get('basic_blocks', {}).values())
-        top_critical_addrs = data.get('top_critical_blocks', [])
+        top_critical_addrs = data.get('top_critical_blocks', [])[:3]
+        # 为了稳定性：Top-K 先按“重要性”筛选，再按地址排序，避免特征抖动
+        stable_top_addrs = sorted(top_critical_addrs)
         fingerprints = data.get('fingerprints', {})
         
         # === 【核心修正1】计算“有效指令总数” (Effective Total) ===
@@ -594,7 +603,7 @@ class BinaryPerturbationEnv:
         effective_keys = ['n_arith', 'n_logic', 'n_branch', 'n_cmp', 'n_xor', 'n_shift', 'n_consts']
         
         # 遍历 Top-3 关键块 (如果不足3个，循环会自动结束)
-        for addr in top_critical_addrs[:3]:
+        for addr in stable_top_addrs:
             if addr not in data.get('basic_blocks', {}): continue
             bb = data['basic_blocks'][addr]
             
@@ -714,9 +723,49 @@ class BinaryPerturbationEnv:
         
         api_cats = ['io', 'mem', 'str', 'sys', 'net', 'crypto', 'error', 'other', 'internal']
         apis = fingerprints.get('api_types', set())
+        # 9 dims: API 类别 flags
         for cat in api_cats:
             vec.append(1.0 if cat in apis else 0.0)
-            vec.append(0.0) 
+        # 9 dims: 原本恒定 0 -> 替换为真实统计
+        n_ops_imm = fingerprints.get('n_ops_imm', 0)
+        n_ops_reg = fingerprints.get('n_ops_reg', 0)
+        n_ops_mem = fingerprints.get('n_ops_mem', 0)
+        total_ops = max(n_ops_imm + n_ops_reg + n_ops_mem, 1.0)
+        op_imm_ratio = n_ops_imm / total_ops
+        op_reg_ratio = n_ops_reg / total_ops
+        op_mem_ratio = n_ops_mem / total_ops
+
+        consts = fingerprints.get('consts', [])
+        if consts:
+            abs_consts = [abs(v) for v in consts]
+            log_abs = [np.log1p(v) for v in abs_consts]
+            mean_abs_log = float(np.mean(log_abs))
+            max_abs_log = float(np.max(log_abs))
+            pos_cnt = sum(1 for v in consts if v > 0)
+            neg_cnt = sum(1 for v in consts if v < 0)
+            const_pos_ratio = pos_cnt / (neg_cnt + 1.0)
+            const_unique_ratio = len(set(consts)) / (len(consts) + 1.0)
+            const_small_ratio = sum(1 for v in abs_consts if v <= 255) / (len(consts) + 1.0)
+            n_consts_log = float(np.log1p(len(consts)))
+        else:
+            mean_abs_log = 0.0
+            max_abs_log = 0.0
+            const_pos_ratio = 0.0
+            const_unique_ratio = 0.0
+            const_small_ratio = 0.0
+            n_consts_log = 0.0
+
+        vec.extend([
+            op_imm_ratio,
+            op_reg_ratio,
+            op_mem_ratio,
+            n_consts_log,
+            mean_abs_log,
+            max_abs_log,
+            const_pos_ratio,
+            const_unique_ratio,
+            const_small_ratio,
+        ])
             
         # 3. Block Size Dist (5 dims) - 基于 Effective Size
         sizes = [sum(b.get(k, 0) for k in effective_keys) for b in bbs]
@@ -1043,8 +1092,7 @@ class BinaryPerturbationEnv:
        
         if diff > 0:  # 进步
             # 固定权重：简化奖励，避免分段重复放大
-            scale = 16.0
-            incremental = diff * scale
+            incremental = diff * self.incremental_scale
             # 额外降幅奖励：按“相对降幅”给 bonus，保证降得越多奖励越多
             rel_drop = diff / max(prev_score, 1e-6)
             drop_bonus = min(self.drop_bonus_cap, rel_drop * self.drop_bonus_scale)
@@ -1053,7 +1101,7 @@ class BinaryPerturbationEnv:
         
         elif diff <= 0:  # 退步
             # 对称处理，避免过度惩罚导致探索受限
-            incremental = diff * 16.0 
+            incremental = diff * self.incremental_scale
 
         # 关键决策：难度已经用于“采样更频繁”，这里不再二次放大奖励，
         # 避免对“难样本”重复加成导致训练不稳定。
@@ -1062,9 +1110,9 @@ class BinaryPerturbationEnv:
         # === 2. 终极成功奖励 ===
         if current_score < self.target_score:
             # 基础 10 + 质量加成 + 效率加成
-            base_reward = 30.0
-            quality_bonus = (self.target_score - current_score) * 50
-            efficiency_bonus = max(0, (self.max_steps - step_count) * 0.5)      # max_step - step_count
+            base_reward = self.ultimate_base_reward
+            quality_bonus = (self.target_score - current_score) * self.ultimate_quality_scale
+            efficiency_bonus = max(0, (self.max_steps - step_count) * self.ultimate_efficiency_scale)      # max_step - step_count
             
             ultimate = base_reward + quality_bonus + efficiency_bonus
 
@@ -1194,6 +1242,23 @@ class BinaryPerturbationEnv:
         # 提取初始特征
         state = self.extract_features(self.original_binary)
         return state
+
+    def get_loc_mask(self, n_locs=3):
+        """
+        返回位置掩码（长度为 n_locs）。
+        1 表示该位置可用（有对应关键块），0 表示不可用。
+        若当前关键块为空，返回全 1（不做硬屏蔽，避免全零导致无法采样）。
+        """
+        try:
+            n_locs = int(n_locs)
+        except Exception:
+            n_locs = 3
+        if n_locs <= 0:
+            return []
+        if not self.current_critical_blocks:
+            return [1] * n_locs
+        valid = min(len(self.current_critical_blocks), n_locs)
+        return [1] * valid + [0] * (n_locs - valid)
     
     def clear_acfg_cache(self):
         """

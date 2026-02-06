@@ -201,6 +201,8 @@ def train_ppo(args):
         jtrans_model_dir=args.jtrans_model_dir,
         jtrans_tokenizer_dir=args.jtrans_tokenizer_dir,
         jtrans_use_gpu=args.jtrans_use_gpu,
+        feature_mode=args.feature_mode,
+        seed=args.seed,
         stall_limit=args.stall_limit,
         progress_eps=args.progress_eps,
         hold_min=args.hold_min,
@@ -208,9 +210,9 @@ def train_ppo(args):
     )
     env.set_state_dim(args.state_dim)
     if args.detection_method == "safe":
-        safe_target_start = 0.9
-        safe_target_end = 0.6
-        safe_target_decay_episodes = 1200
+        safe_target_start = 0.85
+        safe_target_end = 0.4
+        safe_target_decay_episodes = 800
         env.target_score = safe_target_start
         env.no_change_penalty = 0.05
         logger.success(
@@ -290,16 +292,35 @@ def train_ppo(args):
         for episode in range(start_episode, args.episodes):
             logger.info("=" * 60)
             logger.info(f"回合 {episode + 1}/{args.episodes}")
+            # 训练动态：基于最近成功率调整目标分数（避免单纯线性下降）
+            recent_success_rate = np.mean(success_window) if success_window else 0.0
             if args.detection_method == "safe":
                 progress = min(1.0, episode / max(1, safe_target_decay_episodes))
-                env.target_score = safe_target_start + (safe_target_end - safe_target_start) * progress
+                linear_target = safe_target_start + (safe_target_end - safe_target_start) * progress
+                safe_success_gate = 0.55
+                step = abs(safe_target_start - safe_target_end) / max(1, safe_target_decay_episodes)
+                if recent_success_rate >= safe_success_gate:
+                    env.target_score = max(linear_target, env.target_score - step)
+                # 否则保持当前 target_score，不继续降低
+                env.target_score = max(safe_target_end, min(safe_target_start, env.target_score))
                 if episode % 10 == 0:
-                    logger.success(f"[SAFE train] target_score={env.target_score:.4f} (ep={episode})")
+                    logger.success(
+                        f"[SAFE train] target_score={env.target_score:.4f} (ep={episode}) "
+                        f"sr={recent_success_rate:.2f} gate={safe_success_gate:.2f}"
+                    )
             elif args.detection_method == "jtrans":
                 progress = min(1.0, episode / max(1, jtrans_target_decay_episodes))
-                env.target_score = jtrans_target_start + (jtrans_target_end - jtrans_target_start) * progress
+                linear_target = jtrans_target_start + (jtrans_target_end - jtrans_target_start) * progress
+                jtrans_success_gate = 0.60
+                step = abs(jtrans_target_start - jtrans_target_end) / max(1, jtrans_target_decay_episodes)
+                if recent_success_rate >= jtrans_success_gate:
+                    env.target_score = max(linear_target, env.target_score - step)
+                env.target_score = max(jtrans_target_end, min(jtrans_target_start, env.target_score))
                 if episode % 10 == 0:
-                    logger.success(f"[JTRANS train] target_score={env.target_score:.4f} (ep={episode})")
+                    logger.success(
+                        f"[JTRANS train] target_score={env.target_score:.4f} (ep={episode}) "
+                        f"sr={recent_success_rate:.2f} gate={jtrans_success_gate:.2f}"
+                    )
             
             state = env.reset()
             
@@ -316,7 +337,10 @@ def train_ppo(args):
             for step in range(args.max_steps):
                 global_total_steps += 1 
 
-                joint_idx, loc_idx, act_idx, actual_action, log_prob, value = agent.select_action(state, explore=True)
+                loc_mask = env.get_loc_mask(args.n_locs)
+                joint_idx, loc_idx, act_idx, actual_action, log_prob, value = agent.select_action(
+                    state, explore=True, loc_mask=loc_mask
+                )
                 episode_actions.append(actual_action)
                 prev_state = state
                 
@@ -351,7 +375,7 @@ def train_ppo(args):
                     stat['success'] += 1
 
                 # 存储经验
-                agent.store_transition(prev_state, joint_idx, reward, log_prob, value, done)
+                agent.store_transition(prev_state, joint_idx, reward, log_prob, value, done, loc_mask=loc_mask)
  
                 if 'binary' in info:
                     last_binary_info = {
@@ -539,6 +563,12 @@ if __name__ == "__main__":
     parser.add_argument('--jtrans-model-dir', default=None)
     parser.add_argument('--jtrans-tokenizer-dir', default=None)
     parser.add_argument('--jtrans-use-gpu', action='store_true')
+    parser.add_argument(
+        '--feature-mode',
+        choices=['full', 'no_progress', 'no_api', 'no_progress_api', 'no_section_c'],
+        default='full'
+    )
+    parser.add_argument('--seed', type=int, default=None)
     
     args = parser.parse_args()
 

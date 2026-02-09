@@ -120,16 +120,18 @@ class bb_branchfunc_diversify(ailVisitor):
                 self.update_process()
                 # 如果指定了 target_addr，找到后立即返回
                 if target_addr:
-                    return
+                    return True
         if not do_branch:
             if target_addr:
                 print '[bb_branchfunc_diversify.py:branch_func] Warning: target_addr %s not found' % target_addr
             else:
-                #print 'no valid function is selected'
-                raise Exception('no valid function is selected')
+                # 连续变异时这属于正常情况：当前轮没有可改写的直接跳转。
+                print '[bb_branchfunc_diversify.py:branch_func] Warning: no valid function is selected, skip this round'
+            return False
+        return True
 
     def bb_div_branch(self, target_addr=None):
-        self.branch_func(target_addr)
+        return self.branch_func(target_addr)
 
     def get_branch_routine(self, iloc):
         """
@@ -150,16 +152,20 @@ class bb_branchfunc_diversify(ailVisitor):
         return res
 
     def attach_branch_routine(self):
+        if not self.instrs:
+            print '[bb_branchfunc_diversify.py:attach_branch_routine] Warning: empty instrs, skip'
+            return
         loc = get_loc(self.instrs[-1])
         routine_instrs = self.get_branch_routine(loc)
         self.instrs.extend(routine_instrs)
 
     def bb_div_process(self, target_addr=None):
-        self.bb_div_branch(target_addr)
-        self.attach_branch_routine()
+        changed = self.bb_div_branch(target_addr)
+        if changed:
+            self.attach_branch_routine()
 
     def visit(self, instrs, target_addr = None):
         print 'start bb branch function'
         self.instrs = copy.deepcopy(instrs)
-        self.bb_div_process()
+        self.bb_div_process(target_addr)
         return self.instrs

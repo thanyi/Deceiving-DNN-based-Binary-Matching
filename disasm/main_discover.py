@@ -4,6 +4,7 @@ Discover main function address
 """
 
 import os
+import re
 import config
 from utils.ail_utils import ELF_utils
 import logging
@@ -98,6 +99,35 @@ def main_discover(filename):
                         main_symbol = '0'
                     logger.debug("[main_discover.py:main_discover]: main_symbol = {}".format(main_symbol))
                     break
+
+        # If symbols are heavily rewritten, infer main from startup sequence in first function.
+        if not main_symbol:
+            label_pat = re.compile(r'^[0-9A-Fa-f]+\s+<[^>]+>:$')
+            m64_pat = re.compile(r'\bmov[a-z]*\s+\$0x([0-9A-Fa-f]+),%rdi\b')
+            m32_pat = re.compile(r'\bpush[l]?\s+\$0x([0-9A-Fa-f]+)\b')
+            first_func_begin = -1
+            first_func_end = ll
+            for i in xrange(ll):
+                if label_pat.match(lines[i].strip()):
+                    if first_func_begin < 0:
+                        first_func_begin = i
+                    else:
+                        first_func_end = i
+                        break
+            if first_func_begin >= 0:
+                for i in xrange(first_func_begin, first_func_end):
+                    m64 = m64_pat.search(lines[i])
+                    if m64:
+                        main_symbol = m64.group(1).lstrip('0').upper()
+                        if not main_symbol:
+                            main_symbol = '0'
+                        break
+                    m32 = m32_pat.search(lines[i])
+                    if m32:
+                        main_symbol = m32.group(1).lstrip('0').upper()
+                        if not main_symbol:
+                            main_symbol = '0'
+                        break
         
         # 如果仍然找不到，尝试从args.folder下的unstriped.out中查找
         if not main_symbol:
@@ -122,6 +152,10 @@ def main_discover(filename):
                         pass
                     if os.path.isfile(unstriped_path + '.temp'):
                         os.remove(unstriped_path + '.temp')
+
+        if not main_symbol:
+            logger.warning("[main_discover.py:main_discover]: cannot resolve main symbol, fallback to 0")
+            main_symbol = '0'
         
         if config.arch != config.ARCH_X86 and config.arch != config.ARCH_ARMT:
             raise Exception('Unknown arch')

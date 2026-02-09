@@ -88,7 +88,17 @@ class instr_garbage_diversify(ailVisitor):
         # 未指定 target_addr，在每个函数的随机基本块中插入垃圾代码
         for f in self.fb_tbl.keys():
             # select block to insert garbage
-            b = random.choice(self.fb_tbl[f])
+            candidates = []
+            for b in self.fb_tbl[f]:
+                try:
+                    bil = self.bb_instrs(b)
+                except Exception:
+                    continue
+                if len(bil) > 0:
+                    candidates.append(b)
+            if not candidates:
+                continue
+            b = random.choice(candidates)
             bil = self.bb_instrs(b)
             loc = get_loc(random.choice(bil))
             self._insert_garbage(loc, mode=random.randint(1, 2))

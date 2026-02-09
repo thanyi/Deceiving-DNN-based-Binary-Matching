@@ -32,6 +32,7 @@ def reassemble(saveerr=False, libs=[], debug=False):
     # extra_options = ' -fno-asynchronous-unwind-tables -fno-pic -lgcc_s'
     # command_str = config.compiler + ' final.s ' + ('-g ' if debug else '') + ('-mthumb' if ELF_utils.elf_arm() else (' -Wa,-mindex-reg' + (' -m32' if ELF_utils.elf_32() else ''))) + ' ' + config.gccoptions + extra_options + ' ' + ' '.join(libs)+ (' 2> final.error' if saveerr else '')
     logger.info("[compile_process.py:reassemble]: command_str = {}".format(command_str))
+    print "[compile_process.py:reassemble]: command_str = {}".format(command_str)
     return os.system(command_str)
 
 
@@ -197,7 +198,12 @@ def main(filepath='', libs=[], debug=False):
     if ELF_utils.elf_arm():
         i = 0
         while not modifyARM() and i < 10: i += 1
+    # 尝试重组装并修复未定义符号，最多两轮
     reassemble(True, libs, debug)
-    errors = parse_error()
-    logger.debug("[compile_process.py:main]: errors in main = {}".format(errors))
-    modify(errors)
+    for _ in range(2):
+        errors = parse_error()
+        logger.debug("[compile_process.py:main]: errors in main = {}".format(errors))
+        if not errors:
+            break
+        modify(errors)
+        reassemble(True, libs, debug)

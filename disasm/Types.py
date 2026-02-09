@@ -221,7 +221,7 @@ if config.arch == config.ARCH_X86:
                       'VZEROUPPER', 'VXORPS', 'VANDPS', 'BTC'
     ], True)
     RolOp = RecSet(['ROL', 'SHL', 'SHR', 'SHLD', 'SHRD', 'SHRL', 'ROR', 'RORL',
-                    'SAL', 'SAR', 'SHLL', 'ROLL', 'SHRB', 'SHLB', 'SARL', 'ROLW', 'SHLW',
+                    'SAL', 'SAR', 'SARQ', 'SHLL', 'ROLL', 'SHRB', 'SHLB', 'SARL', 'ROLW', 'SHLW',
                     'SARW', 'SHRW', 'SHLQ', 'SHRQ', 'PSHUFD', 'SHUFPS', 'SHUFPD',
                     'PSLLW', 'PSLLD', 'PSLLQ', 'PSRAW', 'PSRAD', 'PSLLDQ', 'PSRLDQ',
                     'PSRLD', 'PSHUFLW', 'SHRD', 'VPSLLD', 'VPSRLD', 'VPSLLDQ', 'VPSRLDQ',
@@ -398,4 +398,3 @@ class AssistOpClass(str, Exp):
         super(AssistOpClass, self).__init__(op)
 
 class UnOP(RegClass, Ptr): pass       # (%ebx), [r1]
-

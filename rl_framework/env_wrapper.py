@@ -58,6 +58,9 @@ class BinaryPerturbationEnv:
         hold_max=None,
         stall_limit=6,
         progress_eps=1e-4,
+        progress_reward_eps=1e-3,
+        include_schedule_feature=False,
+        strict_invalid_loc=True,
     ):
         """
         参数:
@@ -93,6 +96,9 @@ class BinaryPerturbationEnv:
         self.hold_min = max(1, min(self.hold_min, self.hold_max))
         self.stall_limit = int(stall_limit)
         self.progress_eps = float(progress_eps)
+        self.progress_reward_eps = float(progress_reward_eps)
+        self.include_schedule_feature = bool(include_schedule_feature)
+        self.strict_invalid_loc = bool(strict_invalid_loc)
         self.current_hold_limit = self.hold_max
         self.episodes_on_current = 0
         self.current_sample_data = None # 存储当前样本的元数据
@@ -131,13 +137,13 @@ class BinaryPerturbationEnv:
         self.target_score = 0.40
         self.state_dim = 256  # 默认状态维度（256维），可以通过参数修改
         # 动作空间（必须与 PPOAgent 的 action_map 保持一致）
-        # All available actions (keep 11 for future use).
-        self.all_action_ids = [1, 2, 4, 7, 8, 9, 11]
-        # Enable full 7-action space (including 11).
-        self.action_ids = [1, 2, 4, 7, 8, 9, 11]
+        # 已接入新动作: 13/14/15/16
+        self.all_action_ids = [1, 2, 4, 7, 8, 9, 11, 13, 14, 15, 16]
+        self.action_ids = list(self.all_action_ids)
         self.action_id_to_index = {aid: idx for idx, aid in enumerate(self.action_ids)}
-        # Fixed histogram space: keep 7 bins to match the 16-dim history layout.
-        self.hist_action_ids = list(self.all_action_ids)
+        # 固定历史特征维度：保持 7 bins，避免改变 16 维历史特征布局（影响已实现网络切片）。
+        # 新动作 13/14/15/16 会参与策略决策与执行，但不进入历史直方图统计。
+        self.hist_action_ids = [1, 2, 4, 7, 8, 9, 11]
         self.hist_action_id_to_index = {aid: idx for idx, aid in enumerate(self.hist_action_ids)}
         self.hist_action_dim = len(self.hist_action_ids)
         self.n_actions = len(self.action_ids)
@@ -312,12 +318,16 @@ class BinaryPerturbationEnv:
         features.extend(self._action_histogram_features())
         
         # 3. Progress (2 dims)
-        features.append(self.step_count / 50.0)
-        features.append(1.0 if self.step_count > 25 else 0.0)
+        step_ratio = self.step_count / max(float(self.max_steps), 1.0)
+        features.append(step_ratio)
+        features.append(1.0 if step_ratio > 0.5 else 0.0)
         
         # 4. Global State (2 dims)
         features.append(1.0 if len(self.mutation_history) > 0 else 0.0) # Is Modified
-        features.append(self.episodes_on_current / 20.0) # Dataset progress
+        if self.include_schedule_feature:
+            features.append(self.episodes_on_current / max(float(self.current_hold_limit), 1.0))
+        else:
+            features.append(0.0)
 
         # ==========================================
         # Part 2: 基于 Radare2 的 ACFG 特征 (核心)
@@ -377,7 +387,7 @@ class BinaryPerturbationEnv:
     def _action_histogram_features(self):
         """
         将历史动作(action_id)映射到稳定的索引空间(action_index)，避免把 action_id 当索引导致统计失真。
-        返回长度为 7 的归一化直方图（包含暂时禁用的 action 11，占位为 0）。
+        返回长度为 7 的归一化直方图（固定布局，保证历史特征总维度不变）。
         """
         counts = np.zeros(self.hist_action_dim, dtype=np.float32)
         total = max(len(self.mutation_history), 1)
@@ -437,12 +447,16 @@ class BinaryPerturbationEnv:
         features.extend(self._action_histogram_features())
         
         # 3. Progress (2 dims)
-        features.append(self.step_count / 50.0)
-        features.append(1.0 if self.step_count > 25 else 0.0)
+        step_ratio = self.step_count / max(float(self.max_steps), 1.0)
+        features.append(step_ratio)
+        features.append(1.0 if step_ratio > 0.5 else 0.0)
         
         # 4. Global State (2 dims)
         features.append(1.0 if len(self.mutation_history) > 0 else 0.0) # Is Modified
-        features.append(self.episodes_on_current / 20.0) # Dataset progress
+        if self.include_schedule_feature:
+            features.append(self.episodes_on_current / max(float(self.current_hold_limit), 1.0))
+        else:
+            features.append(0.0)
 
         # ==========================================
         # Part 2: 基于 Radare2 的 ACFG 特征 (核心)
@@ -798,7 +812,7 @@ class BinaryPerturbationEnv:
         
         参数:
             seed_binary: 种子二进制文件路径
-            action: 变异模式 (1,2,4,7,8,9,11)
+            action: 变异模式 (1,2,4,7,8,9,11,13,14,15,16)
             target_addr: 攻击位置地址
         返回:
             mutated_binary: 变异后的二进制文件路径
@@ -959,32 +973,48 @@ class BinaryPerturbationEnv:
         target_addr = None
 
         # 位置选择：
-        # - loc_idx 在 Top-N 范围内：直接用关键块
-        # - 随机非Top块逻辑已暂时禁用（后续可恢复）
+        # - 有关键块时，loc_idx 必须命中 Top-N
+        # - 无关键块时，退回任意块避免环境僵死
         loc_valid = False
-        if self.current_critical_blocks and loc_idx < len(self.current_critical_blocks):
-            target_addr = self.current_critical_blocks[loc_idx]
-            loc_valid = True
-        else:
-            # --- Random NonTop (disabled) ---
-            candidate_blocks = []
-            if self.current_all_blocks:
-                exclude = set(self.current_critical_blocks)
-                candidate_blocks = [addr for addr in self.current_all_blocks if addr not in exclude]
-            
-            if candidate_blocks:
-                target_addr = random.choice(candidate_blocks)
+        if self.current_critical_blocks:
+            if 0 <= loc_idx < len(self.current_critical_blocks):
+                target_addr = self.current_critical_blocks[loc_idx]
                 loc_valid = True
-            elif self.current_all_blocks:
-                # 如果没有非Top块，退回随机任意块（避免完全无效）
+            elif not self.strict_invalid_loc and self.current_all_blocks:
+                # 可选兼容模式：无效 loc_idx 时随机兜底
+                target_addr = random.choice(self.current_all_blocks)
+                loc_valid = True
+        else:
+            if self.current_all_blocks:
                 target_addr = random.choice(self.current_all_blocks)
                 loc_valid = True
 
-            # 这种情况可能发生于：函数太小没有关键块，或特征提取失败
+        if not loc_valid and self.current_critical_blocks and self.strict_invalid_loc:
+            # 严格模式：位置越界直接惩罚并返回，不再用随机兜底掩盖错误动作。
             logger.debug(
-                f"No target block selected; loc_idx={loc_idx}, "
-                f"top_blocks={len(self.current_critical_blocks) if self.current_critical_blocks else 0}."
+                f"Invalid loc_idx={loc_idx} for top_blocks={len(self.current_critical_blocks)}; strict penalty."
             )
+            state = self.extract_features(self.current_binary)
+            reward = self.compute_reward_v2(
+                prev_score,
+                prev_score,
+                self.step_count,
+                invalid_loc=True,
+                no_change=True,
+            )
+            done = self.step_count >= self.max_steps
+            info = {
+                'score': prev_score,
+                'grad': 0.0,
+                'step': self.step_count,
+                'binary': self.current_binary,
+                'target_func': self.function_name,
+                'loc_valid': False,
+                'no_change': True,
+                'score_delta': 0.0,
+                'error': 'invalid_loc',
+            }
+            return state, reward, done, info
 
         # 应用变异
         mutated_binary, hash_val = self.apply_mutation(self.current_binary, action, target_addr)
@@ -1022,7 +1052,7 @@ class BinaryPerturbationEnv:
         
         # 计算奖励
         score_delta = prev_score - score
-        no_change = (score_delta <= 0.0) and (abs(score_delta) < self.no_change_eps)
+        no_change = abs(score_delta) <= self.no_change_eps
         reward = self.compute_reward_v2(
             prev_score,
             score,
@@ -1090,7 +1120,7 @@ class BinaryPerturbationEnv:
         # === 1. 基础进步奖励 ===
         diff = prev_score - current_score
        
-        if diff > 0:  # 进步
+        if diff > self.progress_reward_eps:  # 显著进步
             # 固定权重：简化奖励，避免分段重复放大
             incremental = diff * self.incremental_scale
             # 额外降幅奖励：按“相对降幅”给 bonus，保证降得越多奖励越多
@@ -1098,10 +1128,13 @@ class BinaryPerturbationEnv:
             drop_bonus = min(self.drop_bonus_cap, rel_drop * self.drop_bonus_scale)
             total_reward += drop_bonus
             total_reward += self.effective_mutation_bonus
-        
-        elif diff <= 0:  # 退步
+        elif diff < -self.progress_reward_eps:  # 显著退步
             # 对称处理，避免过度惩罚导致探索受限
             incremental = diff * self.incremental_scale
+        else:
+            # 变化幅度在噪声带内，当作无进展处理，避免学到“抖动投机”。
+            incremental = 0.0
+            no_change = True
 
         # 关键决策：难度已经用于“采样更频繁”，这里不再二次放大奖励，
         # 避免对“难样本”重复加成导致训练不稳定。

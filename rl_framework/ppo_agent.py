@@ -146,10 +146,8 @@ class PPOAgent:
         self.epsilon = epsilon
         self.epochs = epochs
         
-        # 动作映射：索引 -> 实际变异模式（保留原有选择顺序）
-        all_action_map = [1, 2, 4, 7, 8, 9, 11]
-        # 暂时禁用 11，保留以便后续启用
-        default_action_map = [1, 2, 4, 7, 8, 9, 11]
+        # 动作映射：索引 -> 实际变异模式（与 env_wrapper 保持一致）
+        default_action_map = [1, 2, 4, 7, 8, 9, 11, 13, 14, 15, 16]
         if action_map is None:
             action_map = list(default_action_map)
 
@@ -509,17 +507,40 @@ class PPOAgent:
             return
         
         checkpoint = torch.load(path, map_location=self.device)
+
+        # 加载网络权重（兼容动作空间变更导致的 head 尺寸不一致）
+        ckpt_state = checkpoint.get('policy_state_dict', {})
+        model_state = self.policy.state_dict()
+        compatible = {}
+        skipped = []
+        for k, v in ckpt_state.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                compatible[k] = v
+            else:
+                skipped.append(k)
+
+        model_state.update(compatible)
+        self.policy.load_state_dict(model_state, strict=False)
+        if skipped:
+            logger.warning(
+                f"⚠️ 检测到结构不兼容参数，已跳过加载 {len(skipped)} 项（常见于动作数变化）"
+            )
         
-        # 加载网络权重
-        self.policy.load_state_dict(checkpoint['policy_state_dict'])
-        
-        # 加载优化器状态（可选）
+        # 加载优化器状态（可选，结构变化时可能失败）
         if 'optimizer_state_dict' in checkpoint:
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception as e:
+                logger.warning(f"⚠️ 优化器状态不兼容，跳过加载: {e}")
         
         # 加载统计信息（可选）
         if 'action_stats' in checkpoint:
-            self.action_stats = checkpoint['action_stats']
+            try:
+                stats = checkpoint['action_stats']
+                if isinstance(stats, np.ndarray) and stats.shape == self.action_stats.shape:
+                    self.action_stats = stats
+            except Exception:
+                pass
         
 
 if __name__ == "__main__":

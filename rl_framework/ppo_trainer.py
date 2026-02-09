@@ -205,14 +205,17 @@ def train_ppo(args):
         seed=args.seed,
         stall_limit=args.stall_limit,
         progress_eps=args.progress_eps,
+        progress_reward_eps=args.progress_reward_eps,
+        include_schedule_feature=args.include_schedule_feature,
+        strict_invalid_loc=(not args.non_strict_invalid_loc),
         hold_min=args.hold_min,
         hold_max=args.hold_max,
     )
     env.set_state_dim(args.state_dim)
     if args.detection_method == "safe":
-        safe_target_start = 0.85
+        safe_target_start = 0.9
         safe_target_end = 0.4
-        safe_target_decay_episodes = 800
+        safe_target_decay_episodes = 1200
         env.target_score = safe_target_start
         env.no_change_penalty = 0.05
         logger.success(
@@ -220,8 +223,8 @@ def train_ppo(args):
             f"no_change_penalty={env.no_change_penalty}"
         )
     elif args.detection_method == "jtrans":
-        jtrans_target_start = 0.92
-        jtrans_target_end = 0.6
+        jtrans_target_start = 0.9
+        jtrans_target_end = 0.4
         jtrans_target_decay_episodes = 1200
         env.target_score = jtrans_target_start
         logger.success(
@@ -230,6 +233,8 @@ def train_ppo(args):
 
     agent = PPOAgent(
         state_dim=args.state_dim,
+        n_actions=env.n_actions,
+        action_map=list(env.action_ids),
         lr=args.lr,
         gamma=args.gamma,
         epsilon=args.epsilon,
@@ -311,7 +316,7 @@ def train_ppo(args):
             elif args.detection_method == "jtrans":
                 progress = min(1.0, episode / max(1, jtrans_target_decay_episodes))
                 linear_target = jtrans_target_start + (jtrans_target_end - jtrans_target_start) * progress
-                jtrans_success_gate = 0.60
+                jtrans_success_gate = 0.55
                 step = abs(jtrans_target_start - jtrans_target_end) / max(1, jtrans_target_decay_episodes)
                 if recent_success_rate >= jtrans_success_gate:
                     env.target_score = max(linear_target, env.target_score - step)
@@ -539,18 +544,21 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', required=True)
     parser.add_argument('--save-path', required=True)
     parser.add_argument('--state-dim', type=int, default=256) # 默认256维
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--gamma', type=float, default=0.98)
-    parser.add_argument('--epsilon', type=float, default=0.2)
+    parser.add_argument('--lr', type=float, default=5e-5)
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--epsilon', type=float, default=0.15)
     parser.add_argument('--n-locs', type=int, default=3)
     parser.add_argument('--episodes', type=int, default=6000)
-    parser.add_argument('--max-steps', type=int, default=30)
+    parser.add_argument('--max-steps', type=int, default=40)
     parser.add_argument('--save-interval', type=int, default=50)
-    parser.add_argument('--sample-hold-interval', type=int, default=10)
-    parser.add_argument('--stall-limit', type=int, default=3)
-    parser.add_argument('--progress-eps', type=float, default=1e-4)
-    parser.add_argument('--hold-min', type=int, default=None)
-    parser.add_argument('--hold-max', type=int, default=None)
+    parser.add_argument('--sample-hold-interval', type=int, default=15)
+    parser.add_argument('--stall-limit', type=int, default=8)
+    parser.add_argument('--progress-eps', type=float, default=5e-4)
+    parser.add_argument('--progress-reward-eps', type=float, default=2e-3)
+    parser.add_argument('--include-schedule-feature', action='store_true')
+    parser.add_argument('--non-strict-invalid-loc', action='store_true')
+    parser.add_argument('--hold-min', type=int, default=2)
+    parser.add_argument('--hold-max', type=int, default=6)
     parser.add_argument('--model-dir', default='./rl_models')
     parser.add_argument('--resume', default=None)
     parser.add_argument('--use-gpu', action='store_true')

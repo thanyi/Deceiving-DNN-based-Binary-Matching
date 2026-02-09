@@ -129,8 +129,8 @@ class bb_merge_diversify(ailVisitor):
                         print '[bb_merge_diversify.py:bb_div_merge] Found target_addr: %s (matched with 0x%X) in pair (%s, %s)' % (target_addr, b.bblock_begin_loc.loc_addr, s, d)
                     else:
                         print '[bb_merge_diversify.py:bb_div_merge] Found target_addr: %s inside block (begin=0x%X) in pair (%s, %s)' % (target_addr, b.bblock_begin_loc.loc_addr, s, d)
-                        self.merge_bb(pair)
-                        return
+                    self.merge_bb(pair)
+                    return
             print '[bb_merge_diversify.py:bb_div_merge] Warning: target_addr %s not found in mergeable pairs' % target_addr
             return
         

@@ -35,6 +35,30 @@ class instr_replace_diversify(ailVisitor):
             return None
 
     @staticmethod
+    def _reg_bits(e):
+        reg = p_exp(e)
+        if not reg:
+            return None
+        if reg.startswith('%'):
+            reg = reg[1:]
+        reg = reg.lower()
+        if reg in {'al', 'bl', 'cl', 'dl', 'ah', 'bh', 'ch', 'dh', 'spl', 'bpl', 'sil', 'dil'}:
+            return 8
+        if reg in {'ax', 'bx', 'cx', 'dx', 'sp', 'bp', 'si', 'di'}:
+            return 16
+        if reg in {'eax', 'ebx', 'ecx', 'edx', 'esp', 'ebp', 'esi', 'edi'}:
+            return 32
+        if reg.startswith('r'):
+            if reg.endswith('b'):
+                return 8
+            if reg.endswith('w'):
+                return 16
+            if reg.endswith('d'):
+                return 32
+            return 64
+        return None
+
+    @staticmethod
     def is_xor_reg(op, e1, e2):
         op_s = p_op(op)
         if (ELF_utils.elf_64() and op_s == 'xorq') or (ELF_utils.elf_32() and (op_s == 'xor' or op_s == 'xorl')):
@@ -128,13 +152,16 @@ class instr_replace_diversify(ailVisitor):
         if isinstance(i, TripleInstr) and self.is_shl_reg(get_op(i), i[1], i[2]):
             op, e1, e2, l = get_op(i), i[1], i[2], get_loc(i)
             if isinstance(e2, Normal):
+                op_bits = self.bits_of_operation(op)
+                reg_bits = self._reg_bits(e1)
+                if op_bits in (8, 16) or reg_bits in (8, 16) or reg_bits is None:
+                    return False
                 v = 2 ** e2
+                if v > 0x7fffffff:
+                    return False
                 #if random.random() < obfs_proportion:
-                if True: 
-                    if v == 2 and Exp_utils.is_reg(e1):
-                        new_i = TripleInstr((self._ops['add'], e1, e1, l, None))
-                    else:
-                        new_i = FourInstr((self._ops['imul'], e1, e1, Normal(v), l, None))
+                if True:
+                    new_i = FourInstr((self._ops['imul'], e1, e1, Normal(v), l, None))
                     self.replace_instrs(new_i, l, i)
                 return True
         return False

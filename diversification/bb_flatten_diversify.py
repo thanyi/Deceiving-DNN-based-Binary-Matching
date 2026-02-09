@@ -142,17 +142,30 @@ class bb_flatten_diversify(ailVisitor):
 
     def insert_switch_routine(self):
         bb_starts = []
+        if not self.instrs:
+            print '[bb_flatten_diversify.py:insert_switch_routine] Warning: empty instrs, skip switch routine'
+            return
         for i in range(len(self.instrs)):
             if get_op(self.instrs[i]) in ControlOp and 'ret' in p_op(self.instrs[i]):
                 # Note: do not use 'jmp', because it may result in collision with bb_branchfunc_diversify
-                bb_starts.append(i + 1)
-        selected_idx = random.randint(0, len(bb_starts) - 1)
-        selected_i = self.instrs[bb_starts[selected_idx]]
-        # the location of switch routines should be carefully selected
-        selected_loc = get_loc(selected_i)
+                if i + 1 < len(self.instrs):
+                    bb_starts.append(i + 1)
+        if bb_starts:
+            selected_i = self.instrs[random.choice(bb_starts)]
+            # the location of switch routines should be carefully selected
+            selected_loc = get_loc(selected_i)
+            routine = self.get_switch_routine(selected_loc)
+            for ins in routine:
+                self.insert_instrs(ins, selected_loc)
+            self.update_process()
+            return
+
+        # fallback: no ret found, append routine at end
+        print '[bb_flatten_diversify.py:insert_switch_routine] Warning: no ret found, append routine at end'
+        selected_loc = get_loc(self.instrs[-1])
         routine = self.get_switch_routine(selected_loc)
         for ins in routine:
-            self.insert_instrs(ins, selected_loc)
+            self.append_instrs(ins, selected_loc)
         self.update_process()
 
     def visit(self, instrs, target_addr = None):

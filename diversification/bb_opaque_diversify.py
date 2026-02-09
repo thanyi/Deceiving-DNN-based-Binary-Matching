@@ -273,7 +273,14 @@ class bb_opaque_diversify(ailVisitor):
             if get_op(self.instrs[i]) in ControlOp and 'ret' in p_op(self.instrs[i]):
                 # Note: do not use 'jmp', because it may result in collision with bb_branchfunc_diversify
                 bb_starts.append(i)
-        selected_i = self.instrs[random.choice(bb_starts)]
+        if not self.instrs:
+            print '[bb_opaque_diversify.py:attach_opaque_routines] Warning: empty instrs, skip opaque routines'
+            return
+        if bb_starts:
+            selected_i = self.instrs[random.choice(bb_starts)]
+        else:
+            print '[bb_opaque_diversify.py:attach_opaque_routines] Warning: no ret found, append routines at end'
+            selected_i = self.instrs[-1]
         # to avoid possible error in disassembling
         # selected_i = self.instrs[-1]
         # the location of opaque routines should be carefully selected

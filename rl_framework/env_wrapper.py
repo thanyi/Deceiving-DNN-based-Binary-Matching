@@ -151,6 +151,14 @@ class BinaryPerturbationEnv:
         self.no_change_eps = 1e-4
         self.no_change_penalty = 0.1
         self.invalid_loc_penalty = 0.5
+        # 分段惩罚参数（按“连续次数 + 训练阶段”调整）
+        self.no_change_penalty_factors = (0.6, 1.0, 1.6, 2.2)   # 1, 2~3, 4~6, >=7
+        self.invalid_loc_penalty_factors = (1.0, 1.5, 2.2)      # 1, 2~3, >=4
+        self.time_penalty_schedule = (0.02, 0.05, 0.08)         # early, mid, late
+        self.penalty_cap = 2.5
+        # 连续失败计数（用于分段惩罚）
+        self.no_change_streak = 0
+        self.invalid_loc_streak = 0
         # 分数降幅奖励（越降越多）
         self.drop_bonus_scale = 3.0
         self.drop_bonus_cap = 2.0
@@ -351,11 +359,16 @@ class BinaryPerturbationEnv:
             
             if acfg_data:
                 # logger.debug(f"acfg_data: {acfg_data}")
+                self.current_critical_blocks = self._select_top_blocks(acfg_data, k=3)
                 self.current_all_blocks = list(acfg_data.get('basic_blocks', {}).keys())
                 acfg_vec = self._vectorize_acfg(acfg_data)
+            else:
+                self.current_critical_blocks = []
+                self.current_all_blocks = []
                 
         except (FileNotFoundError, KeyError, ValueError, AttributeError) as e:
             logger.warning(f"Feature extraction failed for {binary_path}: {e}")
+            self.current_critical_blocks = []
             self.current_all_blocks = []
             # 保持全0
         
@@ -404,6 +417,53 @@ class BinaryPerturbationEnv:
                 counts[action_idx] += 1.0
 
         return (counts / total).tolist()
+
+    def _select_top_blocks(self, acfg_data, k=3):
+        """
+        选择 Top-K 关键块并保持“重要性顺序”。
+        - 优先使用提取器返回的 top_critical_blocks 顺序；
+        - 若数量不足 K，按 critical_score/dominator/degree 兜底补齐。
+        """
+        try:
+            k = max(1, int(k))
+        except Exception:
+            k = 3
+
+        if not acfg_data:
+            return []
+
+        top_blocks = list(acfg_data.get('top_critical_blocks', []) or [])
+        bbs = acfg_data.get('basic_blocks', {}) or {}
+
+        ordered = []
+        seen = set()
+        for addr in top_blocks:
+            if addr in seen:
+                continue
+            ordered.append(addr)
+            seen.add(addr)
+            if len(ordered) >= k:
+                return ordered
+
+        if isinstance(bbs, dict) and bbs:
+            ranked = sorted(
+                bbs.items(),
+                key=lambda kv: (
+                    -float(kv[1].get('critical_score', 0.0)),
+                    -float(kv[1].get('dominator_score', 0.0)),
+                    -float(kv[1].get('centrality_degree', 0.0)),
+                    kv[0],
+                )
+            )
+            for addr, _ in ranked:
+                if addr in seen:
+                    continue
+                ordered.append(addr)
+                seen.add(addr)
+                if len(ordered) >= k:
+                    break
+
+        return ordered[:k]
 
     def _apply_feature_mode(self, features):
         if self.feature_mode == "full":
@@ -476,11 +536,13 @@ class BinaryPerturbationEnv:
             r2_ext.close()
             
             if acfg_data:
-                top_blocks = acfg_data.get('top_critical_blocks', [])[:3]
-                # 重要性筛选后按地址排序，保证特征与动作位点稳定对齐
-                self.current_critical_blocks = sorted(top_blocks)
+                # 保持重要性顺序，避免地址排序打乱 Top-1/2/3 的语义。
+                self.current_critical_blocks = self._select_top_blocks(acfg_data, k=3)
                 self.current_all_blocks = list(acfg_data.get('basic_blocks', {}).keys())
                 acfg_vec = self._vectorize_acfg(acfg_data)
+            else:
+                self.current_critical_blocks = []
+                self.current_all_blocks = []
                 
                 
         except (FileNotFoundError, KeyError, ValueError, AttributeError) as e:
@@ -530,9 +592,8 @@ class BinaryPerturbationEnv:
         n_edges = data.get('num_edges', 0)
         complexity = data.get('cyclomatic_complexity', 0)
         bbs = list(data.get('basic_blocks', {}).values())
-        top_critical_addrs = data.get('top_critical_blocks', [])[:3]
-        # 为了稳定性：Top-K 先按“重要性”筛选，再按地址排序，避免特征抖动
-        stable_top_addrs = sorted(top_critical_addrs)
+        # 保持提取器给出的重要性顺序（Top-1/2/3），并在缺失时做兜底补齐。
+        stable_top_addrs = self._select_top_blocks(data, k=3)
         fingerprints = data.get('fingerprints', {})
         
         # === 【核心修正1】计算“有效指令总数” (Effective Total) ===
@@ -994,6 +1055,8 @@ class BinaryPerturbationEnv:
             logger.debug(
                 f"Invalid loc_idx={loc_idx} for top_blocks={len(self.current_critical_blocks)}; strict penalty."
             )
+            self.invalid_loc_streak += 1
+            self.no_change_streak += 1
             state = self.extract_features(self.current_binary)
             reward = self.compute_reward_v2(
                 prev_score,
@@ -1001,6 +1064,8 @@ class BinaryPerturbationEnv:
                 self.step_count,
                 invalid_loc=True,
                 no_change=True,
+                no_change_streak=self.no_change_streak,
+                invalid_streak=self.invalid_loc_streak,
             )
             done = self.step_count >= self.max_steps
             info = {
@@ -1011,6 +1076,8 @@ class BinaryPerturbationEnv:
                 'target_func': self.function_name,
                 'loc_valid': False,
                 'no_change': True,
+                'no_change_streak': self.no_change_streak,
+                'invalid_loc_streak': self.invalid_loc_streak,
                 'score_delta': 0.0,
                 'error': 'invalid_loc',
             }
@@ -1053,12 +1120,22 @@ class BinaryPerturbationEnv:
         # 计算奖励
         score_delta = prev_score - score
         no_change = abs(score_delta) <= self.no_change_eps
+        if no_change:
+            self.no_change_streak += 1
+        else:
+            self.no_change_streak = 0
+        if loc_valid:
+            self.invalid_loc_streak = 0
+        else:
+            self.invalid_loc_streak += 1
         reward = self.compute_reward_v2(
             prev_score,
             score,
             self.step_count,
             invalid_loc=not loc_valid,
             no_change=no_change,
+            no_change_streak=self.no_change_streak,
+            invalid_streak=self.invalid_loc_streak,
         )
         # reward = self.compute_reward(score, grad)
         
@@ -1073,6 +1150,8 @@ class BinaryPerturbationEnv:
             'target_func': self.function_name, # 记录当前目标函数名
             'loc_valid': loc_valid,
             'no_change': no_change,
+            'no_change_streak': self.no_change_streak,
+            'invalid_loc_streak': self.invalid_loc_streak,
             'score_delta': score_delta,
         }
         
@@ -1113,7 +1192,8 @@ class BinaryPerturbationEnv:
 
 
     def compute_reward_v2(self, prev_score, current_score, step_count,
-                          invalid_loc=False, no_change=False):
+                          invalid_loc=False, no_change=False,
+                          no_change_streak=0, invalid_streak=0):
         """计算奖励"""
         # 基础奖励
         total_reward = 0.0
@@ -1151,13 +1231,40 @@ class BinaryPerturbationEnv:
 
             total_reward += ultimate * self.reward_weights['ultimate']
 
-        # === 3. 显式惩罚 ===
+        # === 3. 显式惩罚（分段式）===
         penalty = 0.0
+        step_ratio = step_count / max(float(self.max_steps), 1.0)
+        if step_ratio < 0.33:
+            time_penalty = self.time_penalty_schedule[0]
+        elif step_ratio < 0.66:
+            time_penalty = self.time_penalty_schedule[1]
+        else:
+            time_penalty = self.time_penalty_schedule[2]
+
         if no_change:
-            penalty += self.no_change_penalty
+            s = max(int(no_change_streak), 1)
+            if s <= 1:
+                factor = self.no_change_penalty_factors[0]
+            elif s <= 3:
+                factor = self.no_change_penalty_factors[1]
+            elif s <= 6:
+                factor = self.no_change_penalty_factors[2]
+            else:
+                factor = self.no_change_penalty_factors[3]
+            penalty += self.no_change_penalty * factor
+
         if invalid_loc:
-            penalty += self.invalid_loc_penalty
-        penalty += 0.05  # 时间成本
+            s = max(int(invalid_streak), 1)
+            if s <= 1:
+                factor = self.invalid_loc_penalty_factors[0]
+            elif s <= 3:
+                factor = self.invalid_loc_penalty_factors[1]
+            else:
+                factor = self.invalid_loc_penalty_factors[2]
+            penalty += self.invalid_loc_penalty * factor
+
+        penalty += time_penalty
+        penalty = min(penalty, self.penalty_cap)
 
 
         total_reward -= penalty * self.reward_weights['penalty']
@@ -1271,6 +1378,8 @@ class BinaryPerturbationEnv:
         self.current_binary = self.original_binary
         self.mutation_history = []
         self.step_count = 0
+        self.no_change_streak = 0
+        self.invalid_loc_streak = 0
         
         # 提取初始特征
         state = self.extract_features(self.original_binary)

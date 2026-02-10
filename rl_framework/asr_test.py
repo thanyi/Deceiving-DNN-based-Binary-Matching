@@ -13,6 +13,8 @@ import pickle
 import random
 import threading
 import time
+import tempfile
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 import torch
@@ -121,6 +123,27 @@ def format_topk(topk: List[Dict], max_items: Optional[int] = None) -> str:
     return ", ".join(parts)
 
 
+def format_id_list(ids: List[str], max_items: int = 20) -> str:
+    if not ids:
+        return "empty"
+    if max_items <= 0 or len(ids) <= max_items:
+        return ", ".join(ids)
+    shown = ids[:max_items]
+    return f"{', '.join(shown)}, ...(+{len(ids) - max_items})"
+
+
+def format_variant_scores(variant_ids: List[str], scores: List[Dict]) -> str:
+    if not variant_ids:
+        return "empty"
+    score_map = {str(item.get("id")): item.get("score") for item in scores}
+    parts: List[str] = []
+    for vid in variant_ids:
+        score = score_map.get(str(vid))
+        score_str = f"{float(score):.4f}" if score is not None else "NA"
+        parts.append(f"{vid}({score_str})")
+    return ", ".join(parts)
+
+
 def make_mutated_query(sample: Dict, mutated_binary: Optional[str]) -> Dict:
     mutated = dict(sample)
     if mutated_binary:
@@ -169,6 +192,14 @@ class RetrievalBase:
             )
 
     def topk(self, query: Dict, dataset: List[Dict], k: int, query_kind: str) -> List[Dict]:
+        raise NotImplementedError
+
+    def score_candidates(
+        self,
+        query: Dict,
+        candidates: List[Dict],
+        query_kind: str,
+    ) -> List[Dict]:
         raise NotImplementedError
 
 
@@ -288,6 +319,19 @@ class Asm2VecRetriever(RetrievalBase):
                     )
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:k]
+
+    def score_candidates(
+        self,
+        query: Dict,
+        candidates: List[Dict],
+        query_kind: str,
+    ) -> List[Dict]:
+        scored: List[Dict] = []
+        for idx, cand in enumerate(candidates, start=1):
+            result = self._score_candidate(query, cand, query_kind, self._get_worker_dir(idx))
+            if result is not None:
+                scored.append(result)
+        return scored
 
 
 class SafeRetriever(RetrievalBase):
@@ -426,6 +470,362 @@ class SafeRetriever(RetrievalBase):
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:k]
 
+    def score_candidates(
+        self,
+        query: Dict,
+        candidates: List[Dict],
+        query_kind: str,
+    ) -> List[Dict]:
+        scored: List[Dict] = []
+        for idx, cand in enumerate(candidates, start=1):
+            result = self._score_candidate(query, cand, query_kind, self._get_worker_dir(idx))
+            if result is not None:
+                scored.append(result)
+        return scored
+
+
+class JTransRetriever(RetrievalBase):
+    name = "jtrans"
+
+    def __init__(
+        self,
+        model_dir: Optional[str],
+        tokenizer_dir: Optional[str],
+        use_gpu: bool,
+        asm_work_dir: Optional[str],
+        retrieval_workers: int = 1,
+        log_every: int = 0,
+    ) -> None:
+        super().__init__(log_every=log_every)
+        if model_dir and not _is_valid_dir(model_dir):
+            raise ValueError(f"jTrans model dir invalid: {model_dir}")
+        if tokenizer_dir and not _is_valid_dir(tokenizer_dir):
+            raise ValueError(f"jTrans tokenizer dir invalid: {tokenizer_dir}")
+        self.model_dir = model_dir
+        self.tokenizer_dir = tokenizer_dir
+        self.use_gpu = bool(use_gpu)
+        self.asm_work_dir = asm_work_dir
+        self.retrieval_workers = int(retrieval_workers or 1)
+        self.original_asm_cache: Dict = {}
+        # 共享缓存：避免 retrieval_workers>1 时每线程重复加载 jTrans 模型导致内存膨胀。
+        try:
+            emb_cache_max = int(os.environ.get("JTRANS_EMB_CACHE_MAX", "512"))
+        except Exception:
+            emb_cache_max = 512
+        self.jtrans_cache: Dict = {
+            "emb_cache_max": max(0, emb_cache_max),
+        }
+
+    def _get_worker_dir(self, cand_idx: int) -> Optional[str]:
+        if not self.asm_work_dir:
+            return None
+        if self.retrieval_workers <= 1:
+            return self.asm_work_dir
+        worker_dir = os.path.join(self.asm_work_dir, f"cand_{cand_idx}")
+        os.makedirs(worker_dir, exist_ok=True)
+        return worker_dir
+
+    def _get_jtrans_cache(self) -> Dict:
+        # 使用共享缓存，防止线程本地缓存在频繁创建线程池时反复占用大内存。
+        return self.jtrans_cache
+
+    def _get_query_addr(self, query: Dict, query_kind: str) -> Optional[int]:
+        if query_kind == "original":
+            addr = _parse_addr(query.get("func_addr"))
+            if addr is None:
+                raise ValueError("original query missing func_addr in dataset json")
+            return addr
+        if query_kind == "mutated":
+            return _resolve_mutated_addr(query.get("binary_path", ""), query.get("func_name"))
+        raise ValueError(f"query_kind must be original/mutated, got {query_kind}")
+
+    def _score_candidate(
+        self,
+        query: Dict,
+        cand: Dict,
+        query_kind: str,
+        worker_dir: Optional[str],
+    ) -> Optional[Dict]:
+        query_addr = self._get_query_addr(query, query_kind)
+        cand_addr = _parse_addr(cand.get("func_addr"))
+        if cand_addr is None:
+            return None
+
+        score, _grad = run_one(
+            original_binary=query.get("binary_path"),
+            mutated_binary=cand.get("binary_path"),
+            model_original=None,
+            checkdict={},
+            function_name=str(query.get("func_name")),
+            detection_method="jtrans",
+            asm_work_dir=worker_dir,
+            original_asm_cache=self.original_asm_cache,
+            simple_mode=True,
+            original_func_addr=query_addr,
+            mutated_func_addr=cand_addr,
+            sym_to_addr_path=None,
+            sym_to_addr_map=None,
+            safe_checkpoint_dir=None,
+            safe_i2v_dir=None,
+            safe_use_gpu=False,
+            original_asm_path=None,
+            mutated_asm_cache=None,
+            safe_cache=None,
+            jtrans_model_dir=self.model_dir,
+            jtrans_tokenizer_dir=self.tokenizer_dir,
+            jtrans_use_gpu=self.use_gpu,
+            jtrans_cache=self._get_jtrans_cache(),
+        )
+        if score is None:
+            return None
+        cand_id = str(cand.get("id") or cand.get("func_name") or "unknown_cand")
+        return {"id": cand_id, "score": float(score)}
+
+    def topk(self, query: Dict, dataset: List[Dict], k: int, query_kind: str) -> List[Dict]:
+        scored: List[Dict] = []
+        total = len(dataset)
+        self._log_start(total, query_kind)
+        if self.retrieval_workers > 1 and total > 0:
+            max_workers = min(self.retrieval_workers, total)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._score_candidate,
+                        query,
+                        cand,
+                        query_kind,
+                        self._get_worker_dir(idx),
+                    ): idx
+                    for idx, cand in enumerate(dataset, start=1)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    result = future.result()
+                    if result is not None:
+                        scored.append(result)
+                        self._log_candidate(
+                            idx=idx,
+                            total=total,
+                            cand_id=str(result.get("id")),
+                            score=float(result.get("score", 0.0)),
+                            query_kind=query_kind,
+                        )
+        else:
+            for idx, cand in enumerate(dataset, start=1):
+                result = self._score_candidate(
+                    query, cand, query_kind, self._get_worker_dir(idx)
+                )
+                if result is not None:
+                    scored.append(result)
+                    self._log_candidate(
+                        idx=idx,
+                        total=total,
+                        cand_id=str(result.get("id")),
+                        score=float(result.get("score", 0.0)),
+                        query_kind=query_kind,
+                    )
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:k]
+
+    def score_candidates(
+        self,
+        query: Dict,
+        candidates: List[Dict],
+        query_kind: str,
+    ) -> List[Dict]:
+        scored: List[Dict] = []
+        for idx, cand in enumerate(candidates, start=1):
+            result = self._score_candidate(query, cand, query_kind, self._get_worker_dir(idx))
+            if result is not None:
+                scored.append(result)
+        return scored
+
+
+class GMNRetriever(RetrievalBase):
+    name = "gmn"
+
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        features_json: str,
+        dataset: str = "one",
+        features_type: str = "opc",
+        batch_size: int = 20,
+        output_dir: Optional[str] = None,
+        idb_root: Optional[str] = None,
+        idb_prefix: Optional[str] = None,
+        log_every: int = 0,
+    ) -> None:
+        super().__init__(log_every=log_every)
+        self.checkpoint_dir = checkpoint_dir
+        self.features_json = features_json
+        self.dataset = dataset
+        self.features_type = features_type
+        self.batch_size = batch_size
+        self.output_dir = output_dir or tempfile.mkdtemp(prefix="gmn_out_")
+        self.idb_root = idb_root
+        self.idb_prefix = idb_prefix
+        self._engine = None
+
+    def _ensure_engine(self):
+        if self._engine is not None:
+            return self._engine
+
+        if not os.path.isdir(self.checkpoint_dir):
+            raise ValueError(f"GMN checkpoint dir invalid: {self.checkpoint_dir}")
+        if not os.path.isfile(self.features_json):
+            raise ValueError(f"GMN features json invalid: {self.features_json}")
+
+        try:
+            import tensorflow as tf  # noqa: F401
+        except Exception as e:
+            raise RuntimeError(f"GMN requires tensorflow==1.x. Import failed: {e}")
+
+        gmn_root = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "detection_model",
+            "binary_function_similarity",
+            "Models",
+            "GGSNN-GMN",
+            "NeuralNetwork",
+        )
+        gmn_root = os.path.abspath(gmn_root)
+        if gmn_root not in os.sys.path:
+            os.sys.path.insert(0, gmn_root)
+
+        from core.config import get_config
+        from core.gnn_model import GNNModel
+        from core.build_dataset import build_testing_generator
+        from core.model_evaluation import evaluate_sim
+
+        args = SimpleNamespace(
+            model_type="matching",
+            training_mode="pair",
+            features_type=self.features_type,
+            dataset=self.dataset,
+            num_epochs=1,
+            checkpointdir=self.checkpoint_dir,
+            outputdir=self.output_dir,
+            featuresdir=os.path.dirname(os.path.dirname(self.features_json)),
+        )
+        config = get_config(args)
+        config["checkpoint_dir"] = self.checkpoint_dir
+        config["batch_size"] = self.batch_size
+        config["testing"]["features_testing_path"] = self.features_json
+
+        self._engine = {
+            "config": config,
+            "model": GNNModel(config),
+            "build_testing_generator": build_testing_generator,
+            "evaluate_sim": evaluate_sim,
+            "initialized": False,
+        }
+        return self._engine
+
+    def _format_fva(self, addr: Optional[object]) -> Optional[str]:
+        val = _parse_addr(addr)
+        if val is None:
+            return None
+        return hex(val)
+
+    def _map_idb_path(self, binary_path: Optional[str]) -> Optional[str]:
+        if not binary_path:
+            return None
+        if not self.idb_root:
+            return binary_path
+        rel = os.path.relpath(binary_path, self.idb_root)
+        if self.idb_prefix:
+            return os.path.join(self.idb_prefix, rel).replace(os.sep, "/")
+        return rel.replace(os.sep, "/")
+
+    def _score_pairs(self, pairs: List[Dict]) -> List[float]:
+        engine = self._ensure_engine()
+        config = engine["config"]
+        model = engine["model"]
+        build_testing_generator = engine["build_testing_generator"]
+        evaluate_sim = engine["evaluate_sim"]
+
+        if not pairs:
+            return []
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, encoding="utf-8"
+        ) as tmp:
+            writer = csv.DictWriter(
+                tmp,
+                fieldnames=[
+                    "idb_path_1",
+                    "fva_1",
+                    "func_name_1",
+                    "idb_path_2",
+                    "fva_2",
+                    "func_name_2",
+                    "db_type",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(pairs)
+            csv_path = tmp.name
+
+        try:
+            if not engine["initialized"]:
+                init_gen = build_testing_generator(config, csv_path)
+                model._model_initialize(init_gen, is_training=False)
+                model._create_tfsaver()
+                model._restore_model()
+                engine["initialized"] = True
+
+            batch_gen = build_testing_generator(config, csv_path)
+            sims = evaluate_sim(
+                model._session,
+                model._tensors["metrics"]["evaluation"],
+                model._placeholders,
+                batch_gen,
+            )
+            return sims.tolist()
+        finally:
+            try:
+                os.remove(csv_path)
+            except Exception:
+                pass
+
+    def topk(self, query: Dict, dataset: List[Dict], k: int, query_kind: str) -> List[Dict]:
+        if query_kind != "original":
+            raise ValueError("GMN retriever only supports query_kind=original")
+
+        query_idb = self._map_idb_path(query.get("binary_path"))
+        query_fva = self._format_fva(query.get("func_addr"))
+        if not query_idb or not query_fva:
+            raise ValueError("GMN requires binary_path and func_addr in dataset")
+
+        pairs = []
+        cand_ids = []
+        for cand in dataset:
+            cand_idb = self._map_idb_path(cand.get("binary_path"))
+            cand_fva = self._format_fva(cand.get("func_addr"))
+            if not cand_idb or not cand_fva:
+                continue
+            pairs.append(
+                {
+                    "idb_path_1": query_idb,
+                    "fva_1": query_fva,
+                    "func_name_1": str(query.get("func_name") or ""),
+                    "idb_path_2": cand_idb,
+                    "fva_2": cand_fva,
+                    "func_name_2": str(cand.get("func_name") or ""),
+                    "db_type": "QQ",
+                }
+            )
+            cand_ids.append(str(cand.get("id") or cand.get("func_name") or "unknown_cand"))
+
+        sims = self._score_pairs(pairs)
+        scored = []
+        for cand_id, score in zip(cand_ids, sims):
+            scored.append({"id": cand_id, "score": float(score)})
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:k]
+
 
 class RLAgentRunner:
     def __init__(
@@ -440,6 +840,9 @@ class RLAgentRunner:
         safe_checkpoint_dir: Optional[str] = None,
         safe_i2v_dir: Optional[str] = None,
         safe_use_gpu: bool = False,
+        jtrans_model_dir: Optional[str] = None,
+        jtrans_tokenizer_dir: Optional[str] = None,
+        jtrans_use_gpu: bool = False,
     ) -> None:
         self.dataset_path = dataset_path
         self.save_path = save_path
@@ -463,6 +866,9 @@ class RLAgentRunner:
             safe_i2v_dir=safe_i2v_dir,
             safe_use_gpu=safe_use_gpu,
             safe_cache_enabled=(detection_method == "safe"),
+            jtrans_model_dir=jtrans_model_dir,
+            jtrans_tokenizer_dir=jtrans_tokenizer_dir,
+            jtrans_use_gpu=jtrans_use_gpu,
         )
         self.env.target_score = 0.4
         self.env.set_state_dim(state_dim)
@@ -548,6 +954,27 @@ def build_retriever(args: argparse.Namespace, save_path: str) -> RetrievalBase:
             retrieval_workers=args.retrieval_workers,
             log_every=args.retrieval_log_every,
         )
+    if args.retrieval_model == "jtrans":
+        return JTransRetriever(
+            model_dir=args.jtrans_model_dir,
+            tokenizer_dir=args.jtrans_tokenizer_dir,
+            use_gpu=args.jtrans_use_gpu,
+            asm_work_dir=asm_work_dir,
+            retrieval_workers=args.retrieval_workers,
+            log_every=args.retrieval_log_every,
+        )
+    if args.retrieval_model == "gmn":
+        return GMNRetriever(
+            checkpoint_dir=args.gmn_checkpoint_dir,
+            features_json=args.gmn_features_json,
+            dataset=args.gmn_dataset,
+            features_type=args.gmn_features_type,
+            batch_size=args.gmn_batch_size,
+            output_dir=args.gmn_output_dir or asm_work_dir,
+            idb_root=args.gmn_idb_root,
+            idb_prefix=args.gmn_idb_prefix,
+            log_every=args.retrieval_log_every,
+        )
     raise ValueError(f"Unknown retrieval model: {args.retrieval_model}")
 
 
@@ -631,6 +1058,9 @@ def run_asr_simple(
     csv_path: str,
     use_gpu: bool,
     env_detection: str,
+    jtrans_model_dir: Optional[str],
+    jtrans_tokenizer_dir: Optional[str],
+    jtrans_use_gpu: bool,
     retriever: RetrievalBase,
 ) -> Tuple[float, List[Dict]]:
     dataset = load_dataset(dataset_path)
@@ -651,6 +1081,9 @@ def run_asr_simple(
         safe_checkpoint_dir=getattr(retriever, "checkpoint_dir", None),
         safe_i2v_dir=getattr(retriever, "i2v_dir", None),
         safe_use_gpu=getattr(retriever, "use_gpu", False),
+        jtrans_model_dir=jtrans_model_dir,
+        jtrans_tokenizer_dir=jtrans_tokenizer_dir,
+        jtrans_use_gpu=jtrans_use_gpu,
     )
     print("[ASR] Environment ready. Start mutation.")
 
@@ -756,7 +1189,20 @@ def run_asr_simple(
             pbar.set_postfix({"asr": f"{current_asr:.3f}"})
 
     asr = success / max(len(dataset), 1)
-    save_csv(rows, csv_path)
+    save_csv(
+        rows,
+        csv_path,
+        fieldnames=[
+            "sample_id",
+            "target_id",
+            "rank_before",
+            "rank_after",
+            "steps_used",
+            "final_score",
+            "success",
+            "error",
+        ],
+    )
     return asr, rows
 
 
@@ -769,8 +1215,12 @@ def run_asr_multi_variant(
     limit_mode: str,
     limit_seed: Optional[int],
     save_path: str,
+    csv_path: str,
     use_gpu: bool,
     env_detection: str,
+    jtrans_model_dir: Optional[str],
+    jtrans_tokenizer_dir: Optional[str],
+    jtrans_use_gpu: bool,
     retriever: RetrievalBase,
 ) -> Dict[str, float]:
     dataset = load_dataset(dataset_path)
@@ -791,33 +1241,97 @@ def run_asr_multi_variant(
         safe_checkpoint_dir=getattr(retriever, "checkpoint_dir", None),
         safe_i2v_dir=getattr(retriever, "i2v_dir", None),
         safe_use_gpu=getattr(retriever, "use_gpu", False),
+        jtrans_model_dir=jtrans_model_dir,
+        jtrans_tokenizer_dir=jtrans_tokenizer_dir,
+        jtrans_use_gpu=jtrans_use_gpu,
     )
     print("[ASR-MV] Environment ready. Start mutation.")
 
     sampled_ids = {str(item.get("id")) for item in dataset if item.get("id") is not None}
+    id_to_item = {
+        str(item.get("id")): item for item in dataset if item.get("id") is not None
+    }
     total = 0
     skipped = 0
+    skipped_low_pre = 0
     errors = 0
     sum_asr1 = 0.0
+    sum_asr2 = 0.0
     sum_asr3 = 0.0
-    sum_asr5 = 0.0
+    sum_asr4 = 0.0
     sum_wasr = 0.0
     sum_recall_pre = 0.0
     sum_recall_post = 0.0
     checked = 0
+    rows: List[Dict] = []
 
     pbar = tqdm(enumerate(dataset), total=len(dataset), desc=f"ASR-MV@{k}", unit="sample")
     for idx, sample in pbar:
-        variants = _get_variant_set(sample)
-        if not variants:
+        variants_raw = _get_variant_set(sample)
+        if not variants_raw:
             skipped += 1
+            rows.append(
+                {
+                    "sample_id": str(sample.get("id") or f"sample_{idx}"),
+                    "sample_idx": idx,
+                    "func_name": sample.get("func_name", ""),
+                    "variant_count_raw": 0,
+                    "variant_count": 0,
+                    "variant_ids": "",
+                    "status": "skipped",
+                    "error": "no_variants",
+                    "topk_before": "",
+                    "topk_after": "",
+                    "hits_pre": "",
+                    "hits_post": "",
+                    "pushed_out": "",
+                    "asr1_hit": "",
+                    "asr2_hit": "",
+                    "asr3_hit": "",
+                    "asr4_hit": "",
+                    "wasr": "",
+                    "recall_pre": "",
+                    "recall_post": "",
+                    "steps_used": "",
+                    "final_score": "",
+                }
+            )
             continue
-        variants = set(v for v in variants if v in sampled_ids)
+        variants = set(v for v in variants_raw if v in sampled_ids)
+        sample_id = str(sample.get("id") or f"sample_{idx}")
+        if sample_id in sampled_ids:
+            variants.add(sample_id)
         if not variants:
             skipped += 1
+            rows.append(
+                {
+                    "sample_id": str(sample.get("id") or f"sample_{idx}"),
+                    "sample_idx": idx,
+                    "func_name": sample.get("func_name", ""),
+                    "variant_count_raw": len(variants_raw),
+                    "variant_count": 0,
+                    "variant_ids": "",
+                    "status": "skipped",
+                    "error": "variants_not_in_dataset",
+                    "topk_before": "",
+                    "topk_after": "",
+                    "hits_pre": "",
+                    "hits_post": "",
+                    "pushed_out": "",
+                    "asr1_hit": "",
+                    "asr2_hit": "",
+                    "asr3_hit": "",
+                    "asr4_hit": "",
+                    "wasr": "",
+                    "recall_pre": "",
+                    "recall_post": "",
+                    "steps_used": "",
+                    "final_score": "",
+                }
+            )
             continue
 
-        sample_id = str(sample.get("id") or f"sample_{idx}")
+        variant_list = sorted(variants)
         tqdm.write(
             f"[ASR-MV] Start sample={idx} id={sample_id} func={sample.get('func_name')} variants={len(variants)}"
         )
@@ -830,13 +1344,101 @@ def run_asr_multi_variant(
             errors += 1
             checked += 1
             tqdm.write(f"[ASR-MV] retrieval_before_failed:{e}")
+            rows.append(
+                {
+                    "sample_id": sample_id,
+                    "sample_idx": idx,
+                    "func_name": sample.get("func_name", ""),
+                    "variant_count_raw": len(variants_raw),
+                    "variant_count": len(variant_list),
+                    "variant_ids": format_id_list(variant_list),
+                    "status": "error",
+                    "error": f"retrieval_before_failed:{e}",
+                    "topk_before": "",
+                    "topk_after": "",
+                    "hits_pre": "",
+                    "hits_post": "",
+                    "pushed_out": "",
+                    "asr1_hit": "",
+                    "asr2_hit": "",
+                    "asr3_hit": "",
+                    "asr4_hit": "",
+                    "wasr": "",
+                    "recall_pre": "",
+                    "recall_post": "",
+                    "steps_used": "",
+                    "final_score": "",
+                }
+            )
             if checked % 6 == 0:
                 denom = max(total, 1)
                 tqdm.write(
                     "[ASR-MV] "
-                    f"ASR@1={sum_asr1 / denom:.4f} "
-                    f"ASR@3={sum_asr3 / denom:.4f} "
-                    f"ASR@5={sum_asr5 / denom:.4f} "
+                    f"ASR@1={sum_asr1 / denom:.4f} (n={total}) "
+                    f"ASR@2={sum_asr2 / denom:.4f} (n={total}) "
+                    f"ASR@3={sum_asr3 / denom:.4f} (n={total}) "
+                    f"ASR@4={sum_asr4 / denom:.4f} (n={total}) "
+                    f"wASR={sum_wasr / denom:.4f} "
+                    f"recall_pre={sum_recall_pre / denom:.4f} "
+                    f"recall_post={sum_recall_post / denom:.4f}"
+                )
+            continue
+
+        tqdm.write(f"[ASR-MV] TopK before ({retriever.name}): {format_topk(topk_before)}")
+        variant_candidates = [id_to_item[v] for v in variant_list if v in id_to_item]
+        variant_scores_pre = retriever.score_candidates(
+            sample, variant_candidates, query_kind="original"
+        )
+        tqdm.write(
+            f"[ASR-MV] Variant scores pre: {format_variant_scores(variant_list, variant_scores_pre)}"
+        )
+
+        topk_pre_ids = {
+            str(item.get("id")) for item in topk_before if item.get("id") is not None
+        }
+        pre_topk_variants = topk_pre_ids & variants
+        hits_pre = len(pre_topk_variants)
+        if hits_pre < 4:
+            skipped += 1
+            skipped_low_pre += 1
+            checked += 1
+            tqdm.write(
+                f"[ASR-MV] skipped_pre_hits<{4}: hits_pre={hits_pre} sample={sample_id}"
+            )
+            rows.append(
+                {
+                    "sample_id": sample_id,
+                    "sample_idx": idx,
+                    "func_name": sample.get("func_name", ""),
+                    "variant_count_raw": len(variants_raw),
+                    "variant_count": len(variant_list),
+                    "variant_ids": format_id_list(variant_list),
+                    "status": "skipped",
+                    "error": f"insufficient_pre_hits:{hits_pre}<4",
+                    "topk_before": format_topk(topk_before),
+                    "topk_after": "",
+                    "hits_pre": hits_pre,
+                    "hits_post": "",
+                    "pushed_out": "",
+                    "asr1_hit": "",
+                    "asr2_hit": "",
+                    "asr3_hit": "",
+                    "asr4_hit": "",
+                    "wasr": "",
+                    "recall_pre": "",
+                    "recall_post": "",
+                    "steps_used": "",
+                    "final_score": "",
+                }
+            )
+            if checked % 6 == 0:
+                denom = max(total, 1)
+                tqdm.write(
+                    "[ASR-MV] "
+                    f"ASR@1={sum_asr1 / denom:.4f} (n={total}) "
+                    f"ASR@2={sum_asr2 / denom:.4f} (n={total}) "
+                    f"ASR@3={sum_asr3 / denom:.4f} (n={total}) "
+                    f"ASR@4={sum_asr4 / denom:.4f} (n={total}) "
                     f"wASR={sum_wasr / denom:.4f} "
                     f"recall_pre={sum_recall_pre / denom:.4f} "
                     f"recall_post={sum_recall_post / denom:.4f}"
@@ -850,13 +1452,40 @@ def run_asr_multi_variant(
             errors += 1
             checked += 1
             tqdm.write(f"[ASR-MV] mutation_failed_skip_after:{attack_info['error']}")
+            rows.append(
+                {
+                    "sample_id": sample_id,
+                    "sample_idx": idx,
+                    "func_name": sample.get("func_name", ""),
+                    "variant_count_raw": len(variants_raw),
+                    "variant_count": len(variant_list),
+                    "variant_ids": format_id_list(variant_list),
+                    "status": "error",
+                    "error": f"mutation_failed_skip_after:{attack_info['error']}",
+                    "topk_before": format_topk(topk_before),
+                    "topk_after": "",
+                    "hits_pre": hits_pre,
+                    "hits_post": "",
+                    "pushed_out": "",
+                    "asr1_hit": "",
+                    "asr2_hit": "",
+                    "asr3_hit": "",
+                    "asr4_hit": "",
+                    "wasr": "",
+                    "recall_pre": "",
+                    "recall_post": "",
+                    "steps_used": attack_info["steps_used"],
+                    "final_score": attack_info["final_score"],
+                }
+            )
             if checked % 6 == 0:
                 denom = max(total, 1)
                 tqdm.write(
                     "[ASR-MV] "
-                    f"ASR@1={sum_asr1 / denom:.4f} "
-                    f"ASR@3={sum_asr3 / denom:.4f} "
-                    f"ASR@5={sum_asr5 / denom:.4f} "
+                    f"ASR@1={sum_asr1 / denom:.4f} (n={total}) "
+                    f"ASR@2={sum_asr2 / denom:.4f} (n={total}) "
+                    f"ASR@3={sum_asr3 / denom:.4f} (n={total}) "
+                    f"ASR@4={sum_asr4 / denom:.4f} (n={total}) "
                     f"wASR={sum_wasr / denom:.4f} "
                     f"recall_pre={sum_recall_pre / denom:.4f} "
                     f"recall_post={sum_recall_post / denom:.4f}"
@@ -871,31 +1500,67 @@ def run_asr_multi_variant(
             errors += 1
             checked += 1
             tqdm.write(f"[ASR-MV] retrieval_after_failed:{e}")
+            rows.append(
+                {
+                    "sample_id": sample_id,
+                    "sample_idx": idx,
+                    "func_name": sample.get("func_name", ""),
+                    "variant_count_raw": len(variants_raw),
+                    "variant_count": len(variant_list),
+                    "variant_ids": format_id_list(variant_list),
+                    "status": "error",
+                    "error": f"retrieval_after_failed:{e}",
+                    "topk_before": format_topk(topk_before),
+                    "topk_after": "",
+                    "hits_pre": hits_pre,
+                    "hits_post": "",
+                    "pushed_out": "",
+                    "asr1_hit": "",
+                    "asr2_hit": "",
+                    "asr3_hit": "",
+                    "asr4_hit": "",
+                    "wasr": "",
+                    "recall_pre": "",
+                    "recall_post": "",
+                    "steps_used": attack_info["steps_used"],
+                    "final_score": attack_info["final_score"],
+                }
+            )
             if checked % 6 == 0:
                 denom = max(total, 1)
                 tqdm.write(
                     "[ASR-MV] "
-                    f"ASR@1={sum_asr1 / denom:.4f} "
-                    f"ASR@3={sum_asr3 / denom:.4f} "
-                    f"ASR@5={sum_asr5 / denom:.4f} "
+                    f"ASR@1={sum_asr1 / denom:.4f} (n={total}) "
+                    f"ASR@2={sum_asr2 / denom:.4f} (n={total}) "
+                    f"ASR@3={sum_asr3 / denom:.4f} (n={total}) "
+                    f"ASR@4={sum_asr4 / denom:.4f} (n={total}) "
                     f"wASR={sum_wasr / denom:.4f} "
                     f"recall_pre={sum_recall_pre / denom:.4f} "
                     f"recall_post={sum_recall_post / denom:.4f}"
                 )
             continue
 
-        topk_pre_ids = {str(item.get("id")) for item in topk_before if item.get("id") is not None}
-        topk_post_ids = {str(item.get("id")) for item in topk_after if item.get("id") is not None}
+        tqdm.write(f"[ASR-MV] TopK after ({retriever.name}): {format_topk(topk_after)}")
+        variant_scores_post = retriever.score_candidates(
+            mutated_query, variant_candidates, query_kind="mutated"
+        )
+        tqdm.write(
+            f"[ASR-MV] Variant scores post: {format_variant_scores(variant_list, variant_scores_post)}"
+        )
 
-        hits_pre = len(topk_pre_ids & variants)
-        hits_post = len(topk_post_ids & variants)
+        topk_post_ids = {
+            str(item.get("id")) for item in topk_after if item.get("id") is not None
+        }
+        hits_post = len(topk_post_ids & pre_topk_variants)
         pushed_out = max(hits_pre - hits_post, 0)
 
         total += 1
         sum_asr1 += 1.0 if pushed_out >= 1 else 0.0
+        sum_asr2 += 1.0 if pushed_out >= 2 else 0.0
         sum_asr3 += 1.0 if pushed_out >= 3 else 0.0
-        sum_asr5 += 1.0 if pushed_out >= 5 else 0.0
-        sum_wasr += min(max(pushed_out, 0), 5) / 5.0
+        sum_asr4 += 1.0 if pushed_out >= 4 else 0.0
+        wasr = min(max(pushed_out, 0), 4) / 4.0
+        sum_wasr += wasr
         sum_recall_pre += hits_pre / max(len(variants), 1)
         sum_recall_post += hits_post / max(len(variants), 1)
         checked += 1
@@ -903,13 +1568,42 @@ def run_asr_multi_variant(
         tqdm.write(
             f"[ASR-MV] hits_pre={hits_pre} hits_post={hits_post} pushed_out={pushed_out}"
         )
+        recall_pre = hits_pre / max(len(variants), 1)
+        recall_post = hits_post / max(len(variants), 1)
+        rows.append(
+            {
+                "sample_id": sample_id,
+                "sample_idx": idx,
+                "func_name": sample.get("func_name", ""),
+                "variant_count_raw": len(variants_raw),
+                "variant_count": len(variant_list),
+                "variant_ids": format_id_list(variant_list),
+                "status": "ok",
+                "error": "",
+                "topk_before": format_topk(topk_before),
+                "topk_after": format_topk(topk_after),
+                "hits_pre": hits_pre,
+                "hits_post": hits_post,
+                "pushed_out": pushed_out,
+                "asr1_hit": 1 if pushed_out >= 1 else 0,
+                "asr2_hit": 1 if pushed_out >= 2 else 0,
+                "asr3_hit": 1 if pushed_out >= 3 else 0,
+                "asr4_hit": 1 if pushed_out >= 4 else 0,
+                "wasr": wasr,
+                "recall_pre": recall_pre,
+                "recall_post": recall_post,
+                "steps_used": attack_info["steps_used"],
+                "final_score": attack_info["final_score"],
+            }
+        )
         if checked % 6 == 0:
             denom = max(total, 1)
             tqdm.write(
                 "[ASR-MV] "
-                f"ASR@1={sum_asr1 / denom:.4f} "
-                f"ASR@3={sum_asr3 / denom:.4f} "
-                f"ASR@5={sum_asr5 / denom:.4f} "
+                f"ASR@1={sum_asr1 / denom:.4f} (n={total}) "
+                f"ASR@2={sum_asr2 / denom:.4f} (n={total}) "
+                f"ASR@3={sum_asr3 / denom:.4f} (n={total}) "
+                f"ASR@4={sum_asr4 / denom:.4f} (n={total}) "
                 f"wASR={sum_wasr / denom:.4f} "
                 f"recall_pre={sum_recall_pre / denom:.4f} "
                 f"recall_post={sum_recall_post / denom:.4f}"
@@ -918,38 +1612,68 @@ def run_asr_multi_variant(
     denom = max(total, 1)
     metrics = {
         "ASR@1": sum_asr1 / denom,
+        "ASR@2": sum_asr2 / denom,
         "ASR@3": sum_asr3 / denom,
-        "ASR@5": sum_asr5 / denom,
+        "ASR@4": sum_asr4 / denom,
         "wASR": sum_wasr / denom,
         "recall_pre": sum_recall_pre / denom,
         "recall_post": sum_recall_post / denom,
     }
-    print(f"[ASR-MV] samples={total} skipped={skipped} errors={errors}")
+    print(
+        f"[ASR-MV] samples={total} skipped={skipped} "
+        f"skipped_low_pre={skipped_low_pre} errors={errors}"
+    )
     print(
         "[ASR-MV] "
-        f"ASR@1={metrics['ASR@1']:.4f} "
-        f"ASR@3={metrics['ASR@3']:.4f} "
-        f"ASR@5={metrics['ASR@5']:.4f} "
+        f"ASR@1={metrics['ASR@1']:.4f} (n={total}) "
+        f"ASR@2={metrics['ASR@2']:.4f} (n={total}) "
+        f"ASR@3={metrics['ASR@3']:.4f} (n={total}) "
+        f"ASR@4={metrics['ASR@4']:.4f} (n={total}) "
         f"wASR={metrics['wASR']:.4f} "
         f"recall_pre={metrics['recall_pre']:.4f} "
         f"recall_post={metrics['recall_post']:.4f}"
     )
+    save_csv(
+        rows,
+        csv_path,
+        fieldnames=[
+            "sample_id",
+            "sample_idx",
+            "func_name",
+            "variant_count_raw",
+            "variant_count",
+            "variant_ids",
+            "status",
+            "error",
+            "topk_before",
+            "topk_after",
+            "hits_pre",
+            "hits_post",
+            "pushed_out",
+            "asr1_hit",
+            "asr2_hit",
+            "asr3_hit",
+            "asr4_hit",
+            "wasr",
+            "recall_pre",
+            "recall_post",
+            "steps_used",
+            "final_score",
+        ],
+    )
+    print(f"[ASR-MV] CSV saved to: {csv_path}")
     return metrics
 
 
-def save_csv(rows: List[Dict], path: str) -> None:
+def save_csv(
+    rows: List[Dict],
+    path: str,
+    fieldnames: Optional[List[str]] = None,
+) -> None:
     if not rows:
         return
-    fieldnames = [
-        "sample_id",
-        "target_id",
-        "rank_before",
-        "rank_after",
-        "steps_used",
-        "final_score",
-        "success",
-        "error",
-    ]
+    if fieldnames is None:
+        fieldnames = list(rows[0].keys())
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -988,16 +1712,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--retrieval-model",
-        choices=["asm2vec", "safe"],
+        choices=["asm2vec", "safe", "jtrans", "gmn"],
         default="asm2vec",
         help="Retrieval model for Top-K ranking.",
     )
     parser.add_argument("--safe-checkpoint-dir", default=None)
     parser.add_argument("--safe-i2v-dir", default=None)
     parser.add_argument("--safe-use-gpu", action="store_true")
+    parser.add_argument("--jtrans-model-dir", default=None)
+    parser.add_argument("--jtrans-tokenizer-dir", default=None)
+    parser.add_argument("--jtrans-use-gpu", action="store_true")
     parser.add_argument(
         "--env-detection",
-        choices=["asm2vec", "safe"],
+        choices=["asm2vec", "safe", "jtrans"],
         default="asm2vec",
         help="Detection method for env.step() scoring.",
     )
@@ -1013,6 +1740,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Log candidate scoring every N items (0 disables).",
     )
+    parser.add_argument("--gmn-checkpoint-dir", default=None)
+    parser.add_argument("--gmn-features-json", default=None)
+    parser.add_argument("--gmn-dataset", default="one", choices=["one", "two", "vuln"])
+    parser.add_argument("--gmn-features-type", default="opc", choices=["opc", "nofeatures"])
+    parser.add_argument("--gmn-batch-size", type=int, default=20)
+    parser.add_argument("--gmn-output-dir", default=None)
+    parser.add_argument("--gmn-idb-root", default=None)
+    parser.add_argument("--gmn-idb-prefix", default=None)
     return parser
 
 
@@ -1024,6 +1759,14 @@ def main() -> None:
     csv_path = args.csv
     if not os.path.isabs(csv_path):
         csv_path = os.path.join(args.save_path, csv_path)
+
+    if args.env_detection == "jtrans" or args.retrieval_model == "jtrans":
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        jtrans_root = os.path.join(project_root, "detection_model", "jTrans")
+        if args.jtrans_model_dir is None:
+            args.jtrans_model_dir = os.path.join(jtrans_root, "models", "jTrans-finetune")
+        if args.jtrans_tokenizer_dir is None:
+            args.jtrans_tokenizer_dir = os.path.join(jtrans_root, "jtrans_tokenizer")
 
     retriever = build_retriever(args, args.save_path)
     print(f"[ASR] Retrieval model: {retriever.name}")
@@ -1040,6 +1783,9 @@ def main() -> None:
             csv_path=csv_path,
             use_gpu=args.use_gpu,
             env_detection=args.env_detection,
+            jtrans_model_dir=args.jtrans_model_dir,
+            jtrans_tokenizer_dir=args.jtrans_tokenizer_dir,
+            jtrans_use_gpu=args.jtrans_use_gpu,
             retriever=retriever,
         )
 
@@ -1055,8 +1801,12 @@ def main() -> None:
             limit_mode=args.limit_mode,
             limit_seed=args.limit_seed,
             save_path=args.save_path,
+            csv_path=csv_path,
             use_gpu=args.use_gpu,
             env_detection=args.env_detection,
+            jtrans_model_dir=args.jtrans_model_dir,
+            jtrans_tokenizer_dir=args.jtrans_tokenizer_dir,
+            jtrans_use_gpu=args.jtrans_use_gpu,
             retriever=retriever,
         )
 

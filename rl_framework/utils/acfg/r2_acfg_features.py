@@ -156,7 +156,7 @@ class RadareACFGExtractor:
                         dominator_scores[node] = len(nx.descendants(dom_tree, node))
         except: pass
 
-        # --- 3.3.3 关键区域筛选 (仅用于排序，不作为特征输出) ---
+        # --- 3.3.3 关键区域筛选辅助 ---
         def simple_norm(d):
             vals = list(d.values())
             if not vals: return d
@@ -166,15 +166,6 @@ class RadareACFGExtractor:
         n_bet = simple_norm(betweenness)
         n_dom = simple_norm(dominator_scores)
         n_deg = simple_norm(degree)
-        
-        critical_scores = []
-        for addr in G.nodes():
-            # 权重聚合
-            score = 0.4*n_bet.get(addr,0) + 0.3*n_dom.get(addr,0) + 0.3*n_deg.get(addr,0)
-            critical_scores.append((addr, score))
-        
-        critical_scores.sort(key=lambda x: x[1], reverse=True)
-        top_k_blocks = [x[0] for x in critical_scores[:5]]
 
         # --- B. 语义指纹提取 ---
         fingerprints = {
@@ -216,6 +207,43 @@ class RadareACFGExtractor:
             
             bbs_features[bb_addr] = feats
 
+        # --- D. 混合关键块评分 (拓扑 + 语义) ---
+        # 旧逻辑只看中心性，容易选到“结构中心但语义弱”的块。
+        # 新逻辑加入语义密度，让目标块更可能对检测分数敏感。
+        semantic_raw = {}
+        for addr, feats in bbs_features.items():
+            n_inst = max(float(feats.get('n_instructions', 0)), 1.0)
+            sem = (
+                float(feats.get('n_arith', 0)) +
+                float(feats.get('n_logic', 0)) +
+                float(feats.get('n_cmp', 0)) +
+                float(feats.get('n_xor', 0)) +
+                float(feats.get('n_shift', 0)) +
+                1.5 * float(feats.get('n_call', 0)) +
+                float(feats.get('n_mem_read', 0)) +
+                float(feats.get('n_mem_write', 0)) +
+                0.5 * float(feats.get('n_consts', 0))
+            ) / n_inst
+            semantic_raw[addr] = sem
+
+        n_sem = simple_norm(semantic_raw)
+        critical_scores = []
+        for addr in G.nodes():
+            score = (
+                0.35 * n_bet.get(addr, 0.0) +
+                0.25 * n_dom.get(addr, 0.0) +
+                0.20 * n_deg.get(addr, 0.0) +
+                0.20 * n_sem.get(addr, 0.0)
+            )
+            # 写回到每个块特征，供下游直接使用
+            if addr in bbs_features:
+                bbs_features[addr]['critical_score'] = score
+            critical_scores.append((addr, score))
+
+        # 稳定排序：先按 score 降序，再按地址升序（消除并列时抖动）
+        critical_scores.sort(key=lambda x: (-x[1], x[0]))
+        top_k_blocks = [x[0] for x in critical_scores[:5]]
+
         result = {
             'num_nodes': len(G.nodes()),
             'num_edges': len(G.edges()),
@@ -239,7 +267,7 @@ class RadareACFGExtractor:
         stats = {
             'n_instructions': len(instrs),
             'n_arith': 0, 'n_logic': 0, 'n_branch': 0, 'n_transfer': 0,
-            'n_xor': 0, 'n_shift': 0, 'n_cmp': 0,
+            'n_xor': 0, 'n_shift': 0, 'n_cmp': 0, 'n_call': 0,
             'n_mem_write': 0, 'n_mem_read': 0, 
             'n_regs_gp': 0, 'n_regs_vec': 0, 'n_consts': 0
         }
@@ -256,6 +284,8 @@ class RadareACFGExtractor:
             val = ins.get('val')
             
             # 1. 语义统计 (增强版)
+            if mnemonic.startswith('call'):
+                stats['n_call'] += 1
             # 支持向量指令 (vpxor, vxorps)
             if 'xor' in mnemonic: stats['n_xor'] += 1
             # 支持 cmp/test

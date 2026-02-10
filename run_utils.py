@@ -208,16 +208,18 @@ def _get_safe_paths(safe_root=None, checkpoint_dir=None, i2v_dir=None):
 def _get_safe_session(checkpoint_dir, i2v_dir, use_gpu=True, safe_cache=None):
     if safe_cache is not None:
         key = (checkpoint_dir, i2v_dir, bool(use_gpu))
-        sess = safe_cache.get("session")
-        get_functions = safe_cache.get("get_functions")
-        if sess is not None and safe_cache.get("session_key") == key and get_functions is not None:
-            return sess, get_functions, False
+        session_lock = safe_cache.setdefault("_session_lock", threading.Lock())
+        with session_lock:
+            sess = safe_cache.get("session")
+            get_functions = safe_cache.get("get_functions")
+            if sess is not None and safe_cache.get("session_key") == key and get_functions is not None:
+                return sess, get_functions, False
 
-        try:
-            if sess is not None:
-                sess.close()
-        except Exception:
-            pass
+            try:
+                if sess is not None:
+                    sess.close()
+            except Exception:
+                pass
 
     safe_root, _, _ = _get_safe_paths(checkpoint_dir=checkpoint_dir, i2v_dir=i2v_dir)
     if safe_root not in sys.path:
@@ -228,12 +230,34 @@ def _get_safe_session(checkpoint_dir, i2v_dir, use_gpu=True, safe_cache=None):
 
     sess = SAFEInferenceSession(checkpoint_dir, i2v_dir, use_gpu=use_gpu)
     if safe_cache is not None:
-        safe_cache["session"] = sess
-        safe_cache["session_key"] = (checkpoint_dir, i2v_dir, bool(use_gpu))
-        safe_cache["get_functions"] = get_functions_from_binary
-        safe_cache.setdefault("emb_cache", {})
-        safe_cache.setdefault("instr_cache", {})
-        return sess, get_functions_from_binary, False
+        session_lock = safe_cache.setdefault("_session_lock", threading.Lock())
+        with session_lock:
+            safe_cache["session"] = sess
+            safe_cache["session_key"] = (checkpoint_dir, i2v_dir, bool(use_gpu))
+            safe_cache["get_functions"] = get_functions_from_binary
+            emb_cache = safe_cache.get("emb_cache")
+            if not isinstance(emb_cache, OrderedDict):
+                emb_cache = OrderedDict(emb_cache or {})
+                safe_cache["emb_cache"] = emb_cache
+            instr_cache = safe_cache.get("instr_cache")
+            if not isinstance(instr_cache, OrderedDict):
+                instr_cache = OrderedDict(instr_cache or {})
+                safe_cache["instr_cache"] = instr_cache
+            safe_cache.setdefault("_cache_lock", threading.Lock())
+            safe_cache.setdefault("_infer_lock", threading.Lock())
+            try:
+                emb_cache_max = int(safe_cache.get("emb_cache_max", os.environ.get("SAFE_EMB_CACHE_MAX", "1024")))
+            except Exception:
+                emb_cache_max = 1024
+            try:
+                instr_cache_max = int(
+                    safe_cache.get("instr_cache_max", os.environ.get("SAFE_INSTR_CACHE_MAX", "2048"))
+                )
+            except Exception:
+                instr_cache_max = 2048
+            safe_cache["emb_cache_max"] = max(0, emb_cache_max)
+            safe_cache["instr_cache_max"] = max(0, instr_cache_max)
+            return sess, get_functions_from_binary, False
 
     return sess, get_functions_from_binary, True
 
@@ -242,16 +266,42 @@ def _get_safe_session(checkpoint_dir, i2v_dir, use_gpu=True, safe_cache=None):
 
 
 def _get_jtrans_paths(model_dir=None, tokenizer_dir=None):
-    base = os.environ.get(
-        "JTRANS_ROOT",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "detection_model", "jTrans"),
-    )
+    def _looks_like_jtrans_root(path):
+        return bool(path) and os.path.isfile(os.path.join(path, "readidadata.py"))
+
+    def _infer_root_from_model(path):
+        # e.g. /x/jTrans/models/jTrans-finetune -> /x/jTrans
+        if not path:
+            return None
+        p = os.path.abspath(path)
+        if os.path.basename(os.path.dirname(p)) == "models":
+            return os.path.dirname(os.path.dirname(p))
+        return os.path.dirname(p)
+
+    def _infer_root_from_tokenizer(path):
+        # e.g. /x/jTrans/jtrans_tokenizer -> /x/jTrans
+        if not path:
+            return None
+        return os.path.dirname(os.path.abspath(path))
+
+    base_default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "detection_model", "jTrans")
+    base = os.environ.get("JTRANS_ROOT", base_default)
+
     model = model_dir or os.environ.get(
         "JTRANS_MODEL_DIR", os.path.join(base, "models", "jTrans-finetune")
     )
     tokenizer = tokenizer_dir or os.environ.get(
         "JTRANS_TOKENIZER_DIR", os.path.join(base, "jtrans_tokenizer")
     )
+
+    # 当显式传入 model/tokenizer 路径时，优先从这些路径反推 jTrans 根目录，
+    # 避免 readidadata.py 导入失败。
+    if not _looks_like_jtrans_root(base):
+        for cand in (_infer_root_from_model(model), _infer_root_from_tokenizer(tokenizer), base_default):
+            if _looks_like_jtrans_root(cand):
+                base = cand
+                break
+
     return base, model, tokenizer
 
 
@@ -317,8 +367,12 @@ def _jtrans_tokens_from_asm(asm_path):
     try:
         from readidadata import parse_asm
     except Exception as e:
-        logger.error(f"jTrans解析模块加载失败: {e}")
-        return []
+        # 兼容 readidadata 未在当前 sys.path 暴露时的导入路径
+        try:
+            from detection_model.jTrans.readidadata import parse_asm
+        except Exception:
+            logger.error(f"jTrans解析模块加载失败: {e}")
+            return []
 
     tokens = []
     try:
@@ -417,9 +471,16 @@ def _safe_get_embedding(
 ):
     cache_key = (os.path.abspath(binary_path), addr_int)
     if safe_cache is not None:
-        emb_cache = safe_cache.setdefault("emb_cache", {})
-        if cache_key in emb_cache:
-            return emb_cache[cache_key]
+        cache_lock = safe_cache.setdefault("_cache_lock", threading.Lock())
+        with cache_lock:
+            emb_cache = safe_cache.get("emb_cache")
+            if not isinstance(emb_cache, OrderedDict):
+                emb_cache = OrderedDict(emb_cache or {})
+                safe_cache["emb_cache"] = emb_cache
+            if cache_key in emb_cache:
+                emb = emb_cache.pop(cache_key)
+                emb_cache[cache_key] = emb
+                return emb
 
     if session is None or get_functions is None:
         session, get_functions, _ephemeral = _get_safe_session(
@@ -427,23 +488,72 @@ def _safe_get_embedding(
         )
 
     if safe_cache is not None:
-        instr_cache = safe_cache.setdefault("instr_cache", {})
-        instr = instr_cache.get(cache_key)
+        cache_lock = safe_cache.setdefault("_cache_lock", threading.Lock())
+        with cache_lock:
+            instr_cache = safe_cache.get("instr_cache")
+            if not isinstance(instr_cache, OrderedDict):
+                instr_cache = OrderedDict(instr_cache or {})
+                safe_cache["instr_cache"] = instr_cache
+            instr = instr_cache.get(cache_key)
+            if instr is not None:
+                instr_cache.move_to_end(cache_key)
     else:
         instr = None
 
     if instr is None:
-        instr_list = get_functions(binary_path, addr_int)
+        infer_lock = safe_cache.setdefault("_infer_lock", threading.Lock()) if safe_cache is not None else None
+        if infer_lock is not None:
+            with infer_lock:
+                instr_list = get_functions(binary_path, addr_int)
+        else:
+            instr_list = get_functions(binary_path, addr_int)
         instr = instr_list[0] if instr_list else None
         if safe_cache is not None:
-            instr_cache[cache_key] = instr
+            cache_lock = safe_cache.setdefault("_cache_lock", threading.Lock())
+            with cache_lock:
+                instr_cache = safe_cache.get("instr_cache")
+                if not isinstance(instr_cache, OrderedDict):
+                    instr_cache = OrderedDict(instr_cache or {})
+                    safe_cache["instr_cache"] = instr_cache
+                instr_cache[cache_key] = instr
+                try:
+                    instr_cache_max = int(
+                        safe_cache.get("instr_cache_max", os.environ.get("SAFE_INSTR_CACHE_MAX", "2048"))
+                    )
+                except Exception:
+                    instr_cache_max = 2048
+                if instr_cache_max <= 0:
+                    instr_cache.clear()
+                else:
+                    while len(instr_cache) > instr_cache_max:
+                        instr_cache.popitem(last=False)
 
     if instr is None:
         return None
 
-    emb = session.get_embedding(instr, verbose=False)
+    infer_lock = safe_cache.setdefault("_infer_lock", threading.Lock()) if safe_cache is not None else None
+    if infer_lock is not None:
+        with infer_lock:
+            emb = session.get_embedding(instr, verbose=False)
+    else:
+        emb = session.get_embedding(instr, verbose=False)
     if safe_cache is not None:
-        emb_cache[cache_key] = emb
+        cache_lock = safe_cache.setdefault("_cache_lock", threading.Lock())
+        with cache_lock:
+            emb_cache = safe_cache.get("emb_cache")
+            if not isinstance(emb_cache, OrderedDict):
+                emb_cache = OrderedDict(emb_cache or {})
+                safe_cache["emb_cache"] = emb_cache
+            emb_cache[cache_key] = emb
+            try:
+                emb_cache_max = int(safe_cache.get("emb_cache_max", os.environ.get("SAFE_EMB_CACHE_MAX", "1024")))
+            except Exception:
+                emb_cache_max = 1024
+            if emb_cache_max <= 0:
+                emb_cache.clear()
+            else:
+                while len(emb_cache) > emb_cache_max:
+                    emb_cache.popitem(last=False)
     return emb
 
 def run_one(

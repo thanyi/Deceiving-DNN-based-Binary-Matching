@@ -354,7 +354,6 @@ class SafeRetriever(RetrievalBase):
         self.asm_work_dir = asm_work_dir
         self.retrieval_workers = int(retrieval_workers or 1)
         self.safe_cache: Dict = {}
-        self._thread_local = threading.local()
 
     def _get_worker_dir(self, cand_idx: int) -> Optional[str]:
         if not self.asm_work_dir:
@@ -366,12 +365,8 @@ class SafeRetriever(RetrievalBase):
         return worker_dir
 
     def _get_safe_cache(self) -> Dict:
-        if self.retrieval_workers > 1:
-            cache = getattr(self._thread_local, "safe_cache", None)
-            if cache is None:
-                cache = {}
-                self._thread_local.safe_cache = cache
-            return cache
+        # SAFE session/cache must be shared across workers to avoid repeated
+        # model loading and memory blow-up under multi-thread retrieval.
         return self.safe_cache
 
     def _get_query_addr(self, query: Dict, query_kind: str) -> int:

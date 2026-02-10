@@ -271,7 +271,12 @@ def _get_jtrans_session(model_dir, tokenizer_dir, use_gpu=True, jtrans_cache=Non
 
     try:
         import torch
-        from transformers import BertTokenizer, BertModel
+        try:
+            from transformers import BertTokenizer, BertModel
+        except Exception:
+            # 兼容部分 transformers 版本未在包根导出 Bert* 的情况
+            from transformers.models.bert.tokenization_bert import BertTokenizer
+            from transformers.models.bert.modeling_bert import BertModel
     except Exception as e:
         logger.error(f"jTrans依赖缺失: {e}")
         return None, None, None

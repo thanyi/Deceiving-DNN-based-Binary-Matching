@@ -936,6 +936,238 @@ class RLAgentRunner:
         }
 
 
+class GAAgentRunner:
+    def __init__(
+        self,
+        dataset_path: str,
+        save_path: str,
+        max_steps: int,
+        state_dim: int = 256,
+        detection_method: str = "asm2vec",
+        safe_checkpoint_dir: Optional[str] = None,
+        safe_i2v_dir: Optional[str] = None,
+        safe_use_gpu: bool = False,
+        jtrans_model_dir: Optional[str] = None,
+        jtrans_tokenizer_dir: Optional[str] = None,
+        jtrans_use_gpu: bool = False,
+        population_size: int = 6,
+        generations: int = 4,
+        elite_size: int = 2,
+        mutation_rate: float = 0.25,
+        crossover_rate: float = 0.70,
+        seq_len: int = 8,
+        loc_slots: int = 3,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.dataset_path = dataset_path
+        self.save_path = save_path
+        os.makedirs(self.save_path, exist_ok=True)
+        self.population_size = max(2, int(population_size))
+        self.generations = max(1, int(generations))
+        self.elite_size = max(1, int(elite_size))
+        self.mutation_rate = min(max(float(mutation_rate), 0.0), 1.0)
+        self.crossover_rate = min(max(float(crossover_rate), 0.0), 1.0)
+        self.seq_len = max(1, int(seq_len))
+        self.loc_slots = max(1, int(loc_slots))
+        self.rng = random.Random(seed)
+
+        self.env = BinaryPerturbationEnv(
+            save_path=self.save_path,
+            dataset_path=self.dataset_path,
+            sample_hold_interval=10**9,
+            max_steps=max_steps,
+            detection_method=detection_method,
+            safe_checkpoint_dir=safe_checkpoint_dir,
+            safe_i2v_dir=safe_i2v_dir,
+            safe_use_gpu=safe_use_gpu,
+            safe_cache_enabled=(detection_method == "safe"),
+            jtrans_model_dir=jtrans_model_dir,
+            jtrans_tokenizer_dir=jtrans_tokenizer_dir,
+            jtrans_use_gpu=jtrans_use_gpu,
+        )
+        self.env.target_score = 0.4
+        self.env.set_state_dim(state_dim)
+        print(
+            "[ASR] GA baseline loaded "
+            f"(pop={self.population_size}, gen={self.generations}, "
+            f"elite={self.elite_size}, mut={self.mutation_rate}, cross={self.crossover_rate}, "
+            f"seq_len={self.seq_len}, loc_slots={self.loc_slots})"
+        )
+
+    def _pin_sample(self, sample_idx: int) -> None:
+        sample = self.env.dataset[sample_idx]
+        self.env.current_sample_idx = sample_idx
+        self.env.current_sample_data = sample
+        self.env.episodes_on_current = 0
+        self.env.original_func_addr = None
+        self.env.original_binary = sample["binary_path"]
+        self.env.function_name = sample["func_name"]
+
+    def _reset_pinned_env(self, sample_idx: int) -> None:
+        self._pin_sample(sample_idx)
+        sample_id = self.env.idx_to_id.get(self.env.current_sample_idx)
+        if sample_id in self.env.sample_no_progress:
+            self.env.sample_no_progress[sample_id] = 0
+        self.env.episodes_on_current = 0
+        self.env.reset(force_switch=False)
+
+    def _valid_locs(self) -> List[int]:
+        mask = self.env.get_loc_mask(self.loc_slots)
+        valid = [i for i, m in enumerate(mask) if m]
+        return valid if valid else [0]
+
+    def _random_genome(self, genome_len: int, valid_locs: List[int]) -> List[Tuple[int, int]]:
+        genes: List[Tuple[int, int]] = []
+        for _ in range(genome_len):
+            genes.append(
+                (
+                    self.rng.choice(self.env.action_ids),
+                    self.rng.choice(valid_locs),
+                )
+            )
+        return genes
+
+    def _mutate_genome(self, genome: List[Tuple[int, int]], valid_locs: List[int]) -> List[Tuple[int, int]]:
+        mutated: List[Tuple[int, int]] = []
+        for action, loc_idx in genome:
+            if self.rng.random() < self.mutation_rate:
+                if self.rng.random() < 0.5:
+                    action = self.rng.choice(self.env.action_ids)
+                else:
+                    loc_idx = self.rng.choice(valid_locs)
+            mutated.append((action, loc_idx))
+        return mutated
+
+    def _crossover(
+        self, p1: List[Tuple[int, int]], p2: List[Tuple[int, int]]
+    ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+        if len(p1) <= 1 or self.rng.random() >= self.crossover_rate:
+            return list(p1), list(p2)
+        point = self.rng.randint(1, len(p1) - 1)
+        c1 = p1[:point] + p2[point:]
+        c2 = p2[:point] + p1[point:]
+        return c1, c2
+
+    def _select_parent(self, scored: List[Dict]) -> List[Tuple[int, int]]:
+        if len(scored) == 1:
+            return list(scored[0]["genome"])
+        a, b = self.rng.sample(scored, 2)
+        winner = a if a["fitness"] >= b["fitness"] else b
+        return list(winner["genome"])
+
+    def _evaluate_genome(self, sample_idx: int, genome: List[Tuple[int, int]], step_budget: int) -> Dict:
+        self._reset_pinned_env(sample_idx)
+        final_score = 1.0
+        final_binary = None
+        error = ""
+        steps_used = 0
+        done = False
+
+        for action, loc_idx in genome:
+            if steps_used >= step_budget:
+                break
+            _state, _reward, done, info = self.env.step(action, loc_idx)
+            steps_used += 1
+            if info.get("binary"):
+                final_binary = info["binary"]
+            if "score" in info:
+                final_score = float(info["score"])
+            if info.get("should_reset"):
+                error = str(info.get("error", "should_reset"))
+                break
+            if done:
+                break
+
+        success = final_score < self.env.target_score
+        fitness = 1.0 - final_score
+        if success:
+            fitness += 1.0
+        if error:
+            fitness -= 1.0
+        return {
+            "steps_used": steps_used,
+            "final_score": final_score,
+            "final_binary": final_binary,
+            "error": error,
+            "fitness": fitness,
+            "success": success,
+            "done": done,
+        }
+
+    def attack_sample(self, sample_idx: int, max_steps: int) -> Dict:
+        self._reset_pinned_env(sample_idx)
+        valid_locs = self._valid_locs()
+        genome_len = max(1, min(self.seq_len, int(max_steps)))
+        elite_size = min(self.elite_size, self.population_size - 1)
+        population = [
+            self._random_genome(genome_len, valid_locs) for _ in range(self.population_size)
+        ]
+        remaining_steps = max(1, int(max_steps))
+        total_steps = 0
+        best = {
+            "steps_used": 0,
+            "final_score": 1.0,
+            "final_binary": None,
+            "error": "ga_no_eval",
+            "fitness": -1.0,
+            "success": False,
+        }
+
+        print(f"[ASR-GA] Attack sample={sample_idx} func={self.env.function_name}")
+        for gen in range(self.generations):
+            if remaining_steps <= 0:
+                break
+            scored: List[Dict] = []
+            for genome in population:
+                if remaining_steps <= 0:
+                    break
+                eval_budget = min(genome_len, remaining_steps)
+                result = self._evaluate_genome(sample_idx, genome, eval_budget)
+                result["genome"] = genome
+                scored.append(result)
+                total_steps += result["steps_used"]
+                remaining_steps -= result["steps_used"]
+                if result["fitness"] > best["fitness"]:
+                    best = dict(result)
+                if result["success"]:
+                    break
+
+            if not scored:
+                break
+            scored.sort(key=lambda x: x["fitness"], reverse=True)
+            gen_best = scored[0]
+            print(
+                f"[ASR-GA] Gen {gen + 1}/{self.generations} "
+                f"best_score={gen_best['final_score']:.4f} "
+                f"fitness={gen_best['fitness']:.4f} "
+                f"remaining_steps={remaining_steps}"
+            )
+            if gen_best["success"]:
+                break
+
+            elites = [list(item["genome"]) for item in scored[:elite_size]]
+            next_population: List[List[Tuple[int, int]]] = list(elites)
+            while len(next_population) < self.population_size:
+                p1 = self._select_parent(scored)
+                p2 = self._select_parent(scored)
+                c1, c2 = self._crossover(p1, p2)
+                next_population.append(self._mutate_genome(c1, valid_locs))
+                if len(next_population) < self.population_size:
+                    next_population.append(self._mutate_genome(c2, valid_locs))
+            population = next_population[: self.population_size]
+
+        print(
+            f"[ASR-GA] Finished sample={sample_idx} steps={total_steps} "
+            f"final_score={best['final_score']} error={best['error']}"
+        )
+        return {
+            "steps_used": total_steps,
+            "final_score": float(best["final_score"]),
+            "final_binary": best.get("final_binary"),
+            "error": str(best.get("error", "")),
+        }
+
+
 def build_retriever(args: argparse.Namespace, save_path: str) -> RetrievalBase:
     asm_work_dir = os.path.join(save_path, "_retrieval_work")
     os.makedirs(asm_work_dir, exist_ok=True)
@@ -976,6 +1208,46 @@ def build_retriever(args: argparse.Namespace, save_path: str) -> RetrievalBase:
             log_every=args.retrieval_log_every,
         )
     raise ValueError(f"Unknown retrieval model: {args.retrieval_model}")
+
+
+def build_attack_runner(
+    args: argparse.Namespace,
+    dataset_path: str,
+    save_path: str,
+    max_steps: int,
+    retriever: RetrievalBase,
+):
+    common_kwargs = {
+        "dataset_path": dataset_path,
+        "save_path": save_path,
+        "max_steps": max_steps,
+        "detection_method": args.env_detection,
+        "safe_checkpoint_dir": getattr(retriever, "checkpoint_dir", None),
+        "safe_i2v_dir": getattr(retriever, "i2v_dir", None),
+        "safe_use_gpu": getattr(retriever, "use_gpu", False),
+        "jtrans_model_dir": args.jtrans_model_dir,
+        "jtrans_tokenizer_dir": args.jtrans_tokenizer_dir,
+        "jtrans_use_gpu": args.jtrans_use_gpu,
+    }
+    if args.attack_agent == "ppo":
+        return RLAgentRunner(
+            model_path=args.model_path,
+            use_gpu=args.use_gpu,
+            **common_kwargs,
+        )
+    if args.attack_agent == "ga":
+        return GAAgentRunner(
+            population_size=args.ga_population_size,
+            generations=args.ga_generations,
+            elite_size=args.ga_elite_size,
+            mutation_rate=args.ga_mutation_rate,
+            crossover_rate=args.ga_crossover_rate,
+            seq_len=args.ga_seq_len,
+            loc_slots=args.ga_loc_slots,
+            seed=args.ga_seed,
+            **common_kwargs,
+        )
+    raise ValueError(f"Unknown attack agent: {args.attack_agent}")
 
 
 def _apply_limit(
@@ -1048,7 +1320,6 @@ def _apply_limit(
 
 def run_asr_simple(
     dataset_path: str,
-    model_path: str,
     k: int,
     budget: int,
     limit: Optional[int],
@@ -1056,12 +1327,8 @@ def run_asr_simple(
     limit_seed: Optional[int],
     save_path: str,
     csv_path: str,
-    use_gpu: bool,
-    env_detection: str,
-    jtrans_model_dir: Optional[str],
-    jtrans_tokenizer_dir: Optional[str],
-    jtrans_use_gpu: bool,
     retriever: RetrievalBase,
+    runner,
 ) -> Tuple[float, List[Dict]]:
     dataset = load_dataset(dataset_path)
     dataset = _apply_limit(dataset, limit, limit_mode, limit_seed)
@@ -1070,20 +1337,6 @@ def run_asr_simple(
         f"[ASR] Dataset loaded: {dataset_path} samples={len(dataset)} "
         f"topk={k} budget={budget} retrieval={retriever.name} "
         f"limit={limit} mode={limit_mode}"
-    )
-    runner = RLAgentRunner(
-        dataset_path=dataset_path,
-        model_path=model_path,
-        save_path=save_path,
-        max_steps=budget,
-        use_gpu=use_gpu,
-        detection_method=env_detection,
-        safe_checkpoint_dir=getattr(retriever, "checkpoint_dir", None),
-        safe_i2v_dir=getattr(retriever, "i2v_dir", None),
-        safe_use_gpu=getattr(retriever, "use_gpu", False),
-        jtrans_model_dir=jtrans_model_dir,
-        jtrans_tokenizer_dir=jtrans_tokenizer_dir,
-        jtrans_use_gpu=jtrans_use_gpu,
     )
     print("[ASR] Environment ready. Start mutation.")
 
@@ -1208,7 +1461,6 @@ def run_asr_simple(
 
 def run_asr_multi_variant(
     dataset_path: str,
-    model_path: str,
     k: int,
     budget: int,
     limit: Optional[int],
@@ -1216,12 +1468,8 @@ def run_asr_multi_variant(
     limit_seed: Optional[int],
     save_path: str,
     csv_path: str,
-    use_gpu: bool,
-    env_detection: str,
-    jtrans_model_dir: Optional[str],
-    jtrans_tokenizer_dir: Optional[str],
-    jtrans_use_gpu: bool,
     retriever: RetrievalBase,
+    runner,
 ) -> Dict[str, float]:
     dataset = load_dataset(dataset_path)
     dataset = _apply_limit(dataset, limit, limit_mode, limit_seed)
@@ -1230,20 +1478,6 @@ def run_asr_multi_variant(
         f"[ASR-MV] Dataset loaded: {dataset_path} samples={len(dataset)} "
         f"topk={k} budget={budget} retrieval={retriever.name} "
         f"limit={limit} mode={limit_mode}"
-    )
-    runner = RLAgentRunner(
-        dataset_path=dataset_path,
-        model_path=model_path,
-        save_path=save_path,
-        max_steps=budget,
-        use_gpu=use_gpu,
-        detection_method=env_detection,
-        safe_checkpoint_dir=getattr(retriever, "checkpoint_dir", None),
-        safe_i2v_dir=getattr(retriever, "i2v_dir", None),
-        safe_use_gpu=getattr(retriever, "use_gpu", False),
-        jtrans_model_dir=jtrans_model_dir,
-        jtrans_tokenizer_dir=jtrans_tokenizer_dir,
-        jtrans_use_gpu=jtrans_use_gpu,
     )
     print("[ASR-MV] Environment ready. Start mutation.")
 
@@ -1740,6 +1974,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Log candidate scoring every N items (0 disables).",
     )
+    parser.add_argument(
+        "--attack-agent",
+        choices=["ppo", "ga"],
+        default="ppo",
+        help="Mutation attacker: PPO policy or GA baseline.",
+    )
+    parser.add_argument("--ga-population-size", type=int, default=6)
+    parser.add_argument("--ga-generations", type=int, default=4)
+    parser.add_argument("--ga-elite-size", type=int, default=2)
+    parser.add_argument("--ga-mutation-rate", type=float, default=0.25)
+    parser.add_argument("--ga-crossover-rate", type=float, default=0.70)
+    parser.add_argument("--ga-seq-len", type=int, default=8)
+    parser.add_argument("--ga-loc-slots", type=int, default=3)
+    parser.add_argument("--ga-seed", type=int, default=None)
     parser.add_argument("--gmn-checkpoint-dir", default=None)
     parser.add_argument("--gmn-features-json", default=None)
     parser.add_argument("--gmn-dataset", default="one", choices=["one", "two", "vuln"])
@@ -1769,11 +2017,18 @@ def main() -> None:
             args.jtrans_tokenizer_dir = os.path.join(jtrans_root, "jtrans_tokenizer")
 
     retriever = build_retriever(args, args.save_path)
+    runner = build_attack_runner(
+        args=args,
+        dataset_path=args.dataset,
+        save_path=args.save_path,
+        max_steps=args.budget,
+        retriever=retriever,
+    )
     print(f"[ASR] Retrieval model: {retriever.name}")
+    print(f"[ASR] Attack agent: {args.attack_agent}")
     if args.mode == "single":
         asr, rows = run_asr_simple(
             dataset_path=args.dataset,
-            model_path=args.model_path,
             k=args.topk,
             budget=args.budget,
             limit=args.limit,
@@ -1781,12 +2036,8 @@ def main() -> None:
             limit_seed=args.limit_seed,
             save_path=args.save_path,
             csv_path=csv_path,
-            use_gpu=args.use_gpu,
-            env_detection=args.env_detection,
-            jtrans_model_dir=args.jtrans_model_dir,
-            jtrans_tokenizer_dir=args.jtrans_tokenizer_dir,
-            jtrans_use_gpu=args.jtrans_use_gpu,
             retriever=retriever,
+            runner=runner,
         )
 
         print(f"ASR@{args.topk}: {asr:.4f} ({sum(r['success'] for r in rows)}/{len(rows)})")
@@ -1794,7 +2045,6 @@ def main() -> None:
     else:
         run_asr_multi_variant(
             dataset_path=args.dataset,
-            model_path=args.model_path,
             k=args.topk,
             budget=args.budget,
             limit=args.limit,
@@ -1802,12 +2052,8 @@ def main() -> None:
             limit_seed=args.limit_seed,
             save_path=args.save_path,
             csv_path=csv_path,
-            use_gpu=args.use_gpu,
-            env_detection=args.env_detection,
-            jtrans_model_dir=args.jtrans_model_dir,
-            jtrans_tokenizer_dir=args.jtrans_tokenizer_dir,
-            jtrans_use_gpu=args.jtrans_use_gpu,
             retriever=retriever,
+            runner=runner,
         )
 
 

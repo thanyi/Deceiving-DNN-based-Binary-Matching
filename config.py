@@ -65,9 +65,15 @@ diversification_description = \
 #  7: insert garbage code
 #  8: transform equivalent instructions
 #  9: inline functions
-# 10: merge basic blocks"""
+# 10: merge basic blocks
+# 11: opaque obfuscation on basic blocks (gen2)
+# 12: intra-function state-machine flatten
+# 13: unconditional-edge trampoline split
+# 14: branch inversion + explicit fallthrough
+# 15: critical-edge-style trampoline split
+# 16: opaque diamond cfg-storm"""
 diversification_mode = 0
-all_diver_modes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,11]
+all_diver_modes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 # None denotes random junk code, the level of slow down running junk code is 0-3, 0 means no additional junk code
 junk_code_level = 3
 
@@ -85,7 +91,12 @@ diver_classes = [
     diversification.instr_replace_diversify,
     diversification.func_inline_diversify,
     diversification.bb_merge_diversify,
-    diversification.bb_opaque_diversify_gen2
+    diversification.bb_opaque_diversify_gen2,
+    diversification.func_state_flatten_diversify,
+    diversification.cfg_uncond_trampoline_diversify,
+    diversification.bb_branch_invert_diversify,
+    diversification.cfg_edge_split_diversify,
+    diversification.bb_opaque_cfgstorm_diversify
 ]
 
 

@@ -20,7 +20,8 @@ import ast
 from argparse import ArgumentParser, RawTextHelpFormatter
 import time
 from loguru import logger
-# from run_utils import run_one, train_pickle
+from run_utils import run_one, train_pickle
+# from run_utils import train_pickle
 
 SURVIVIE = 1 
 TARGET = 0.40 
@@ -61,20 +62,31 @@ def generate(seed,save_bin_folder,mode,F_mode,function_name,tmp_bin = tmp_bin_na
     logger.debug("uroboros cmd is :"+" ".join(p))
     s = check_output(p) # 执行命令，生成变异二进制文件
     logger.info('check_output function runs successfully!')
+    logger.debug(f'tmp_bin = {tmp_bin}, which is exists: {os.path.exists(tmp_bin)}')
+
     h = hashlib.md5(open(tmp_bin, 'rb').read()).hexdigest() # 计算变异二进制文件的hash值
+    logger.debug(f'save_bin_folder = {save_bin_folder}')
     ctr = 1 
     if not os.path.exists(save_bin_folder+"/"+str(h)+"_container/"):
-        os.system("mv "+save_bin_folder+"/tmp/"+" "+save_bin_folder+"/"+str(h)+"_container/")
-        os.system("mv "+tmp_bin+" "+save_bin_folder+"/"+str(h)+"_container/"+str(h))
+        logger.info('first hash! mv the generated tmp dir to xxx_container dir...')
+        cmd_1 = "mv "+save_bin_folder+"/tmp/"+" "+save_bin_folder+"/"+str(h)+"_container/"
+        cmd_2 = "mv "+tmp_bin+" "+save_bin_folder+"/"+str(h)+"_container/"+str(h)
+        logger.debug(f'after first generate, cmd_1 = {cmd_1}')
+        logger.debug(f'after first generate, cmd_2 = {cmd_2}')
+        # input('...')
+        os.system(cmd_1)
+        # input(f"finish {cmd_1}")
+        os.system(cmd_2)
+        # input(f"finish {cmd_2}")
         return save_bin_folder+"/"+str(h)+"_container/"+str(h)
-    else:
+    else:       # 如果存在产生相同的hash值
         saved_flag = False 
         while saved_flag == False:
             h_tmp = str(h)+"_ctr"+str(ctr)
             if not os.path.exists(save_bin_folder+"/"+str(h_tmp)+"_container/"):
                 os.system("mv "+save_bin_folder+"/tmp/"+" "+save_bin_folder+"/"+str(h_tmp)+"_container/")
                 os.system("mv "+tmp_bin+" "+save_bin_folder+"/"+str(h_tmp)+"_container/"+str(h_tmp))
-                saved_flag == True 
+                saved_flag = True 
                 return save_bin_folder+"/"+str(h_tmp)+"_container/"+str(h_tmp)
             else:
                 ctr += 1 
@@ -142,8 +154,8 @@ def wrapper(MAIN_SEED,SAVE_PATH,function_name):
     open_path(SAVE_PATH)
 
     # 定义可用的变异模式
-    # no use 0 , 4, 10 
-    diversification = [1,2,3,4,5,7,8,9,10,11]
+    # no use 0 , 4, 10 (10 causes symbol redefinition errors)
+    diversification = [1,2,3,5,7,8,9,11]
 
     # 检查是否已经找到成功的对抗样本
     if os.path.isfile(SAVE_PATH+"/bypassed.log") == True:
@@ -202,12 +214,14 @@ def wrapper(MAIN_SEED,SAVE_PATH,function_name):
                 i = random.choice(diversification)  # 随机选出一种变异策略i
                 try:
                     logger.info(f"now the action idx is {i}")
-                    # 生成一个新的二进制文件，返回文件hash值
+                    logger.info(f"first generate start ...")
+                    # 生成一个新的二进制文件，返回变异文件的路径
                     hash_ = generate(MAIN_SEED,SAVE_PATH,i,'original',function_name=function_name,iter=1)
-                    logger.info('generate a new binary! generate func done.')
+                    logger.info('first generate end ... generate a new binary!')
+                    input("wait for mutated generation...")
                     if len(generation_dict.keys())==0:
-                        generation_dict[MAIN_SEED] = 0
-                        generation_dict[hash_] = 1
+                        generation_dict[MAIN_SEED] = 0  # 原始文件路径
+                        generation_dict[hash_] = 1      # 变异文件路径
                         operand_dict[MAIN_SEED] = []
                         operand_dict[hash_] = [i]
                         cur_gen = 1
@@ -245,7 +259,7 @@ def wrapper(MAIN_SEED,SAVE_PATH,function_name):
         df['operand'] = operand
         df.to_csv(SAVE_PATH+'/record_step_'+str(NUM_GEN)+'.csv')
         run_pickle(SAVE_PATH,step_size =NUM_GEN)
-        
+        # 到此首次变异结束
         logger.info("[+] Finished initial corpus generation ")
 
         bypassed = False 
@@ -253,18 +267,19 @@ def wrapper(MAIN_SEED,SAVE_PATH,function_name):
         score_list = []
         grad_list = []
         xx = pd.read_csv(SAVE_PATH+'/record_pickle_'+str(NUM_GEN)+'.csv')
-        for items in gen_1:
+        for items in gen_1: # 变异文件的路径列表
             #get id 
             id_ = xx[xx['output']==items].index.values[0]
             checkdict = ast.literal_eval(xx['mapping_symm'].iloc[id_])
-            logger.debug(f'args in run_one function: MAIN_SEED = {MAIN_SEED}, items = {items}, model_original = {model_original}, \
-                         checkdict = {checkdict}, function_name = {function_name}')
+            # logger.debug(f'args in run_one function: MAIN_SEED = {MAIN_SEED}, items = {items}, model_original = {model_original}, \
+            #              checkdict = {checkdict}, function_name = {function_name}')
             score,grad = run_one(MAIN_SEED,items,model_original,checkdict,function_name)
             if score is None or grad is None:
                 logger.warning(f"run_one returned None values, skipping sample: {items}")
                 continue
             grad = abs(grad)
             score = abs(score)
+            logger.debug(f'run_one done!')
             # run checker 
             # if works, quit 
             # if score <TARGET:
@@ -275,16 +290,22 @@ def wrapper(MAIN_SEED,SAVE_PATH,function_name):
             # elif score!= None :
             score_list.append(score)
             grad_list.append(grad)
-        if bypassed == False :
+        if bypassed == False and len(gen_1) > 0:    # 给变异文件列表对应的score_list和grad_list返回最好的五个值
+            logger.info(f'ret_top5 start ...')
             gen_1,score_list,grad_list = ret_top5(gen_1,score_list,grad_list,SAVE_PATH,NUM_GEN,metric='score_list')
+            logger.info(f'ret_top5 end !')
             gen_1= gen_1.tolist()
             score_list= score_list.tolist()
             grad_list = grad_list.tolist()
-            gen_1 = [gen_1[0]]
-            score_list = [score_list[0]]
-            grad_list = [grad_list[0]]
+            if len(gen_1) > 0:
+                gen_1 = [gen_1[0]]
+                score_list = [score_list[0]]
+                grad_list = [grad_list[0]]
+            else:
+                logger.error("No valid mutants generated, cannot continue")
+                return seed_of_output,output,generation,operand,""
         tmp_gen = []
-        if bypassed == False :
+        if bypassed == False and len(gen_1) > 0:
             for i in range(0,NUM_GEN):
                 cur_gen = 0
                 cur_op = ""
@@ -307,7 +328,10 @@ def wrapper(MAIN_SEED,SAVE_PATH,function_name):
                             fmode = 'original'
                         else:
                             fmode = 'mutated'
+                        logger.info(f're generate func start ...')
                         hash_ = generate(seed,SAVE_PATH,mode,fmode,function_name=function_name,iter=iter_)
+                        logger.info(f're generate func end ...')
+                        # input("wait for other generation 2...")
                         # consider the initailization case 
                         if len(generation_dict.keys())==0:
                             generation_dict[seed] = 0
@@ -367,8 +391,8 @@ def wrapper(MAIN_SEED,SAVE_PATH,function_name):
                                 gen_1 = [items]
                                 score_list = [score]
                                 grad_list = [grad]
-                            elif fail_ctr > 10 and grad > 0 :
-                                # let it go 
+                            elif fail_ctr > 5 and grad > 0 :
+                                # let it go - reduced threshold from 10 to 5
                                 if score<score_max:
                                     gen_max = items 
                                     score_max = score
@@ -377,6 +401,19 @@ def wrapper(MAIN_SEED,SAVE_PATH,function_name):
                                 gen_1 = [gen_max]
                                 score_list = [score_max]
                                 grad_list = [grad_max]
+                            elif fail_ctr > 15:
+                                # Force exit if too many failures, even with poor gradient
+                                logger.warning(f"Force exit after {fail_ctr} failures")
+                                if gen_max is not None:
+                                    gen_1 = [gen_max]
+                                    score_list = [score_max]
+                                    grad_list = [grad_max]
+                                else:
+                                    # Use current sample if no better one found
+                                    gen_1 = [items]
+                                    score_list = [score]
+                                    grad_list = [grad]
+                                pass_flag = True
                             else:
                                 if grad>0:
                                     if score<score_max:
@@ -385,8 +422,13 @@ def wrapper(MAIN_SEED,SAVE_PATH,function_name):
                                         grad_max = grad
                                 fail_ctr +=1 
                                 score = None
-                    except:
-                        pass 
+                    except Exception as e:
+                        logger.error(f"Error in mutation generation: {e}")
+                        input("wait for other generation 3...")
+                        fail_ctr += 1
+                        if fail_ctr > 20:  # Ultimate safety valve
+                            logger.error("Too many consecutive failures, breaking out of loop")
+                            pass_flag = True 
                 tmp_gen = []
                 gen_1,score_list,grad_list = ret_top5(gen_1,score_list,grad_list,SAVE_PATH,NUM_GEN)
                 gen_1= gen_1.tolist()

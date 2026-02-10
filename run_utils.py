@@ -17,6 +17,8 @@ import hashlib
 import time
 import tempfile
 import shutil
+import threading
+from collections import OrderedDict
 
 # Force transformers to skip TensorFlow; also drop any broken placeholder module.
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -259,11 +261,13 @@ def _get_jtrans_session(model_dir, tokenizer_dir, use_gpu=True, jtrans_cache=Non
         del sys.modules["tensorflow"]
     if jtrans_cache is not None:
         key = (model_dir, tokenizer_dir, bool(use_gpu))
-        model = jtrans_cache.get("model")
-        tokenizer = jtrans_cache.get("tokenizer")
-        device = jtrans_cache.get("device")
-        if model is not None and tokenizer is not None and jtrans_cache.get("session_key") == key:
-            return model, tokenizer, device
+        session_lock = jtrans_cache.setdefault("_session_lock", threading.Lock())
+        with session_lock:
+            model = jtrans_cache.get("model")
+            tokenizer = jtrans_cache.get("tokenizer")
+            device = jtrans_cache.get("device")
+            if model is not None and tokenizer is not None and jtrans_cache.get("session_key") == key:
+                return model, tokenizer, device
 
     try:
         import torch
@@ -284,11 +288,23 @@ def _get_jtrans_session(model_dir, tokenizer_dir, use_gpu=True, jtrans_cache=Non
     model.to(device)
     tokenizer = BertTokenizer.from_pretrained(tokenizer_dir)
     if jtrans_cache is not None:
-        jtrans_cache["model"] = model
-        jtrans_cache["tokenizer"] = tokenizer
-        jtrans_cache["device"] = device
-        jtrans_cache["session_key"] = (model_dir, tokenizer_dir, bool(use_gpu))
-        jtrans_cache.setdefault("emb_cache", {})
+        session_lock = jtrans_cache.setdefault("_session_lock", threading.Lock())
+        with session_lock:
+            jtrans_cache["model"] = model
+            jtrans_cache["tokenizer"] = tokenizer
+            jtrans_cache["device"] = device
+            jtrans_cache["session_key"] = (model_dir, tokenizer_dir, bool(use_gpu))
+            emb_cache = jtrans_cache.get("emb_cache")
+            if not isinstance(emb_cache, OrderedDict):
+                emb_cache = OrderedDict(emb_cache or {})
+                jtrans_cache["emb_cache"] = emb_cache
+            try:
+                emb_cache_max = int(
+                    jtrans_cache.get("emb_cache_max", os.environ.get("JTRANS_EMB_CACHE_MAX", "512"))
+                )
+            except Exception:
+                emb_cache_max = 512
+            jtrans_cache["emb_cache_max"] = max(0, emb_cache_max)
     return model, tokenizer, device
 
 
@@ -331,9 +347,16 @@ def _jtrans_embed_from_asm(asm_path, model, tokenizer, device, jtrans_cache=None
     if jtrans_cache is not None:
         try:
             cache_key = (os.path.abspath(asm_path), os.path.getmtime(asm_path))
-            emb_cache = jtrans_cache.setdefault("emb_cache", {})
-            if cache_key in emb_cache:
-                return emb_cache[cache_key]
+            cache_lock = jtrans_cache.setdefault("_cache_lock", threading.Lock())
+            with cache_lock:
+                emb_cache = jtrans_cache.get("emb_cache")
+                if not isinstance(emb_cache, OrderedDict):
+                    emb_cache = OrderedDict(emb_cache or {})
+                    jtrans_cache["emb_cache"] = emb_cache
+                if cache_key in emb_cache:
+                    emb = emb_cache.pop(cache_key)
+                    emb_cache[cache_key] = emb
+                    return emb
         except Exception:
             cache_key = None
 
@@ -356,7 +379,24 @@ def _jtrans_embed_from_asm(asm_path, model, tokenizer, device, jtrans_cache=None
         emb = output.pooler_output[0].detach().cpu().numpy()
 
     if jtrans_cache is not None and cache_key is not None:
-        jtrans_cache.setdefault("emb_cache", {})[cache_key] = emb
+        cache_lock = jtrans_cache.setdefault("_cache_lock", threading.Lock())
+        with cache_lock:
+            emb_cache = jtrans_cache.get("emb_cache")
+            if not isinstance(emb_cache, OrderedDict):
+                emb_cache = OrderedDict(emb_cache or {})
+                jtrans_cache["emb_cache"] = emb_cache
+            emb_cache[cache_key] = emb
+            try:
+                emb_cache_max = int(
+                    jtrans_cache.get("emb_cache_max", os.environ.get("JTRANS_EMB_CACHE_MAX", "512"))
+                )
+            except Exception:
+                emb_cache_max = 512
+            if emb_cache_max <= 0:
+                emb_cache.clear()
+            else:
+                while len(emb_cache) > emb_cache_max:
+                    emb_cache.popitem(last=False)
     return emb
 
 

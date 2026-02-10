@@ -218,6 +218,7 @@ a label or an address range of data section to exclude from symbol search""")
     p.add_argument('-t', '--target_addr', type=str, default="", help='target address of one of the top critical blocks')
 
     args = p.parse_args()
+    args.folder = os.path.realpath(args.folder)
     filepath = os.path.realpath(args.binary)
     outpath = os.path.realpath(args.output) if args.output is not None else None
     exclude = os.path.realpath(args.exclude) if len(args.exclude) > 0 else ''
@@ -240,8 +241,14 @@ a label or an address range of data section to exclude from symbol search""")
     # 【日志优化】注释掉详细的参数日志
     # logger.debug("[uroboros_automate-func-name.py:main]: args.binary = {}," \
     #                         " args.mode = {}, args.function = {}".format(args.binary, args.mode, args.function))
+    # Prefer per-run workdir under args.folder to avoid collisions across experiments.
+    work_root = os.environ.get('UROBOROS_WORKDIR_ROOT', args.folder)
+    work_root = os.path.realpath(work_root)
+    if not os.path.isabs(work_root):
+        work_root = os.path.abspath(work_root)
+    open_path(work_root)
     for i in range(1, num_iteration + 1):
-        workdir = abs_path + '/workdir_' + str(i)
+        workdir = os.path.join(work_root, 'workdir_' + str(i))
         if not os.path.isdir(workdir):
             os.mkdir(workdir)
         # 【日志优化】注释掉工作目录日志

@@ -213,7 +213,8 @@ def inference_ppo(args):
     device = 'cuda' if torch.cuda.is_available() and args.use_gpu else 'cpu'
     agent = PPOAgent(
         state_dim=args.state_dim,
-        n_actions=7,
+        n_actions=env.n_actions,
+        action_map=list(env.action_ids),
         device=device
     )
     agent.load(args.model_path)
@@ -509,7 +510,8 @@ def evaluate_dataset(args):
     device = 'cuda' if torch.cuda.is_available() and args.use_gpu else 'cpu'
     agent = PPOAgent(
         state_dim=args.state_dim,
-        n_actions=7,
+        n_actions=env.n_actions,
+        action_map=list(env.action_ids),
         device=device
     )
     agent.load(args.model_path)

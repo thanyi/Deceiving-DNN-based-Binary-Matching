@@ -12,14 +12,13 @@ import glob
 
 # ================= 配置区域 =================
 # 数据集根目录 (二进制)
-DATA_ROOT = "/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/coreutils/bin"
+DATA_ROOT = "/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/diffutils/bin"
 
-# 源码目录根路径
-SOURCE_ROOT = "/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/coreutils/src"
+# 源码目录根路径 (可选, 没有也能跑)
+SOURCE_ROOT = "/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/diffutils/src"
 
-# 测试集版本
-TEST_VERSIONS = ["8.30", "8.32"]
-VAL_RATIO = 0.1
+# 输出 JSON (单文件)
+OUTPUT_JSON = "/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/diffutils/dataset_all.json"
 
 MIN_INSTR = 15
 MAX_INSTR = 800
@@ -170,8 +169,7 @@ def extract_valid_functions(binary_path):
         return []
 
 def main():
-    train_pool = []
-    test_pool = []
+    all_pool = []
     
     dirs = [d for d in os.listdir(DATA_ROOT) if os.path.isdir(os.path.join(DATA_ROOT, d))]
     dirs.sort()
@@ -191,8 +189,6 @@ def main():
             if not user_funcs_whitelist:
                 # 没有源码就降级为仅靠黑名单/尺寸过滤
                 pass
-
-            is_test_version = version in TEST_VERSIONS
 
             for bin_file in os.listdir(folder_path):
                 bin_path = os.path.join(folder_path, bin_file)
@@ -220,10 +216,7 @@ def main():
                         "id": hashlib.md5(f"{bin_path}_{func_name}".encode()).hexdigest()[:8]
                     }
 
-                    if is_test_version:
-                        test_pool.append(sample)
-                    else:
-                        train_pool.append(sample)
+                    all_pool.append(sample)
     else:
         # 模式2：单层二进制文件夹（如 BinaryCorp-3M/small_train）
         bin_files = [f for f in os.listdir(DATA_ROOT) if os.path.isfile(os.path.join(DATA_ROOT, f))]
@@ -238,7 +231,6 @@ def main():
 
             opt = parse_opt_level(bin_file)
             version = "unknown"
-            is_test_version = version in TEST_VERSIONS
             pbar.set_description(f"Flat | Opt: {opt}")
 
             funcs = extract_valid_functions(bin_path)
@@ -256,60 +248,23 @@ def main():
                     "id": hashlib.md5(f"{bin_path}_{func_name}".encode()).hexdigest()[:8]
                 }
 
-                if is_test_version:
-                    test_pool.append(sample)
-                else:
-                    train_pool.append(sample)
-
-    # 划分验证集
-    if flat_mode:
-        # 单层模式按 binary 切分，避免同一 binary 的函数泄漏到 val
-        by_binary = {}
-        for sample in train_pool:
-            by_binary.setdefault(sample["binary_path"], []).append(sample)
-
-        binary_keys = list(by_binary.keys())
-        random.shuffle(binary_keys)
-
-        if len(binary_keys) <= 1:
-            val_binary_keys = set()
-        else:
-            val_binary_size = int(len(binary_keys) * VAL_RATIO)
-            val_binary_size = max(1, val_binary_size)
-            val_binary_keys = set(binary_keys[:val_binary_size])
-
-        val_pool = []
-        final_train_pool = []
-        for bkey in binary_keys:
-            bucket = by_binary[bkey]
-            if bkey in val_binary_keys:
-                val_pool.extend(bucket)
-            else:
-                final_train_pool.extend(bucket)
-    else:
-        random.shuffle(train_pool)
-        val_size = int(len(train_pool) * VAL_RATIO)
-        val_pool = train_pool[:val_size]
-        final_train_pool = train_pool[val_size:]
+                all_pool.append(sample)
     
     print("\n" + "="*40)
     print(f"Summary:")
-    print(f"  Training Samples:   {len(final_train_pool)}")
-    print(f"  Validation Samples: {len(val_pool)}")
-    print(f"  Testing Samples:    {len(test_pool)}")
+    print(f"  Total Samples: {len(all_pool)}")
     print("="*40)
     
-    os.makedirs("fast_0128", exist_ok=True)
-    with open("fast_0128/dataset_train.json", "w") as f: json.dump(final_train_pool, f, indent=2)
-    with open("fast_0128/dataset_val.json", "w") as f: json.dump(val_pool, f, indent=2)
-    with open("fast_0128/dataset_test.json", "w") as f: json.dump(test_pool, f, indent=2)
+    os.makedirs(os.path.dirname(OUTPUT_JSON), exist_ok=True)
+    with open(OUTPUT_JSON, "w") as f:
+        json.dump(all_pool, f, indent=2)
 
     # os.makedirs("fast", exist_ok=True)
     # with open("/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/BinaryCorp-3M/dataset_train.json", "w") as f: json.dump(final_train_pool, f, indent=2)
     # with open("/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/BinaryCorp-3M/dataset_val.json", "w") as f: json.dump(val_pool, f, indent=2)
     # with open("/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/rl_framework/datasets/BinaryCorp-3M/dataset_test.json", "w") as f: json.dump(test_pool, f, indent=2)
 
-    print(f"[+] Done.")
+    print(f"[+] Done: {OUTPUT_JSON}")
 
 if __name__ == "__main__":
     main()

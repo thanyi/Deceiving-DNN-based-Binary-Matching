@@ -42,7 +42,7 @@ def func_addr(filename, count, fexclude=''):
     blacklist = ['__libc_csu_init', '__libc_csu_fini', '__i686.get_pc_thunk.bx', '__do_global_ctors_aux', '_start', '__do_global_dtors_aux', 'frame_dummy']
     addrs = []
     addrs_2 = []
-    regex = re.compile(r'S_(0x[0-9A-F]{7})', re.I)
+    regex = re.compile(r'S_(0x[0-9A-F]+)', re.I)
     regex1 = re.compile(r'<(.*)>:', re.I)
 
     for fn in fnl:

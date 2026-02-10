@@ -23,8 +23,11 @@ from disasm import pre_process
 from disasm.disassemble_process import Disam
 from postprocess import post_process, post_process_lib, post_process_data
 import logging
+import subprocess
+import json
+import os
+import sys
 logger = logging.getLogger(__name__)
-
 class Ail(object):
     """
     Processing skeleton
@@ -126,26 +129,30 @@ class Ail(object):
         """
         pre_process.main()
 
-    def instrProcess(self, instrument=False, docfg=False,specific_function=None):
+    def instrProcess(self, instrument=False, docfg=False,specific_function=None,target_addr=None):
         """
         Process instructions
         :param instrument: True to apply instrumentations
         :param docfg: True to evaluate control flow graph
+        :param specific_function: diversify specific function
+        :param target_addr: target address of one of the top critical blocks
         """
         logger.info("[ail.py:instrProcess]: in instrProcess .. ")
         self.pre_process()
         logger.info("[ail.py:instrProcess]:  self.pre_process() done .. ")
-        logger.debug("[ail.py:instrProcess]: self.file = {}, self.funcs = {}, self.secs = {}".format(self.file, self.funcs, self.secs))
+        # 【日志优化】注释掉详细的 funcs 和 secs 列表日志
+        # logger.debug("[ail.py:instrProcess]: self.file = {}, self.funcs = {}, self.secs = {}".format(self.file, self.funcs, self.secs))
         il, fl, re = Disam.disassemble(self.file, self.funcs, self.secs)
         logger.info("[ail.py:instrProcess]: 3: ANALYSIS ... ")
-        logger.debug("[ail.py:instrProcess]: fl = {}".format(fl))
+        # 【日志优化】fl 可能包含大量函数信息，注释掉
+        # logger.debug("[ail.py:instrProcess]: fl = {}".format(fl))
         print colored('3: ANALYSIS', 'green')
         fbl, bbl, cfg_t, cg, il, re = Analysis.analyze(il, fl, re, docfg)  # @UnusedVariable
         
         ####################################################
         u_funcs = filter(lambda f: f.is_lib is False, fl)
-        logger.info("[ail.py:instrProcess]: Available user functions (total {}): {}".format(
-            len(u_funcs), u_funcs))  
+        # print "[ail.py:instrProcess]: Available user functions (total {}): {}".format(
+        #     len(u_funcs), u_funcs)
         il_ = il
         if specific_function != None :
             arr = []
@@ -167,8 +174,8 @@ class Ail(object):
                 available_funcs = [str(f) for f in u_funcs[:10]]  # 只显示前10个
                 error_msg = 'Function not found: {}. Available functions (showing first 10): {}'.format(
                     specific_function, available_funcs)
-                logger.error("[ail.py:instrProcess]: " + error_msg)
-                raise Exception('Fail: Function not found: {}'.format(specific_function)) 
+                logger.warning("[ail.py:instrProcess]: " + error_msg + ". Fallback to all user functions.")
+                # 继续使用原始 u_funcs，避免直接失败
 
         #print(u_funcs)
         # u_funcs = [S_0x80499A6@0x80499A6-0x8049BEF] OR [set_suffix_length@0x804985D-0x8049A4A]
@@ -194,8 +201,9 @@ class Ail(object):
         diversify_class = config.diver_classes[config.diversification_mode]
         if diversify_class is not None:
             div = diversify_class(funcs=u_funcs, fb_tbl=fbl, cfg_tbl=cfg_t)
-            il_ = div.visit(il_)
-
+            print "[ail.py:instrProcess]: target_addr = ", target_addr
+            il_ = div.visit(il_, target_addr)
+            
         if instrument:
             print colored('4: INSTRUMENTATION', 'green')
             logger.info("[ail.py:instrProcess]: 4: INSTRUMENTATION ... ")
@@ -204,6 +212,7 @@ class Ail(object):
 
         print colored(('5' if instrument else '4') + ': POST-PROCESSING', 'green')
         logger.info("[ail.py:instrProcess]: %s: POST-PROCESSING ... ",('5' if instrument else '4'))
-        logger.debug("[ail.py:instrProcess]: il_ = {}".format(il_))
+        # 【日志优化】il_ 是完整的指令列表，可能非常大，注释掉
+        # logger.debug("[ail.py:instrProcess]: il_ = {}".format(il_))
         Analysis.post_analyze(il_, re)
         self.post_process(instrument)

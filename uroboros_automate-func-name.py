@@ -16,7 +16,12 @@ import pickle
 import gen_address_mapping
 import pickle_gen_mapping
 
-log_file_path = '/home/ycy/ours/Deceiving-DNN-based-Binary-Matching/log/uroboro.log'
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_default_log_path = os.path.join(_script_dir, 'log', 'uroboro.log')
+log_file_path = os.environ.get('UROBORO_LOG_PATH', _default_log_path)
+_log_dir = os.path.dirname(log_file_path)
+if _log_dir and not os.path.exists(_log_dir):
+    os.makedirs(_log_dir)
 # 【日志优化】将级别从 DEBUG 改为 INFO，减少冗余日志输出
 logging.basicConfig(filename=log_file_path,
                     level=logging.INFO,  # 从 DEBUG 改为 INFO

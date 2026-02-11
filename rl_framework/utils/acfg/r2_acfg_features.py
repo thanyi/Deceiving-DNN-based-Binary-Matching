@@ -145,6 +145,10 @@ class RadareACFGExtractor:
             degree = {n: 0 for n in G.nodes()}
 
         dominator_scores = {n: 0 for n in G.nodes()}
+        postdominator_scores = {n: 0 for n in G.nodes()}
+        loop_scores = {n: 0 for n in G.nodes()}
+        control_dependence_scores = {n: 0 for n in G.nodes()}
+        in_loop_flags = {n: 0.0 for n in G.nodes()}
         try:
             if entry_node is not None:
                 idom = nx.immediate_dominators(G, entry_node)
@@ -156,6 +160,71 @@ class RadareACFGExtractor:
                         dominator_scores[node] = len(nx.descendants(dom_tree, node))
         except: pass
 
+        # 基于逆图计算 post-dominator 与控制依赖强度
+        try:
+            exit_nodes = [n for n in G.nodes() if G.out_degree(n) == 0]
+            if exit_nodes:
+                rg = G.reverse(copy=True)
+                virtual_exit = "__virtual_exit__"
+                rg.add_node(virtual_exit)
+                for n in exit_nodes:
+                    rg.add_edge(virtual_exit, n)
+
+                ipdom = nx.immediate_dominators(rg, virtual_exit)
+                pdom_tree = nx.DiGraph()
+                for node, pdom in ipdom.items():
+                    if node == virtual_exit:
+                        continue
+                    if pdom in G.nodes() and node in G.nodes() and node != pdom:
+                        pdom_tree.add_edge(pdom, node)
+
+                for node in G.nodes():
+                    if node in pdom_tree:
+                        postdominator_scores[node] = len(nx.descendants(pdom_tree, node))
+
+                # 近似控制依赖：分支节点沿 postdom 链传播影响
+                for src in G.nodes():
+                    succs = list(G.successors(src))
+                    if len(succs) <= 1:
+                        continue
+                    src_ipdom = ipdom.get(src)
+                    for succ in succs:
+                        cur = succ
+                        seen = set()
+                        while (
+                            cur is not None
+                            and cur != src_ipdom
+                            and cur != virtual_exit
+                            and cur not in seen
+                        ):
+                            seen.add(cur)
+                            if cur in G.nodes():
+                                control_dependence_scores[src] += 1
+                            nxt = ipdom.get(cur)
+                            if nxt is None:
+                                break
+                            cur = nxt
+        except:
+            pass
+
+        # SCC / loop 指标
+        try:
+            sccs = list(nx.strongly_connected_components(G))
+            for scc in sccs:
+                is_loop = len(scc) > 1
+                if not is_loop:
+                    only = next(iter(scc))
+                    is_loop = G.has_edge(only, only)
+                if not is_loop:
+                    continue
+                scc_size = len(scc)
+                for node in scc:
+                    in_loop_flags[node] = 1.0
+                    if scc_size > loop_scores[node]:
+                        loop_scores[node] = scc_size
+        except:
+            pass
+
         # --- 3.3.3 关键区域筛选辅助 ---
         def simple_norm(d):
             vals = list(d.values())
@@ -166,6 +235,9 @@ class RadareACFGExtractor:
         n_bet = simple_norm(betweenness)
         n_dom = simple_norm(dominator_scores)
         n_deg = simple_norm(degree)
+        n_postdom = simple_norm(postdominator_scores)
+        n_loop = simple_norm(loop_scores)
+        n_cdep = simple_norm(control_dependence_scores)
 
         # --- B. 语义指纹提取 ---
         fingerprints = {
@@ -204,6 +276,10 @@ class RadareACFGExtractor:
             feats['centrality_betweenness'] = betweenness.get(bb_addr, 0)
             feats['centrality_degree'] = degree.get(bb_addr, 0)
             feats['dominator_score'] = dominator_scores.get(bb_addr, 0)
+            feats['postdominator_score'] = postdominator_scores.get(bb_addr, 0)
+            feats['loop_score'] = loop_scores.get(bb_addr, 0)
+            feats['control_dependence_score'] = control_dependence_scores.get(bb_addr, 0)
+            feats['is_in_loop'] = in_loop_flags.get(bb_addr, 0.0)
             
             bbs_features[bb_addr] = feats
 
@@ -229,11 +305,18 @@ class RadareACFGExtractor:
         n_sem = simple_norm(semantic_raw)
         critical_scores = []
         for addr in G.nodes():
+            feats = bbs_features.get(addr, {})
+            n_inst = max(float(feats.get('n_instructions', 0)), 1.0)
+            transfer_penalty = min(float(feats.get('n_transfer', 0)) / n_inst, 1.0)
             score = (
-                0.35 * n_bet.get(addr, 0.0) +
-                0.25 * n_dom.get(addr, 0.0) +
-                0.20 * n_deg.get(addr, 0.0) +
-                0.20 * n_sem.get(addr, 0.0)
+                0.23 * n_bet.get(addr, 0.0) +
+                0.18 * n_dom.get(addr, 0.0) +
+                0.14 * n_deg.get(addr, 0.0) +
+                0.15 * n_sem.get(addr, 0.0) +
+                0.12 * n_postdom.get(addr, 0.0) +
+                0.10 * n_loop.get(addr, 0.0) +
+                0.08 * n_cdep.get(addr, 0.0) -
+                0.10 * transfer_penalty
             )
             # 写回到每个块特征，供下游直接使用
             if addr in bbs_features:

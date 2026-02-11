@@ -5,6 +5,8 @@ PPO Trainer for Binary Code Perturbation
 PPO 训练器（直接调用环境）
 """
 import os
+import csv
+import json
 import numpy as np
 import torch
 from ppo_agent import PPOAgent
@@ -13,13 +15,17 @@ from loguru import logger
 import sys
 import shutil
 import glob
+import random
+import pickle
 from collections import deque
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from typing import Dict, List, Optional
 
 # 导入环境
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from env_wrapper import BinaryPerturbationEnv
+from run_utils import run_one
 
 
 def cleanup_intermediate_files(save_path, episode_binaries=None):
@@ -112,6 +118,415 @@ def _load_trainer_state(path):
     return checkpoint.get("trainer_state")
 
 
+def _find_sym_to_addr(binary_path: str) -> Optional[str]:
+    base_dir = os.path.dirname(os.path.abspath(binary_path))
+    candidates = [
+        os.path.join(base_dir, "sym_to_addr.pickle"),
+        os.path.join(os.path.dirname(base_dir), "sym_to_addr.pickle"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _load_sym_to_addr(path: Optional[str]) -> Dict:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return {}
+
+
+def _parse_addr(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            return int(value, 16) if value.startswith(("0x", "0X")) else int(value)
+        return int(value)
+    except Exception:
+        return None
+
+
+def _opt_rank(opt_level: str) -> int:
+    order = {"O0": 0, "O1": 1, "O2": 2, "O3": 3, "Os": 4, "Oz": 5}
+    return order.get(str(opt_level), 99)
+
+
+class TargetedAttackEvaluator:
+    """
+    定向攻击评测：
+    - attacker 函数: 随机样本
+    - target 身份: 随机另一函数身份的多个编译变体
+    - 目标: 最大化 min(sim(attacker_adv, v_i))
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self.dataset_path = args.targeted_eval_dataset or args.dataset
+        self.eval_steps = max(1, int(args.targeted_eval_max_steps))
+        self.pairs = max(1, int(args.targeted_eval_pairs))
+        self.max_target_variants = max(1, int(args.targeted_eval_max_target_variants))
+        self.min_target_variants = max(1, int(args.targeted_eval_min_target_variants))
+        self.success_threshold = float(args.targeted_eval_threshold)
+        self.rng = random.Random(args.targeted_eval_seed)
+
+        with open(self.dataset_path, "r") as f:
+            self.dataset = json.load(f)
+        if not isinstance(self.dataset, list) or not self.dataset:
+            raise ValueError("targeted eval dataset is empty or invalid")
+
+        self.id_to_item = {}
+        self.id_to_index = {}
+        for idx, item in enumerate(self.dataset):
+            sid = str(item.get("id", "")).strip()
+            if not sid:
+                continue
+            self.id_to_item[sid] = item
+            self.id_to_index[sid] = idx
+
+        eval_save_path = os.path.join(args.save_path, "targeted_eval")
+        os.makedirs(eval_save_path, exist_ok=True)
+        self.env = BinaryPerturbationEnv(
+            save_path=eval_save_path,
+            dataset_path=self.dataset_path,
+            sample_hold_interval=10**9,
+            max_steps=self.eval_steps,
+            detection_method=args.detection_method,
+            safe_checkpoint_dir=args.safe_checkpoint_dir,
+            safe_i2v_dir=args.safe_i2v_dir,
+            safe_use_gpu=args.safe_use_gpu,
+            safe_cache_enabled=(args.detection_method == "safe" and not args.no_safe_cache),
+            jtrans_model_dir=args.jtrans_model_dir,
+            jtrans_tokenizer_dir=args.jtrans_tokenizer_dir,
+            jtrans_use_gpu=args.jtrans_use_gpu,
+            feature_mode=args.feature_mode,
+            seed=args.seed,
+            stall_limit=args.stall_limit,
+            progress_eps=args.progress_eps,
+            progress_reward_eps=args.progress_reward_eps,
+            include_schedule_feature=args.include_schedule_feature,
+            strict_invalid_loc=(not args.non_strict_invalid_loc),
+            hold_min=args.hold_min,
+            hold_max=args.hold_max,
+        )
+        self.env.set_state_dim(args.state_dim)
+        # 定向评测只受 max_steps 约束，不希望被 env.target_score 提前 done。
+        self.env.target_score = -1.0
+
+        self._target_original_asm_cache = {}
+        self._mutated_asm_cache = {}
+        self._mutated_sym_cache = {}
+
+    def _pin_sample(self, sample_idx: int) -> None:
+        sample = self.env.dataset[sample_idx]
+        self.env.current_sample_idx = sample_idx
+        self.env.current_sample_data = sample
+        self.env.episodes_on_current = 0
+        self.env.original_func_addr = None
+        self.env.original_binary = sample["binary_path"]
+        self.env.function_name = sample["func_name"]
+
+    def _collect_target_variants(self, target_item: Dict) -> List[Dict]:
+        target_ids = []
+        anchor_id = str(target_item.get("id", "")).strip()
+        if anchor_id:
+            target_ids.append(anchor_id)
+        for vid in target_item.get("variants", []) or []:
+            svid = str(vid).strip()
+            if svid:
+                target_ids.append(svid)
+
+        dedup = []
+        seen = set()
+        for tid in target_ids:
+            if tid in seen:
+                continue
+            seen.add(tid)
+            item = self.id_to_item.get(tid)
+            if item is not None:
+                dedup.append(item)
+
+        dedup.sort(
+            key=lambda x: (
+                _opt_rank(x.get("opt_level")),
+                str(x.get("version", "")),
+                str(x.get("binary_name", "")),
+            )
+        )
+        return dedup[: self.max_target_variants]
+
+    def _sample_pairs(self) -> List[Dict]:
+        target_candidates = []
+        for item in self.dataset:
+            variants = self._collect_target_variants(item)
+            if len(variants) >= self.min_target_variants:
+                t_ids = {str(v.get("id")) for v in variants if v.get("id")}
+                target_candidates.append((item, variants, t_ids))
+
+        if not target_candidates:
+            return []
+
+        pairs = []
+        seen = set()
+        max_attempts = self.pairs * 40
+        attempts = 0
+        while len(pairs) < self.pairs and attempts < max_attempts:
+            attempts += 1
+            target_item, target_variants, target_id_set = self.rng.choice(target_candidates)
+            target_func = str(target_item.get("func_name", ""))
+            attacker_idx = self.rng.randrange(len(self.dataset))
+            attacker_item = self.dataset[attacker_idx]
+            attacker_id = str(attacker_item.get("id", ""))
+            attacker_func = str(attacker_item.get("func_name", ""))
+            if not attacker_id or attacker_id in target_id_set:
+                continue
+            if attacker_func == target_func:
+                continue
+            key = (attacker_id, str(target_item.get("id", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(
+                {
+                    "attacker_idx": attacker_idx,
+                    "attacker": attacker_item,
+                    "target": target_item,
+                    "target_variants": target_variants,
+                }
+            )
+        return pairs
+
+    def _resolve_mutated_addr(self, mutated_binary: str, attacker_func_name: str) -> Optional[int]:
+        bpath = os.path.abspath(mutated_binary)
+        sym_map = self._mutated_sym_cache.get(bpath)
+        if sym_map is None:
+            sym_map = _load_sym_to_addr(_find_sym_to_addr(bpath))
+            self._mutated_sym_cache[bpath] = sym_map
+        if not sym_map:
+            return None
+        return _parse_addr(sym_map.get(attacker_func_name))
+
+    def _score_binary_against_target_variants(
+        self, mutated_binary: str, attacker_func_name: str, target_variants: List[Dict]
+    ) -> Dict:
+        attacker_addr = self._resolve_mutated_addr(mutated_binary, attacker_func_name)
+        if attacker_addr is None:
+            return {"valid": False, "scores": [], "min_score": -1.0, "avg_score": -1.0}
+
+        scores = []
+        for tv in target_variants:
+            target_binary = tv.get("binary_path")
+            target_func = str(tv.get("func_name", ""))
+            target_addr = _parse_addr(tv.get("func_addr"))
+            if not target_binary or not target_func or target_addr is None:
+                continue
+
+            score, _grad = run_one(
+                original_binary=target_binary,
+                mutated_binary=mutated_binary,
+                model_original=None,
+                checkdict={},
+                function_name=target_func,
+                detection_method=self.args.detection_method,
+                asm_work_dir=self.env._asm_work_dir,
+                original_asm_cache=self._target_original_asm_cache,
+                simple_mode=True,
+                original_func_addr=target_addr,
+                mutated_func_addr=attacker_addr,
+                safe_checkpoint_dir=self.args.safe_checkpoint_dir,
+                safe_i2v_dir=self.args.safe_i2v_dir,
+                safe_use_gpu=self.args.safe_use_gpu,
+                mutated_asm_cache=self._mutated_asm_cache,
+                safe_cache=self.env.safe_cache,
+                jtrans_model_dir=self.args.jtrans_model_dir,
+                jtrans_tokenizer_dir=self.args.jtrans_tokenizer_dir,
+                jtrans_use_gpu=self.args.jtrans_use_gpu,
+                jtrans_cache=self.env._jtrans_cache,
+            )
+            if score is None:
+                continue
+            scores.append(float(score))
+
+        if len(scores) != len(target_variants):
+            return {"valid": False, "scores": scores, "min_score": -1.0, "avg_score": -1.0}
+        return {
+            "valid": True,
+            "scores": scores,
+            "min_score": float(min(scores)),
+            "avg_score": float(sum(scores) / len(scores)),
+        }
+
+    def _run_one_pair(self, agent: PPOAgent, pair: Dict) -> Dict:
+        attacker = pair["attacker"]
+        target = pair["target"]
+        target_variants = pair["target_variants"]
+        self._pin_sample(pair["attacker_idx"])
+        state = self.env.reset(force_switch=False)
+
+        pre_eval = self._score_binary_against_target_variants(
+            self.env.current_binary,
+            str(attacker.get("func_name", "")),
+            target_variants,
+        )
+        best_eval = dict(pre_eval)
+        best_binary = self.env.current_binary
+        best_step = 0
+        err = ""
+        steps_used = 0
+
+        for step in range(self.eval_steps):
+            loc_mask = self.env.get_loc_mask(self.args.n_locs)
+            (
+                _joint_idx,
+                loc_idx,
+                _act_idx,
+                actual_action,
+                _log_prob,
+                _value,
+            ) = agent.select_action(state, explore=self.args.targeted_eval_explore, loc_mask=loc_mask)
+            next_state, _reward, done, info = self.env.step(actual_action, loc_idx)
+            steps_used = step + 1
+
+            cand_binary = info.get("binary")
+            if cand_binary:
+                cur_eval = self._score_binary_against_target_variants(
+                    cand_binary,
+                    str(attacker.get("func_name", "")),
+                    target_variants,
+                )
+                if cur_eval["valid"] and (not best_eval["valid"] or cur_eval["min_score"] > best_eval["min_score"]):
+                    best_eval = cur_eval
+                    best_binary = cand_binary
+                    best_step = steps_used
+
+            if info.get("should_reset"):
+                err = str(info.get("error", "should_reset"))
+                break
+
+            state = next_state
+            if done:
+                break
+
+        pre_min = pre_eval["min_score"] if pre_eval["valid"] else -1.0
+        post_min = best_eval["min_score"] if best_eval["valid"] else -1.0
+        pre_avg = pre_eval["avg_score"] if pre_eval["valid"] else -1.0
+        post_avg = best_eval["avg_score"] if best_eval["valid"] else -1.0
+
+        return {
+            "attacker_id": str(attacker.get("id", "")),
+            "attacker_func": str(attacker.get("func_name", "")),
+            "target_id": str(target.get("id", "")),
+            "target_func": str(target.get("func_name", "")),
+            "target_variants": len(target_variants),
+            "steps_used": steps_used,
+            "best_step": best_step,
+            "pre_valid": int(pre_eval["valid"]),
+            "post_valid": int(best_eval["valid"]),
+            "pre_min": pre_min,
+            "post_min": post_min,
+            "pre_avg": pre_avg,
+            "post_avg": post_avg,
+            "gain_min": post_min - pre_min,
+            "gain_avg": post_avg - pre_avg,
+            "success_pre": int(pre_min >= self.success_threshold),
+            "success_post": int(post_min >= self.success_threshold),
+            "improved": int(post_min > pre_min),
+            "error": err,
+            "best_binary": best_binary or "",
+        }
+
+    def evaluate(self, agent: PPOAgent, episode: int) -> Optional[Dict]:
+        pairs = self._sample_pairs()
+        if not pairs:
+            logger.warning("TargetedEval: 无法采样到有效 attacker-target 配对，跳过")
+            return None
+
+        rows = []
+        for pair in pairs:
+            try:
+                rows.append(self._run_one_pair(agent, pair))
+            except Exception as e:
+                rows.append(
+                    {
+                        "attacker_id": str(pair["attacker"].get("id", "")),
+                        "attacker_func": str(pair["attacker"].get("func_name", "")),
+                        "target_id": str(pair["target"].get("id", "")),
+                        "target_func": str(pair["target"].get("func_name", "")),
+                        "target_variants": len(pair["target_variants"]),
+                        "steps_used": 0,
+                        "best_step": 0,
+                        "pre_valid": 0,
+                        "post_valid": 0,
+                        "pre_min": -1.0,
+                        "post_min": -1.0,
+                        "pre_avg": -1.0,
+                        "post_avg": -1.0,
+                        "gain_min": 0.0,
+                        "gain_avg": 0.0,
+                        "success_pre": 0,
+                        "success_post": 0,
+                        "improved": 0,
+                        "error": str(e),
+                        "best_binary": "",
+                    }
+                )
+
+        valid_rows = [r for r in rows if r["pre_valid"] and r["post_valid"]]
+        metrics = {"pairs_total": len(rows), "pairs_valid": len(valid_rows)}
+        if valid_rows:
+            denom = float(len(valid_rows))
+            metrics.update(
+                {
+                    "min_pre": float(sum(r["pre_min"] for r in valid_rows) / denom),
+                    "min_post": float(sum(r["post_min"] for r in valid_rows) / denom),
+                    "avg_pre": float(sum(r["pre_avg"] for r in valid_rows) / denom),
+                    "avg_post": float(sum(r["post_avg"] for r in valid_rows) / denom),
+                    "gain_min": float(sum(r["gain_min"] for r in valid_rows) / denom),
+                    "gain_avg": float(sum(r["gain_avg"] for r in valid_rows) / denom),
+                    "success_pre": float(sum(r["success_pre"] for r in valid_rows) / denom),
+                    "success_post": float(sum(r["success_post"] for r in valid_rows) / denom),
+                    "improved_rate": float(sum(r["improved"] for r in valid_rows) / denom),
+                }
+            )
+        else:
+            metrics.update(
+                {
+                    "min_pre": -1.0,
+                    "min_post": -1.0,
+                    "avg_pre": -1.0,
+                    "avg_post": -1.0,
+                    "gain_min": 0.0,
+                    "gain_avg": 0.0,
+                    "success_pre": 0.0,
+                    "success_post": 0.0,
+                    "improved_rate": 0.0,
+                }
+            )
+
+        out_csv = os.path.join(self.args.model_dir, f"targeted_eval_ep{episode}.csv")
+        os.makedirs(self.args.model_dir, exist_ok=True)
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        metrics["csv"] = out_csv
+
+        logger.success(
+            "TargetedEval: "
+            f"pairs={metrics['pairs_total']} valid={metrics['pairs_valid']} "
+            f"min(pre->post)={metrics['min_pre']:.4f}->{metrics['min_post']:.4f} "
+            f"gain={metrics['gain_min']:.4f} "
+            f"success@{self.success_threshold:.2f}={metrics['success_post']:.2%} "
+            f"improved={metrics['improved_rate']:.2%}"
+        )
+        cleanup_intermediate_files(self.env.save_path, episode_binaries=None)
+        return metrics
+
+
 def train_ppo(args):
     """
     PPO 训练主函数
@@ -137,7 +552,8 @@ def train_ppo(args):
             msg.startswith("TensorBoard:") or
             msg.startswith("回合总结:") or
             msg.startswith("action_stats:") or
-            msg.startswith("loc_valid统计:")
+            msg.startswith("loc_valid统计:") or
+            msg.startswith("TargetedEval:")
         )
 
     def _file_log_filter(record):
@@ -155,6 +571,7 @@ def train_ppo(args):
                 msg.startswith("回合总结:") or
                 msg.startswith("action_stats:") or
                 msg.startswith("loc_valid统计:") or
+                msg.startswith("TargetedEval:") or
                 "训练结束" in msg
             )
         if name == "ppo_agent" and msg.startswith("✅ 模型已保存"):
@@ -241,6 +658,22 @@ def train_ppo(args):
         n_locs=args.n_locs,
         device='cuda' if torch.cuda.is_available() and args.use_gpu else 'cpu'
     )
+
+    targeted_evaluator = None
+    if args.targeted_eval_interval > 0:
+        try:
+            targeted_evaluator = TargetedAttackEvaluator(args)
+            logger.success(
+                "TargetedEval: "
+                f"enabled interval={args.targeted_eval_interval} "
+                f"pairs={args.targeted_eval_pairs} "
+                f"max_target_variants={args.targeted_eval_max_target_variants} "
+                f"eval_steps={args.targeted_eval_max_steps} "
+                f"threshold={args.targeted_eval_threshold}"
+            )
+        except Exception as e:
+            logger.warning(f"TargetedEval: 初始化失败，已禁用 ({e})")
+            targeted_evaluator = None
 
     action_ids = list(getattr(env, "action_ids", []))
     action_stats = {aid: {'count': 0, 'reward_sum': 0.0, 'success': 0} for aid in action_ids}
@@ -484,6 +917,25 @@ def train_ppo(args):
             writer.add_scalar('Debug/Advantage_Std_Raw', update_info['adv_std_raw'], episode)
             writer.add_scalar('Debug/Advantage_AbsMean_Raw', update_info['adv_abs_mean_raw'], episode)
             writer.add_scalar('Debug/Advantage_MaxAbs_Raw', update_info['adv_max_abs_raw'], episode)
+
+            if targeted_evaluator is not None and (episode + 1) % args.targeted_eval_interval == 0:
+                try:
+                    agent.policy.eval()
+                    t_metrics = targeted_evaluator.evaluate(agent, episode + 1)
+                finally:
+                    agent.policy.train()
+                if t_metrics is not None:
+                    writer.add_scalar('Targeted/Pairs_Valid', t_metrics['pairs_valid'], episode)
+                    writer.add_scalar('Targeted/MinSim_Pre', t_metrics['min_pre'], episode)
+                    writer.add_scalar('Targeted/MinSim_Post', t_metrics['min_post'], episode)
+                    writer.add_scalar('Targeted/MinSim_Gain', t_metrics['gain_min'], episode)
+                    writer.add_scalar('Targeted/AvgSim_Pre', t_metrics['avg_pre'], episode)
+                    writer.add_scalar('Targeted/AvgSim_Post', t_metrics['avg_post'], episode)
+                    writer.add_scalar('Targeted/AvgSim_Gain', t_metrics['gain_avg'], episode)
+                    writer.add_scalar('Targeted/Success_Pre', t_metrics['success_pre'], episode)
+                    writer.add_scalar('Targeted/Success_Post', t_metrics['success_post'], episode)
+                    writer.add_scalar('Targeted/Improved_Rate', t_metrics['improved_rate'], episode)
+
             pbar.set_postfix_str(
                 f"sr={current_success_rate:.2f} drop={avg_drop:.2f} "
                 f"loss={loss:.2f} adv_std={update_info['adv_std_raw']:.2f}"
@@ -557,17 +1009,19 @@ if __name__ == "__main__":
     parser.add_argument('--progress-reward-eps', type=float, default=2e-3)
     parser.add_argument('--include-schedule-feature', action='store_true')
     parser.add_argument('--non-strict-invalid-loc', action='store_true')
-    parser.add_argument('--hold-min', type=int, default=2)
-    parser.add_argument('--hold-max', type=int, default=6)
+    parser.add_argument('--hold-min', type=int, default=4)
+    parser.add_argument('--hold-max', type=int, default=10)
     parser.add_argument('--model-dir', default='./rl_models')
     parser.add_argument('--resume', default=None)
     parser.add_argument('--use-gpu', action='store_true')
     parser.add_argument('--log-path', default=None, help='训练日志路径（默认 log/train.log）')
     parser.add_argument('--detection-method', choices=['asm2vec', 'safe', 'jtrans'], default='asm2vec')
+    # SAFE 相关参数
     parser.add_argument('--safe-checkpoint-dir', default=None)
     parser.add_argument('--safe-i2v-dir', default=None)
     parser.add_argument('--safe-use-gpu', action='store_true')
     parser.add_argument('--no-safe-cache', action='store_true', help='Disable SAFE cache reuse during training')
+    # jtrans
     parser.add_argument('--jtrans-model-dir', default=None)
     parser.add_argument('--jtrans-tokenizer-dir', default=None)
     parser.add_argument('--jtrans-use-gpu', action='store_true')
@@ -577,6 +1031,25 @@ if __name__ == "__main__":
         default='full'
     )
     parser.add_argument('--seed', type=int, default=None)
+    # 定向攻击评测（Targeted Attack Eval）
+    parser.add_argument('--targeted-eval-interval', type=int, default=0,
+                        help='每隔多少个 episode 执行一次定向攻击评测（0 表示关闭）')
+    parser.add_argument('--targeted-eval-dataset', default=None,
+                        help='定向评测数据集路径（默认复用 --dataset）')
+    parser.add_argument('--targeted-eval-pairs', type=int, default=8,
+                        help='每次评测随机 attacker-target 配对数')
+    parser.add_argument('--targeted-eval-max-target-variants', type=int, default=4,
+                        help='每个 target identity 最多使用多少个编译变体')
+    parser.add_argument('--targeted-eval-min-target-variants', type=int, default=2,
+                        help='每个 target identity 至少需要多少个可用变体')
+    parser.add_argument('--targeted-eval-max-steps', type=int, default=30,
+                        help='定向评测每个 pair 的攻击步数预算')
+    parser.add_argument('--targeted-eval-threshold', type=float, default=0.85,
+                        help='定向成功阈值：min(sim_to_target_variants) >= threshold')
+    parser.add_argument('--targeted-eval-seed', type=int, default=1234,
+                        help='定向评测随机种子')
+    parser.add_argument('--targeted-eval-explore', action='store_true',
+                        help='定向评测时是否使用随机采样动作（默认贪心）')
     
     args = parser.parse_args()
 

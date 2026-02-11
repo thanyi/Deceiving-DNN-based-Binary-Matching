@@ -11,12 +11,14 @@ import json
 import os
 import pickle
 import random
+import shutil
 import threading
 import time
 import tempfile
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -148,10 +150,21 @@ def make_mutated_query(sample: Dict, mutated_binary: Optional[str]) -> Dict:
     mutated = dict(sample)
     if mutated_binary:
         mutated["binary_path"] = mutated_binary
-    mutated.pop("func_addr", None)
     base = f"{mutated.get('binary_path', '')}::{mutated.get('func_name', '')}"
     mutated["id"] = hashlib.md5(base.encode("utf-8")).hexdigest()[:8]
     return mutated
+
+
+def pick_after_binary(attack_info: Dict) -> Tuple[Optional[str], str]:
+    """
+    选择 after 检索使用的二进制：
+    优先使用变异过程中最低相似度分数对应的 best_binary，
+    如果不可用则回退到 final_binary。
+    """
+    best_binary = attack_info.get("best_binary")
+    if best_binary:
+        return best_binary, "best_binary"
+    return attack_info.get("final_binary"), "final_binary"
 
 
 def _get_variant_set(sample: Dict) -> Optional[set]:
@@ -162,6 +175,126 @@ def _get_variant_set(sample: Dict) -> Optional[set]:
     if not cleaned:
         return None
     return set(cleaned)
+
+
+def _remove_path_quiet(path: str) -> bool:
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+        return True
+    except Exception:
+        return False
+
+
+def cleanup_save_path_garbage(
+    save_path: str,
+    max_age_seconds: int,
+    include_containers: bool = False,
+) -> Dict[str, int]:
+    now = time.time()
+    max_age = max(0, int(max_age_seconds))
+    stats = {"removed": 0, "failed": 0}
+
+    def is_old(path: str) -> bool:
+        try:
+            return (now - os.path.getmtime(path)) >= max_age
+        except Exception:
+            return False
+
+    # 1) Top-level tmp_*
+    try:
+        for name in os.listdir(save_path):
+            p = os.path.join(save_path, name)
+            if not os.path.isdir(p):
+                continue
+            if name.startswith("tmp_") and is_old(p):
+                if _remove_path_quiet(p):
+                    stats["removed"] += 1
+                else:
+                    stats["failed"] += 1
+            elif include_containers and name.endswith("_container") and is_old(p):
+                if _remove_path_quiet(p):
+                    stats["removed"] += 1
+                else:
+                    stats["failed"] += 1
+    except Exception:
+        pass
+
+    # 2) Retrieval worker dirs: _retrieval_work/cand_*
+    retrieval_dir = os.path.join(save_path, "_retrieval_work")
+    if os.path.isdir(retrieval_dir):
+        try:
+            for name in os.listdir(retrieval_dir):
+                p = os.path.join(retrieval_dir, name)
+                if os.path.isdir(p) and name.startswith("cand_") and is_old(p):
+                    if _remove_path_quiet(p):
+                        stats["removed"] += 1
+                    else:
+                        stats["failed"] += 1
+        except Exception:
+            pass
+
+    # 3) Leftover mutant binaries: rl_output/mutant_*.bin
+    rl_output_dir = os.path.join(save_path, "rl_output")
+    if os.path.isdir(rl_output_dir):
+        try:
+            for name in os.listdir(rl_output_dir):
+                p = os.path.join(rl_output_dir, name)
+                if (
+                    os.path.isfile(p)
+                    and name.startswith("mutant_")
+                    and name.endswith(".bin")
+                    and is_old(p)
+                ):
+                    if _remove_path_quiet(p):
+                        stats["removed"] += 1
+                    else:
+                        stats["failed"] += 1
+        except Exception:
+            pass
+
+    return stats
+
+
+class SavePathCleanupManager:
+    def __init__(
+        self,
+        save_path: str,
+        interval_seconds: int,
+        max_age_seconds: int,
+        include_containers: bool = False,
+    ) -> None:
+        self.save_path = save_path
+        self.interval_seconds = max(0, int(interval_seconds or 0))
+        self.max_age_seconds = max(0, int(max_age_seconds or 0))
+        self.include_containers = bool(include_containers)
+        self._last_ts = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self.interval_seconds > 0
+
+    def maybe_cleanup(self, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = time.time()
+        if (not force) and (now - self._last_ts < self.interval_seconds):
+            return
+        stats = cleanup_save_path_garbage(
+            save_path=self.save_path,
+            max_age_seconds=self.max_age_seconds,
+            include_containers=self.include_containers,
+        )
+        self._last_ts = now
+        removed = int(stats.get("removed", 0))
+        failed = int(stats.get("failed", 0))
+        if removed > 0 or failed > 0:
+            tqdm.write(
+                f"[ASR-CLEANUP] removed={removed} failed={failed} "
+                f"max_age={self.max_age_seconds}s include_containers={self.include_containers}"
+            )
 
 
 class RetrievalBase:
@@ -649,6 +782,7 @@ class GMNRetriever(RetrievalBase):
         output_dir: Optional[str] = None,
         idb_root: Optional[str] = None,
         idb_prefix: Optional[str] = None,
+        opcodes_json: Optional[str] = None,
         log_every: int = 0,
     ) -> None:
         super().__init__(log_every=log_every)
@@ -660,7 +794,12 @@ class GMNRetriever(RetrievalBase):
         self.output_dir = output_dir or tempfile.mkdtemp(prefix="gmn_out_")
         self.idb_root = idb_root
         self.idb_prefix = idb_prefix
+        self.opcodes_json = opcodes_json
         self._engine = None
+        self._feature_idb_keys: Optional[set] = None
+        self._base_feature_dict: Optional[Dict] = None
+        self._opcodes_dict: Optional[Dict[str, int]] = None
+        self._runtime_feature_cache: Dict[Tuple[str, str, str], Dict] = {}
 
     def _ensure_engine(self):
         if self._engine is not None:
@@ -724,17 +863,266 @@ class GMNRetriever(RetrievalBase):
             return None
         return hex(val)
 
+    def _get_feature_idb_keys(self) -> set:
+        if self._feature_idb_keys is not None:
+            return self._feature_idb_keys
+        try:
+            with open(self.features_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._feature_idb_keys = set(str(k) for k in data.keys())
+            else:
+                self._feature_idb_keys = set()
+        except Exception:
+            self._feature_idb_keys = set()
+        return self._feature_idb_keys
+
+    def _get_base_feature_dict(self) -> Dict:
+        if self._base_feature_dict is not None:
+            return self._base_feature_dict
+        with open(self.features_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"GMN features json must be dict: {self.features_json}")
+        self._base_feature_dict = data
+        return self._base_feature_dict
+
+    def _get_opcodes_dict(self) -> Dict[str, int]:
+        if self.features_type != "opc":
+            return {}
+        if self._opcodes_dict is not None:
+            return self._opcodes_dict
+
+        path = self.opcodes_json
+        if not path:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            path = os.path.join(
+                project_root,
+                "detection_model",
+                "binary_function_similarity",
+                "Models",
+                "GGSNN-GMN",
+                "Preprocessing",
+                "Dataset-1_training",
+                "opcodes_dict.json",
+            )
+        if not os.path.isfile(path):
+            raise ValueError(
+                "GMN opc features require opcodes json. "
+                f"Provide --gmn-opcodes-json. Missing: {path}"
+            )
+
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if not isinstance(loaded, dict):
+            raise ValueError(f"Invalid opcodes json: {path}")
+        self._opcodes_dict = {str(k).lower(): int(v) for k, v in loaded.items()}
+        self.opcodes_json = path
+        return self._opcodes_dict
+
+    @staticmethod
+    def _np_to_sparse_string(mat: np.ndarray) -> str:
+        rows, cols = np.nonzero(mat)
+        data = mat[rows, cols]
+        row_str = ";".join(str(int(x)) for x in rows.tolist())
+        col_str = ";".join(str(int(x)) for x in cols.tolist())
+        data_str = ";".join(str(int(x)) for x in data.tolist())
+        n_row = str(int(mat.shape[0]))
+        n_col = str(int(mat.shape[1]))
+        return "::".join([row_str, col_str, data_str, n_row, n_col])
+
+    @staticmethod
+    def _normalize_mnemonic(ins: Dict) -> Optional[str]:
+        mnem = ins.get("mnemonic")
+        if mnem:
+            return str(mnem).strip().lower()
+        opcode = str(ins.get("opcode") or "").strip()
+        if not opcode:
+            return None
+        head = opcode.split(" ", 1)[0].strip().lower()
+        return head or None
+
+    def _extract_runtime_feature_for_query(
+        self,
+        query: Dict,
+        query_idb: str,
+        query_fva: str,
+    ) -> Dict:
+        binary_path = str(query.get("binary_path") or "")
+        func_name = str(query.get("func_name") or "")
+        cache_key = (binary_path, query_idb, query_fva)
+        cached = self._runtime_feature_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        query_addr = _parse_addr(query_fva)
+        if query_addr is None:
+            raise ValueError("GMN mutated query missing valid function addr")
+        if not os.path.isfile(binary_path):
+            raise ValueError(f"mutated binary not found: {binary_path}")
+
+        try:
+            import r2pipe
+        except Exception as e:
+            raise RuntimeError(f"GMN mutated retrieval requires r2pipe: {e}")
+
+        r2 = r2pipe.open(binary_path, flags=["-2"])
+        try:
+            r2.cmd("aaa")
+            blocks = r2.cmdj(f"afbj @ {query_addr}") or []
+            if not blocks:
+                r2.cmd(f"af @ {query_addr}")
+                blocks = r2.cmdj(f"afbj @ {query_addr}") or []
+            if not blocks:
+                raise ValueError(
+                    f"cannot extract CFG for mutated function: {func_name}@{hex(query_addr)}"
+                )
+
+            node_addrs = sorted(
+                int(bb.get("addr"))
+                for bb in blocks
+                if bb.get("addr") is not None
+            )
+            if not node_addrs:
+                raise ValueError(
+                    f"mutated CFG has no basic blocks: {func_name}@{hex(query_addr)}"
+                )
+            node_to_idx = {addr: idx for idx, addr in enumerate(node_addrs)}
+
+            graph_mat = np.zeros((len(node_addrs), len(node_addrs)), dtype=np.int8)
+            bb_map = {int(bb.get("addr")): bb for bb in blocks if bb.get("addr") is not None}
+            for src in node_addrs:
+                bb = bb_map.get(src) or {}
+                for edge_key in ("jump", "fail"):
+                    dst = bb.get(edge_key)
+                    if dst is None:
+                        continue
+                    dst_int = int(dst)
+                    if dst_int in node_to_idx:
+                        graph_mat[node_to_idx[src], node_to_idx[dst_int]] = 1
+
+            opcodes = self._get_opcodes_dict()
+            opc_dim = len(opcodes)
+            opc_mat = np.zeros((len(node_addrs), opc_dim), dtype=np.int8)
+            if opc_dim > 0:
+                for row_idx, bb_addr in enumerate(node_addrs):
+                    bb = bb_map.get(bb_addr) or {}
+                    size = int(bb.get("size") or 0)
+                    if size <= 0:
+                        continue
+                    instrs = r2.cmdj(f"pDj {size} @ {bb_addr}") or []
+                    for ins in instrs:
+                        mnem = self._normalize_mnemonic(ins)
+                        if not mnem:
+                            continue
+                        opc_idx = opcodes.get(mnem)
+                        if opc_idx is None or opc_idx < 0 or opc_idx >= opc_dim:
+                            continue
+                        if opc_mat[row_idx, opc_idx] < np.iinfo(np.int8).max:
+                            opc_mat[row_idx, opc_idx] += 1
+
+            runtime = {
+                query_idb: {
+                    query_fva: {
+                        "graph": self._np_to_sparse_string(graph_mat),
+                        "opc": self._np_to_sparse_string(opc_mat),
+                    }
+                }
+            }
+            self._runtime_feature_cache[cache_key] = runtime
+            return runtime
+        finally:
+            try:
+                r2.quit()
+            except Exception:
+                pass
+
+    def _build_features_for_query(self, query: Dict, query_kind: str) -> Tuple[str, str, Optional[Dict]]:
+        query_idb = self._map_idb_path(query.get("binary_path"))
+        if not query_idb:
+            raise ValueError("GMN requires query binary_path")
+
+        if query_kind == "original":
+            query_fva = self._format_fva(query.get("func_addr"))
+            if not query_fva:
+                raise ValueError("GMN requires original query func_addr in dataset")
+            return query_idb, query_fva, None
+
+        if query_kind == "mutated":
+            query_addr = _resolve_mutated_addr(
+                str(query.get("binary_path") or ""),
+                query.get("func_name"),
+            )
+            if query_addr is None:
+                query_addr = _parse_addr(query.get("func_addr"))
+            query_fva = self._format_fva(query_addr)
+            if not query_fva:
+                raise ValueError(
+                    "GMN mutated query missing addr (sym_to_addr and func_addr are both unavailable)"
+                )
+
+            runtime = self._extract_runtime_feature_for_query(
+                query=query,
+                query_idb=query_idb,
+                query_fva=query_fva,
+            )
+            merged = dict(self._get_base_feature_dict())
+            for idb_path, funcs in runtime.items():
+                existing = dict(merged.get(idb_path, {}))
+                existing.update(funcs)
+                merged[idb_path] = existing
+            return query_idb, query_fva, merged
+
+        raise ValueError(f"query_kind must be original/mutated, got {query_kind}")
+
     def _map_idb_path(self, binary_path: Optional[str]) -> Optional[str]:
         if not binary_path:
             return None
-        if not self.idb_root:
-            return binary_path
-        rel = os.path.relpath(binary_path, self.idb_root)
-        if self.idb_prefix:
-            return os.path.join(self.idb_prefix, rel).replace(os.sep, "/")
-        return rel.replace(os.sep, "/")
+        mapped = binary_path
+        if self.idb_root:
+            rel = os.path.relpath(binary_path, self.idb_root)
+            if self.idb_prefix:
+                mapped = os.path.join(self.idb_prefix, rel)
+            else:
+                mapped = rel
 
-    def _score_pairs(self, pairs: List[Dict]) -> List[float]:
+        mapped = mapped.replace(os.sep, "/")
+        candidates: List[str] = []
+
+        def add_cand(path: Optional[str]) -> None:
+            if not path:
+                return
+            path = path.replace(os.sep, "/")
+            if path not in candidates:
+                candidates.append(path)
+
+        add_cand(mapped)
+        if mapped.endswith(".i64"):
+            add_cand(mapped[:-4])
+        else:
+            add_cand(f"{mapped}.i64")
+
+        for p in list(candidates):
+            add_cand(p.replace("IDBs/coreutils/coreutils-", "IDBs/coreutils-"))
+
+        for p in list(candidates):
+            if p.startswith("IDBs/"):
+                add_cand(f"../../rl_framework/datasets/coreutils/{p}")
+            if p.startswith("rl_framework/"):
+                add_cand(f"../../{p}")
+
+        feature_keys = self._get_feature_idb_keys()
+        for p in candidates:
+            if p in feature_keys:
+                return p
+
+        # Fall back to a deterministic default even when we cannot pre-match.
+        for p in candidates:
+            if p.endswith(".i64"):
+                return p
+        return candidates[0] if candidates else None
+
+    def _score_pairs(self, pairs: List[Dict], features_override: Optional[Dict] = None) -> List[float]:
         engine = self._ensure_engine()
         config = engine["config"]
         model = engine["model"]
@@ -763,6 +1151,10 @@ class GMNRetriever(RetrievalBase):
             writer.writerows(pairs)
             csv_path = tmp.name
 
+        prev_features = config["testing"].get("features_testing_path")
+        if features_override is not None:
+            config["testing"]["features_testing_path"] = features_override
+
         try:
             if not engine["initialized"]:
                 init_gen = build_testing_generator(config, csv_path)
@@ -784,15 +1176,17 @@ class GMNRetriever(RetrievalBase):
                 os.remove(csv_path)
             except Exception:
                 pass
+            config["testing"]["features_testing_path"] = prev_features
 
-    def topk(self, query: Dict, dataset: List[Dict], k: int, query_kind: str) -> List[Dict]:
-        if query_kind != "original":
-            raise ValueError("GMN retriever only supports query_kind=original")
-
-        query_idb = self._map_idb_path(query.get("binary_path"))
-        query_fva = self._format_fva(query.get("func_addr"))
-        if not query_idb or not query_fva:
-            raise ValueError("GMN requires binary_path and func_addr in dataset")
+    def _score_dataset(
+        self,
+        query: Dict,
+        dataset: List[Dict],
+        query_kind: str,
+    ) -> List[Dict]:
+        query_idb, query_fva, features_override = self._build_features_for_query(
+            query, query_kind
+        )
 
         pairs = []
         cand_ids = []
@@ -814,12 +1208,24 @@ class GMNRetriever(RetrievalBase):
             )
             cand_ids.append(str(cand.get("id") or cand.get("func_name") or "unknown_cand"))
 
-        sims = self._score_pairs(pairs)
+        sims = self._score_pairs(pairs, features_override=features_override)
         scored = []
         for cand_id, score in zip(cand_ids, sims):
             scored.append({"id": cand_id, "score": float(score)})
+        return scored
+
+    def topk(self, query: Dict, dataset: List[Dict], k: int, query_kind: str) -> List[Dict]:
+        scored = self._score_dataset(query, dataset, query_kind)
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:k]
+
+    def score_candidates(
+        self,
+        query: Dict,
+        candidates: List[Dict],
+        query_kind: str,
+    ) -> List[Dict]:
+        return self._score_dataset(query, candidates, query_kind)
 
 
 class RLAgentRunner:
@@ -884,6 +1290,9 @@ class RLAgentRunner:
         steps_used = 0
         final_score = 1.0
         final_binary = None
+        best_score = float("inf")
+        best_binary = None
+        best_step = 0
         error = ""
 
         print(f"[ASR] Attack sample={sample_idx} func={self.env.function_name}")
@@ -910,6 +1319,15 @@ class RLAgentRunner:
                 final_binary = info["binary"]
             if "score" in info:
                 final_score = float(info["score"])
+                loc_valid = info.get("loc_valid", True)
+                if (
+                    final_binary
+                    and loc_valid
+                    and final_score < best_score
+                ):
+                    best_score = final_score
+                    best_binary = final_binary
+                    best_step = step + 1
 
             if info.get("should_reset"):
                 error = str(info.get("error", "should_reset"))
@@ -923,10 +1341,18 @@ class RLAgentRunner:
             f"[ASR] Finished sample={sample_idx} steps={steps_used} "
             f"final_score={final_score} error={error}"
         )
+        if best_binary is not None:
+            print(
+                f"[ASR] Best mutation during attack: step={best_step} "
+                f"best_score={best_score:.6f}"
+            )
         return {
             "steps_used": steps_used,
             "final_score": final_score,
             "final_binary": final_binary,
+            "best_score": float(best_score) if best_binary is not None else float(final_score),
+            "best_binary": best_binary if best_binary is not None else final_binary,
+            "best_step": best_step,
             "error": error,
         }
 
@@ -1054,6 +1480,9 @@ class GAAgentRunner:
         self._reset_pinned_env(sample_idx)
         final_score = 1.0
         final_binary = None
+        best_score = float("inf")
+        best_binary = None
+        best_step = 0
         error = ""
         steps_used = 0
         done = False
@@ -1067,6 +1496,15 @@ class GAAgentRunner:
                 final_binary = info["binary"]
             if "score" in info:
                 final_score = float(info["score"])
+                loc_valid = info.get("loc_valid", True)
+                if (
+                    final_binary
+                    and loc_valid
+                    and final_score < best_score
+                ):
+                    best_score = final_score
+                    best_binary = final_binary
+                    best_step = steps_used
             if info.get("should_reset"):
                 error = str(info.get("error", "should_reset"))
                 break
@@ -1083,6 +1521,9 @@ class GAAgentRunner:
             "steps_used": steps_used,
             "final_score": final_score,
             "final_binary": final_binary,
+            "best_score": float(best_score) if best_binary is not None else float(final_score),
+            "best_binary": best_binary if best_binary is not None else final_binary,
+            "best_step": best_step,
             "error": error,
             "fitness": fitness,
             "success": success,
@@ -1103,6 +1544,9 @@ class GAAgentRunner:
             "steps_used": 0,
             "final_score": 1.0,
             "final_binary": None,
+            "best_score": 1.0,
+            "best_binary": None,
+            "best_step": 0,
             "error": "ga_no_eval",
             "fitness": -1.0,
             "success": False,
@@ -1159,6 +1603,9 @@ class GAAgentRunner:
             "steps_used": total_steps,
             "final_score": float(best["final_score"]),
             "final_binary": best.get("final_binary"),
+            "best_score": float(best.get("best_score", best["final_score"])),
+            "best_binary": best.get("best_binary") or best.get("final_binary"),
+            "best_step": int(best.get("best_step", 0)),
             "error": str(best.get("error", "")),
         }
 
@@ -1200,6 +1647,7 @@ def build_retriever(args: argparse.Namespace, save_path: str) -> RetrievalBase:
             output_dir=args.gmn_output_dir or asm_work_dir,
             idb_root=args.gmn_idb_root,
             idb_prefix=args.gmn_idb_prefix,
+            opcodes_json=args.gmn_opcodes_json,
             log_every=args.retrieval_log_every,
         )
     raise ValueError(f"Unknown retrieval model: {args.retrieval_model}")
@@ -1324,6 +1772,7 @@ def run_asr_simple(
     csv_path: str,
     retriever: RetrievalBase,
     runner,
+    cleanup_mgr: Optional[SavePathCleanupManager] = None,
 ) -> Tuple[float, List[Dict]]:
     dataset = load_dataset(dataset_path)
     dataset = _apply_limit(dataset, limit, limit_mode, limit_seed)
@@ -1340,6 +1789,8 @@ def run_asr_simple(
 
     pbar = tqdm(enumerate(dataset), total=len(dataset), desc=f"ASR@{k}", unit="sample")
     for idx, sample in pbar:
+        if cleanup_mgr is not None:
+            cleanup_mgr.maybe_cleanup()
         sample_id = str(sample.get("id") or f"sample_{idx}")
         tqdm.write(
             f"[ASR] Start sample={idx} id={sample_id} func={sample.get('func_name')}"
@@ -1370,7 +1821,13 @@ def run_asr_simple(
         tqdm.write(f"[ASR] TopK before ({retriever.name}): {format_topk(topk_before)}")
 
         attack_info = runner.attack_sample(sample_idx=idx, max_steps=budget)
-        mutated_query = make_mutated_query(sample, attack_info["final_binary"])
+        after_binary, after_binary_source = pick_after_binary(attack_info)
+        mutated_query = make_mutated_query(sample, after_binary)
+        tqdm.write(
+            f"[ASR] After-query source={after_binary_source} "
+            f"best_score={attack_info.get('best_score', attack_info.get('final_score', 1.0)):.6f} "
+            f"final_score={attack_info.get('final_score', 1.0):.6f}"
+        )
 
         if attack_info.get("error"):
             rows.append(
@@ -1451,6 +1908,8 @@ def run_asr_simple(
             "error",
         ],
     )
+    if cleanup_mgr is not None:
+        cleanup_mgr.maybe_cleanup(force=True)
     return asr, rows
 
 
@@ -1465,6 +1924,7 @@ def run_asr_multi_variant(
     csv_path: str,
     retriever: RetrievalBase,
     runner,
+    cleanup_mgr: Optional[SavePathCleanupManager] = None,
 ) -> Dict[str, float]:
     dataset = load_dataset(dataset_path)
     dataset = _apply_limit(dataset, limit, limit_mode, limit_seed)
@@ -1496,6 +1956,8 @@ def run_asr_multi_variant(
 
     pbar = tqdm(enumerate(dataset), total=len(dataset), desc=f"ASR-MV@{k}", unit="sample")
     for idx, sample in pbar:
+        if cleanup_mgr is not None:
+            cleanup_mgr.maybe_cleanup()
         variants_raw = _get_variant_set(sample)
         if not variants_raw:
             skipped += 1
@@ -1675,7 +2137,13 @@ def run_asr_multi_variant(
             continue
 
         attack_info = runner.attack_sample(sample_idx=idx, max_steps=budget)
-        mutated_query = make_mutated_query(sample, attack_info["final_binary"])
+        after_binary, after_binary_source = pick_after_binary(attack_info)
+        mutated_query = make_mutated_query(sample, after_binary)
+        tqdm.write(
+            f"[ASR-MV] After-query source={after_binary_source} "
+            f"best_score={attack_info.get('best_score', attack_info.get('final_score', 1.0)):.6f} "
+            f"final_score={attack_info.get('final_score', 1.0):.6f}"
+        )
 
         if attack_info.get("error"):
             errors += 1
@@ -1890,6 +2358,8 @@ def run_asr_multi_variant(
             "final_score",
         ],
     )
+    if cleanup_mgr is not None:
+        cleanup_mgr.maybe_cleanup(force=True)
     print(f"[ASR-MV] CSV saved to: {csv_path}")
     return metrics
 
@@ -1932,6 +2402,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit-seed", type=int, default=None)
     parser.add_argument("--save-path", default=default_save)
     parser.add_argument("--csv", default="asr_test.csv")
+    parser.add_argument(
+        "--cleanup-interval-seconds",
+        type=int,
+        default=0,
+        help="Periodic cleanup interval for --save-path. 0 disables cleanup.",
+    )
+    parser.add_argument(
+        "--cleanup-max-age-seconds",
+        type=int,
+        default=1800,
+        help="Only remove temp folders/files older than this age.",
+    )
+    parser.add_argument(
+        "--cleanup-include-containers",
+        action="store_true",
+        help="Also cleanup *_container folders under --save-path when they are old enough.",
+    )
     parser.add_argument("--use-gpu", action="store_true")
     parser.add_argument(
         "--mode",
@@ -1991,6 +2478,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gmn-output-dir", default=None)
     parser.add_argument("--gmn-idb-root", default=None)
     parser.add_argument("--gmn-idb-prefix", default=None)
+    parser.add_argument("--gmn-opcodes-json", default=None)
     return parser
 
 
@@ -2012,6 +2500,19 @@ def main() -> None:
             args.jtrans_tokenizer_dir = os.path.join(jtrans_root, "jtrans_tokenizer")
 
     retriever = build_retriever(args, args.save_path)
+    cleanup_mgr = SavePathCleanupManager(
+        save_path=args.save_path,
+        interval_seconds=args.cleanup_interval_seconds,
+        max_age_seconds=args.cleanup_max_age_seconds,
+        include_containers=args.cleanup_include_containers,
+    )
+    if cleanup_mgr.enabled:
+        print(
+            "[ASR] Cleanup enabled: "
+            f"interval={args.cleanup_interval_seconds}s "
+            f"max_age={args.cleanup_max_age_seconds}s "
+            f"include_containers={bool(args.cleanup_include_containers)}"
+        )
     runner = build_attack_runner(
         args=args,
         dataset_path=args.dataset,
@@ -2033,6 +2534,7 @@ def main() -> None:
             csv_path=csv_path,
             retriever=retriever,
             runner=runner,
+            cleanup_mgr=cleanup_mgr,
         )
 
         print(f"ASR@{args.topk}: {asr:.4f} ({sum(r['success'] for r in rows)}/{len(rows)})")
@@ -2049,6 +2551,7 @@ def main() -> None:
             csv_path=csv_path,
             retriever=retriever,
             runner=runner,
+            cleanup_mgr=cleanup_mgr,
         )
 
 

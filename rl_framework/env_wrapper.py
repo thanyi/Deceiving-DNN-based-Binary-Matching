@@ -451,6 +451,9 @@ class BinaryPerturbationEnv:
                 key=lambda kv: (
                     -float(kv[1].get('critical_score', 0.0)),
                     -float(kv[1].get('dominator_score', 0.0)),
+                    -float(kv[1].get('postdominator_score', 0.0)),
+                    -float(kv[1].get('control_dependence_score', 0.0)),
+                    -float(kv[1].get('loop_score', 0.0)),
                     -float(kv[1].get('centrality_degree', 0.0)),
                     kv[0],
                 )
@@ -710,50 +713,52 @@ class BinaryPerturbationEnv:
             mem_ops = bb.get('n_mem_write', 0) + bb.get('n_mem_read', 0)
             v.append(safe_div(compute_ops, mem_ops + 1.0))
             
-            # --- [3] 拓扑与中心性 (4 dims) ---
-            v.append(bb.get('centrality_betweenness', 0))      # 14. Betweenness
-            v.append(bb.get('centrality_degree', 0))           # 15. Degree
-            v.append(np.log1p(bb.get('dominator_score', 0)))   # 16. Dom Score
-            v.append(bb.get('critical_score', 0))              # 17. Aggregated Score
+            # --- [3] 拓扑与中心性 (6 dims) ---
+            v.append(bb.get('centrality_betweenness', 0))         # 14. Betweenness
+            v.append(bb.get('centrality_degree', 0))              # 15. Degree
+            v.append(np.log1p(bb.get('dominator_score', 0)))      # 16. Dom Score
+            v.append(np.log1p(bb.get('postdominator_score', 0)))  # 17. Post-Dom Score
+            v.append(np.log1p(bb.get('control_dependence_score', 0)))  # 18. CDG Score
+            v.append(bb.get('critical_score', 0))                 # 19. Aggregated Score
             
-            # --- [4] 结构标志位 (4 dims) ---
-            v.append(1.0 if bb.get('n_consts', 0) > 0 else 0.0)      # 18. Has Constant?
-            v.append(1.0 if bb.get('n_branch', 0) > 1 else 0.0)      # 19. Is Multi-Branch?
-            v.append(1.0 if compute_ops > mem_ops else 0.0)          # 20. Is Compute Heavy?
-            v.append(1.0 if bb.get('n_branch', 0) == 0 else 0.0)     # 21. Is Leaf Node?
+            # --- [4] 结构标志位 (3 dims) ---
+            v.append(1.0 if bb.get('n_consts', 0) > 0 else 0.0)      # 20. Has Constant?
+            v.append(1.0 if bb.get('n_branch', 0) > 1 else 0.0)      # 21. Is Multi-Branch?
+            v.append(1.0 if compute_ops > mem_ops else 0.0)          # 22. Is Compute Heavy?
             
-            # --- [5] 高级组合特征 (10 dims, 填满32) ---
-            # 22. Entropy Proxy (操作码种类丰富度)
+            # --- [5] 高级组合特征 (9 dims, 填满32) ---
+            # 23. Entropy Proxy (操作码种类丰富度)
             uniq_types = sum(1 for k in effective_keys if bb.get(k, 0) > 0)
             v.append(uniq_types / 7.0)
             
-            # 23. Stack Heaviness (是否主要是栈操作)
+            # 24. Stack Heaviness (是否主要是栈操作)
             v.append(1.0 if bb.get('n_transfer', 0) > n_inst * 0.5 else 0.0)
             
-            # 24. Loop Header Heuristic (有跳转且介数高)
-            is_loop = 1.0 if (bb.get('n_branch', 0) > 0 and bb.get('centrality_betweenness', 0) > 0.1) else 0.0
+            # 25. Loop Header Heuristic (有跳转且在环中)
+            is_loop = 1.0 if (
+                bb.get('n_branch', 0) > 0 and (
+                    bb.get('is_in_loop', 0.0) > 0.5 or bb.get('loop_score', 0) > 1
+                )
+            ) else 0.0
             v.append(is_loop)
             
-            # 25. Logic+Xor Density (混淆常见特征)
+            # 26. Logic+Xor Density (混淆常见特征)
             v.append(safe_div(bb.get('n_logic', 0) + bb.get('n_xor', 0), safe_bb_eff))
             
-            # 26. Write/Read Ratio (写多读少可能是初始化)
+            # 27. Write/Read Ratio (写多读少可能是初始化)
             v.append(safe_div(bb.get('n_mem_write', 0), bb.get('n_mem_read', 0) + 1.0))
             
-            # 27. Arith/Logic Ratio
+            # 28. Arith/Logic Ratio
             v.append(safe_div(bb.get('n_arith', 0), bb.get('n_logic', 0) + 1.0))
             
-            # 28. Branch/Compute Ratio (控制流密集度)
+            # 29. Branch/Compute Ratio (控制流密集度)
             v.append(safe_div(bb.get('n_branch', 0), compute_ops + 1.0))
             
-            # 29. Reg Diversity (通用+向量寄存器总数归一化)
+            # 30. Reg Diversity (通用+向量寄存器总数归一化)
             v.append(safe_div(bb.get('n_regs_gp', 0) + bb.get('n_regs_vec', 0), 16.0))
             
-            # 30. Tiny Block Flag (是否极小块，如Trampoline)
+            # 31. Tiny Block Flag (是否极小块，如Trampoline)
             v.append(1.0 if n_inst < 5 else 0.0)
-            
-            # 31. Large Block Flag (是否超大块，如展开的循环)
-            v.append(1.0 if n_inst > 50 else 0.0)
 
             # 确保长度为 32
             v = v[:32] 
@@ -786,8 +791,12 @@ class BinaryPerturbationEnv:
         global_sums = {k: sum(b.get(k, 0) for b in bbs) for k in effective_keys}
         for k in effective_keys:
             vec.append(global_sums[k] / safe_eff_total)
-        # 补 1 维
-        vec.append(0.0) 
+        # 补 1 维：全局环块比例 (替代占位常量)
+        loop_block_ratio = (
+            sum(1 for b in bbs if float(b.get('is_in_loop', 0.0)) > 0.5) / n_nodes
+            if bbs else 0.0
+        )
+        vec.append(loop_block_ratio)
             
         # 2. API & Strings (22 dims)
         vec.append(np.log1p(fingerprints.get('n_calls', 0)))

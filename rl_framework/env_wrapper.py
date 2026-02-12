@@ -61,6 +61,7 @@ class BinaryPerturbationEnv:
         progress_reward_eps=1e-3,
         include_schedule_feature=False,
         strict_invalid_loc=True,
+        include_action12=False,
     ):
         """
         参数:
@@ -99,6 +100,7 @@ class BinaryPerturbationEnv:
         self.progress_reward_eps = float(progress_reward_eps)
         self.include_schedule_feature = bool(include_schedule_feature)
         self.strict_invalid_loc = bool(strict_invalid_loc)
+        self.include_action12 = bool(include_action12)
         self.current_hold_limit = self.hold_max
         self.episodes_on_current = 0
         self.current_sample_data = None # 存储当前样本的元数据
@@ -137,8 +139,11 @@ class BinaryPerturbationEnv:
         self.target_score = 0.40
         self.state_dim = 256  # 默认状态维度（256维），可以通过参数修改
         # 动作空间（必须与 PPOAgent 的 action_map 保持一致）
-        # 已接入新动作: 13/14/15/16
-        self.all_action_ids = [1, 2, 4, 7, 8, 9, 11, 13, 14, 15, 16]
+        # 已接入新动作: 12/13/14/15/16（12 默认可选开关）
+        self.all_action_ids = [1, 2, 4, 7, 8, 9, 11]
+        if self.include_action12:
+            self.all_action_ids.append(12)
+        self.all_action_ids.extend([13, 14, 15, 16])
         self.action_ids = list(self.all_action_ids)
         self.action_id_to_index = {aid: idx for idx, aid in enumerate(self.action_ids)}
         # 固定历史特征维度：保持 7 bins，避免改变 16 维历史特征布局（影响已实现网络切片）。

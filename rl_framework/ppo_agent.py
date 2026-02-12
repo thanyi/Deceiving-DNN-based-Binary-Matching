@@ -128,7 +128,7 @@ class PPOAgent:
     """PPO 智能体"""
     
     def __init__(self, state_dim=256, n_actions=None, n_locs=3, lr=1e-4, gamma=0.99, 
-                 epsilon=0.2, epochs=10, device='cpu', action_map=None):
+                 epsilon=0.2, epochs=10, device='cpu', action_map=None, action_prior=None):
         """
         参数:
             state_dim: 状态维度（特征向量长度）
@@ -165,10 +165,13 @@ class PPOAgent:
         self.action_map = action_map
         self.n_actions = len(self.action_map) 
         self.n_locs = n_locs
+        self._action_log_prior = None
 
         # 初始化网络
         self.policy = StructuredJointNetwork(state_dim, self.n_actions, self.n_locs).to(self.device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
+        if action_prior:
+            self.set_action_prior(action_prior)
 
         self.action_stats = np.zeros((self.n_locs, self.n_actions))
         
@@ -193,6 +196,7 @@ class PPOAgent:
             action_logits, state_value = self.policy(state)
         # 位置掩码（仅在采样时使用）
         action_logits = self._apply_loc_mask(action_logits, loc_mask)
+        action_logits = self._apply_action_prior(action_logits)
         
         dist = Categorical(logits=action_logits)
         
@@ -319,6 +323,7 @@ class PPOAgent:
                 loc_masks = self.memory['loc_masks']
                 loc_masks = torch.FloatTensor(np.array(loc_masks)).to(self.device)
                 action_logits = self._apply_loc_mask(action_logits, loc_masks)
+            action_logits = self._apply_action_prior(action_logits)
             
             # ✅ NaN 检查
             if torch.isnan(action_logits).any():
@@ -482,6 +487,53 @@ class PPOAgent:
         loc_mask = torch.where(mask_sum > 0, loc_mask, torch.ones_like(loc_mask))
         joint_mask = loc_mask.repeat_interleave(self.n_actions, dim=1)
         return action_logits.masked_fill(joint_mask <= 0, -1e9)
+
+    def set_action_prior(self, weights_by_action):
+        """
+        设置动作先验（按实际 action id），用于缓解动作塌缩。
+        先验以 log(weight) 的形式加到 logits 上。
+        """
+        if not weights_by_action:
+            self._action_log_prior = None
+            return
+
+        prior = np.ones(self.n_actions, dtype=np.float32)
+        for idx, aid in enumerate(self.action_map):
+            raw = weights_by_action.get(aid, weights_by_action.get(str(aid), 1.0))
+            try:
+                w = float(raw)
+            except Exception:
+                w = 1.0
+            if w <= 0:
+                w = 1.0
+            prior[idx] = w
+
+        mean_w = float(np.mean(prior)) if len(prior) > 0 else 1.0
+        if mean_w <= 0:
+            mean_w = 1.0
+        prior = prior / mean_w
+        if np.allclose(prior, np.ones_like(prior), atol=1e-6):
+            self._action_log_prior = None
+            logger.info("动作先验已关闭（所有权重等于1）")
+            return
+        self._action_log_prior = torch.tensor(
+            np.log(np.clip(prior, 1e-8, None)),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        logger.info(f"动作先验已启用: {weights_by_action}")
+
+    def _apply_action_prior(self, action_logits):
+        if self._action_log_prior is None:
+            return action_logits
+        if action_logits.dim() != 2:
+            return action_logits
+        joint_dim = action_logits.size(1)
+        if joint_dim != self.n_locs * self.n_actions:
+            return action_logits
+        prior = self._action_log_prior.to(action_logits.device)
+        joint_prior = prior.repeat(self.n_locs).unsqueeze(0)
+        return action_logits + joint_prior
     
     def save(self, path, extra_state=None):
         """保存模型（完整版）"""

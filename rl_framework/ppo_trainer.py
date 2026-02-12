@@ -20,7 +20,7 @@ import pickle
 from collections import deque
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # 导入环境
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -156,6 +156,30 @@ def _opt_rank(opt_level: str) -> int:
     return order.get(str(opt_level), 99)
 
 
+def _parse_action_weight_cfg(raw: str) -> Dict[int, float]:
+    """
+    解析格式如 "16:1.8,11:1.5,14:1.3,15:1.3" 的动作权重配置。
+    """
+    out: Dict[int, float] = {}
+    text = str(raw or "").strip()
+    if not text:
+        return out
+    for seg in text.split(","):
+        item = seg.strip()
+        if not item or ":" not in item:
+            continue
+        a, w = item.split(":", 1)
+        try:
+            aid = int(a.strip())
+            weight = float(w.strip())
+        except Exception:
+            continue
+        if weight <= 0:
+            continue
+        out[aid] = weight
+    return out
+
+
 class TargetedAttackEvaluator:
     """
     定向攻击评测：
@@ -212,6 +236,7 @@ class TargetedAttackEvaluator:
             strict_invalid_loc=(not args.non_strict_invalid_loc),
             hold_min=args.hold_min,
             hold_max=args.hold_max,
+            include_action12=args.enable_action12,
         )
         self.env.set_state_dim(args.state_dim)
         # 定向评测只受 max_steps 约束，不希望被 env.target_score 提前 done。
@@ -527,6 +552,236 @@ class TargetedAttackEvaluator:
         return metrics
 
 
+class InMemoryASRRunner:
+    """
+    使用当前训练中的 PPO agent + 独立评测环境执行攻击，
+    提供与 asr_test 评测函数兼容的 attack_sample 接口。
+    """
+
+    def __init__(self, env: BinaryPerturbationEnv, n_locs: int = 3):
+        self.env = env
+        self.agent: Optional[PPOAgent] = None
+        self.n_locs = max(1, int(n_locs))
+
+    def set_agent(self, agent: PPOAgent) -> None:
+        self.agent = agent
+
+    def _pin_sample(self, sample_idx: int) -> None:
+        sample = self.env.dataset[sample_idx]
+        self.env.current_sample_idx = sample_idx
+        self.env.current_sample_data = sample
+        self.env.episodes_on_current = 0
+        self.env.original_func_addr = None
+        self.env.original_binary = sample["binary_path"]
+        self.env.function_name = sample["func_name"]
+
+    def attack_sample(self, sample_idx: int, max_steps: int) -> Dict:
+        if self.agent is None:
+            raise RuntimeError("InMemoryASRRunner: agent is not set")
+
+        self._pin_sample(sample_idx)
+        state = self.env.reset(force_switch=False)
+
+        steps_used = 0
+        final_score = 1.0
+        final_binary = None
+        best_score = float("inf")
+        best_binary = None
+        best_step = 0
+        error = ""
+
+        for step in range(max_steps):
+            loc_mask = self.env.get_loc_mask(self.n_locs)
+            (
+                _joint_idx,
+                loc_idx,
+                _act_idx,
+                actual_action,
+                _log_prob,
+                _value,
+            ) = self.agent.select_action(state, explore=True, loc_mask=loc_mask)
+
+            next_state, _reward, done, info = self.env.step(actual_action, loc_idx)
+            steps_used = step + 1
+
+            if info.get("binary"):
+                final_binary = info["binary"]
+            if "score" in info:
+                final_score = float(info["score"])
+                if final_binary and info.get("loc_valid", True) and final_score < best_score:
+                    best_score = final_score
+                    best_binary = final_binary
+                    best_step = step + 1
+
+            if info.get("should_reset"):
+                error = str(info.get("error", "should_reset"))
+                break
+
+            state = next_state
+            if done:
+                break
+
+        return {
+            "steps_used": steps_used,
+            "final_score": final_score,
+            "final_binary": final_binary,
+            "best_score": float(best_score) if best_binary is not None else float(final_score),
+            "best_binary": best_binary if best_binary is not None else final_binary,
+            "best_step": best_step,
+            "error": error,
+        }
+
+
+class FixedASREvaluator:
+    """
+    固定小评测集 ASR（默认每 200 个 episode，固定 32 样本）。
+    """
+
+    def __init__(self, args):
+        self.args = args
+        import asr_test as asr_mod
+
+        self._asr_mod = asr_mod
+        self.eval_mode = str(args.asr_eval_mode or "multi_variant").strip().lower()
+        if self.eval_mode != "multi_variant":
+            raise ValueError(f"Unsupported --asr-eval-mode: {self.eval_mode}")
+        self.eval_budget = max(1, int(args.asr_eval_budget or args.max_steps))
+        self.eval_k = max(1, int(args.asr_eval_k))
+        self.eval_seed = int(args.asr_eval_seed)
+        self.eval_save_path = os.path.join(args.save_path, "asr_eval_fixed")
+        os.makedirs(self.eval_save_path, exist_ok=True)
+
+        dataset_path = args.asr_eval_dataset or args.dataset
+        all_samples = asr_mod.load_dataset(dataset_path)
+        if not all_samples:
+            raise ValueError("ASR eval dataset is empty")
+        sample_n = min(max(1, int(args.asr_eval_samples)), len(all_samples))
+        rng = random.Random(self.eval_seed)
+        if sample_n < len(all_samples):
+            selected = sorted(rng.sample(range(len(all_samples)), sample_n))
+            fixed_samples = [all_samples[i] for i in selected]
+        else:
+            fixed_samples = list(all_samples)
+        self.sample_count = len(fixed_samples)
+        self.fixed_dataset_path = os.path.join(args.model_dir, "asr_eval_fixed32.json")
+        os.makedirs(args.model_dir, exist_ok=True)
+        with open(self.fixed_dataset_path, "w", encoding="utf-8") as f:
+            json.dump(fixed_samples, f, ensure_ascii=False, indent=2)
+
+        retriever_name = self._resolve_retriever_name(
+            args.asr_eval_retrieval, args.detection_method
+        )
+        self.retriever = self._build_retriever(retriever_name)
+
+        self.env = BinaryPerturbationEnv(
+            save_path=self.eval_save_path,
+            dataset_path=self.fixed_dataset_path,
+            sample_hold_interval=10**9,
+            max_steps=self.eval_budget,
+            detection_method=args.detection_method,
+            safe_checkpoint_dir=args.safe_checkpoint_dir,
+            safe_i2v_dir=args.safe_i2v_dir,
+            safe_use_gpu=args.safe_use_gpu,
+            safe_cache_enabled=(args.detection_method == "safe" and not args.no_safe_cache),
+            jtrans_model_dir=args.jtrans_model_dir,
+            jtrans_tokenizer_dir=args.jtrans_tokenizer_dir,
+            jtrans_use_gpu=args.jtrans_use_gpu,
+            feature_mode=args.feature_mode,
+            seed=args.seed,
+            stall_limit=args.stall_limit,
+            progress_eps=args.progress_eps,
+            progress_reward_eps=args.progress_reward_eps,
+            include_schedule_feature=args.include_schedule_feature,
+            strict_invalid_loc=(not args.non_strict_invalid_loc),
+            hold_min=args.hold_min,
+            hold_max=args.hold_max,
+            include_action12=args.enable_action12,
+        )
+        self.env.set_state_dim(args.state_dim)
+        self.env.target_score = 0.4
+        self.runner = InMemoryASRRunner(self.env, n_locs=args.n_locs)
+        self.retriever_name = retriever_name
+
+    @staticmethod
+    def _resolve_retriever_name(name: str, detection_method: str) -> str:
+        n = str(name or "auto").strip().lower()
+        if n != "auto":
+            return n
+        if detection_method in ("asm2vec", "safe", "jtrans"):
+            return detection_method
+        return "jtrans"
+
+    def _build_retriever(self, name: str):
+        asm_work_dir = os.path.join(self.eval_save_path, "_retrieval_work")
+        os.makedirs(asm_work_dir, exist_ok=True)
+        workers = max(1, int(self.args.asr_eval_retrieval_workers))
+        log_every = max(0, int(self.args.asr_eval_log_every))
+        if name == "asm2vec":
+            return self._asr_mod.Asm2VecRetriever(
+                asm_work_dir=asm_work_dir,
+                retrieval_workers=workers,
+                log_every=log_every,
+            )
+        if name == "safe":
+            if not self.args.safe_checkpoint_dir or not self.args.safe_i2v_dir:
+                raise ValueError("SAFE ASR eval requires --safe-checkpoint-dir and --safe-i2v-dir")
+            return self._asr_mod.SafeRetriever(
+                checkpoint_dir=self.args.safe_checkpoint_dir,
+                i2v_dir=self.args.safe_i2v_dir,
+                use_gpu=self.args.safe_use_gpu,
+                asm_work_dir=asm_work_dir,
+                retrieval_workers=workers,
+                log_every=log_every,
+            )
+        if name == "jtrans":
+            return self._asr_mod.JTransRetriever(
+                model_dir=self.args.jtrans_model_dir,
+                tokenizer_dir=self.args.jtrans_tokenizer_dir,
+                use_gpu=self.args.jtrans_use_gpu,
+                asm_work_dir=asm_work_dir,
+                retrieval_workers=workers,
+                log_every=log_every,
+            )
+        raise ValueError(f"Unsupported ASR eval retriever: {name}")
+
+    def evaluate(self, agent: PPOAgent, episode: int) -> Dict:
+        self.runner.set_agent(agent)
+        csv_path = os.path.join(self.args.model_dir, f"fixed_asr_ep{episode}.csv")
+        mv_metrics = self._asr_mod.run_asr_multi_variant(
+            dataset_path=self.fixed_dataset_path,
+            k=self.eval_k,
+            budget=self.eval_budget,
+            limit=None,
+            limit_mode="first",
+            limit_seed=self.eval_seed,
+            save_path=self.eval_save_path,
+            csv_path=csv_path,
+            retriever=self.retriever,
+            runner=self.runner,
+            cleanup_mgr=None,
+        )
+        metrics = {
+            "asr": float(mv_metrics.get("wASR", 0.0)),
+            "asr1": float(mv_metrics.get("ASR@1", 0.0)),
+            "asr2": float(mv_metrics.get("ASR@2", 0.0)),
+            "asr3": float(mv_metrics.get("ASR@3", 0.0)),
+            "asr4": float(mv_metrics.get("ASR@4", 0.0)),
+            "wasr": float(mv_metrics.get("wASR", 0.0)),
+            "recall_pre": float(mv_metrics.get("recall_pre", 0.0)),
+            "recall_post": float(mv_metrics.get("recall_post", 0.0)),
+            "samples": int(self.sample_count),
+            "rows": int(self.sample_count),
+            "csv": csv_path,
+            "mode": self.eval_mode,
+        }
+        logger.success(
+            f"FixedASR: mode={self.eval_mode} n={metrics['samples']} asr={metrics['asr']:.4f} "
+            f"retriever={self.retriever_name} csv={csv_path}"
+        )
+        cleanup_intermediate_files(self.env.save_path, episode_binaries=None)
+        return metrics
+
+
 def train_ppo(args):
     """
     PPO 训练主函数
@@ -627,25 +882,28 @@ def train_ppo(args):
         strict_invalid_loc=(not args.non_strict_invalid_loc),
         hold_min=args.hold_min,
         hold_max=args.hold_max,
+        include_action12=args.enable_action12,
     )
     env.set_state_dim(args.state_dim)
+    method_tag = str(args.detection_method).upper()
+    target_start = float(args.fixed_threshold)
+    target_end = 0.4
+    target_decay_episodes = 1200
+    fixed_episodes = max(0, int(args.fixed_episodes))
+    success_gate = 0.55
+    env.target_score = target_start
+
     if args.detection_method == "safe":
-        safe_target_start = 0.9
-        safe_target_end = 0.4
-        safe_target_decay_episodes = 1200
-        env.target_score = safe_target_start
         env.no_change_penalty = 0.05
         logger.success(
-            f"[SAFE train] target_score linear decay {safe_target_start}->{safe_target_end} over {safe_target_decay_episodes} eps; "
+            f"[SAFE train] target_score fixed={target_start} for first {fixed_episodes} eps, "
+            f"then linear decay to {target_end} over {target_decay_episodes} eps; "
             f"no_change_penalty={env.no_change_penalty}"
         )
-    elif args.detection_method == "jtrans":
-        jtrans_target_start = 0.9
-        jtrans_target_end = 0.4
-        jtrans_target_decay_episodes = 1200
-        env.target_score = jtrans_target_start
+    else:
         logger.success(
-            f"[JTRANS train] target_score linear decay {jtrans_target_start}->{jtrans_target_end} over {jtrans_target_decay_episodes} eps"
+            f"[{method_tag} train] target_score fixed={target_start} for first {fixed_episodes} eps, "
+            f"then linear decay to {target_end} over {target_decay_episodes} eps"
         )
 
     agent = PPOAgent(
@@ -658,6 +916,12 @@ def train_ppo(args):
         n_locs=args.n_locs,
         device='cuda' if torch.cuda.is_available() and args.use_gpu else 'cpu'
     )
+    if args.detection_method == "jtrans" and args.enable_high_dist_prior:
+        prior_cfg = _parse_action_weight_cfg(args.high_dist_action_weights)
+        if prior_cfg:
+            agent.set_action_prior(prior_cfg)
+        else:
+            logger.warning("高扰动动作先验配置为空，已跳过")
 
     targeted_evaluator = None
     if args.targeted_eval_interval > 0:
@@ -674,6 +938,21 @@ def train_ppo(args):
         except Exception as e:
             logger.warning(f"TargetedEval: 初始化失败，已禁用 ({e})")
             targeted_evaluator = None
+
+    fixed_asr_evaluator = None
+    if args.asr_eval_interval > 0:
+        try:
+            fixed_asr_evaluator = FixedASREvaluator(args)
+            logger.success(
+                "FixedASR: "
+                f"enabled interval={args.asr_eval_interval} "
+                f"samples={args.asr_eval_samples} k={args.asr_eval_k} "
+                f"budget={args.asr_eval_budget} mode={args.asr_eval_mode} "
+                f"retrieval={fixed_asr_evaluator.retriever_name}"
+            )
+        except Exception as e:
+            logger.warning(f"FixedASR: 初始化失败，已禁用 ({e})")
+            fixed_asr_evaluator = None
 
     action_ids = list(getattr(env, "action_ids", []))
     action_stats = {aid: {'count': 0, 'reward_sum': 0.0, 'success': 0} for aid in action_ids}
@@ -732,32 +1011,29 @@ def train_ppo(args):
             logger.info(f"回合 {episode + 1}/{args.episodes}")
             # 训练动态：基于最近成功率调整目标分数（避免单纯线性下降）
             recent_success_rate = np.mean(success_window) if success_window else 0.0
-            if args.detection_method == "safe":
-                progress = min(1.0, episode / max(1, safe_target_decay_episodes))
-                linear_target = safe_target_start + (safe_target_end - safe_target_start) * progress
-                safe_success_gate = 0.55
-                step = abs(safe_target_start - safe_target_end) / max(1, safe_target_decay_episodes)
-                if recent_success_rate >= safe_success_gate:
-                    env.target_score = max(linear_target, env.target_score - step)
-                # 否则保持当前 target_score，不继续降低
-                env.target_score = max(safe_target_end, min(safe_target_start, env.target_score))
+            if episode < fixed_episodes:
+                env.target_score = target_start
                 if episode % 10 == 0:
                     logger.success(
-                        f"[SAFE train] target_score={env.target_score:.4f} (ep={episode}) "
-                        f"sr={recent_success_rate:.2f} gate={safe_success_gate:.2f}"
+                        f"[{method_tag} train] target_score={env.target_score:.4f} "
+                        f"(ep={episode}, warmup<{fixed_episodes}) "
+                        f"sr={recent_success_rate:.2f}"
                     )
-            elif args.detection_method == "jtrans":
-                progress = min(1.0, episode / max(1, jtrans_target_decay_episodes))
-                linear_target = jtrans_target_start + (jtrans_target_end - jtrans_target_start) * progress
-                jtrans_success_gate = 0.55
-                step = abs(jtrans_target_start - jtrans_target_end) / max(1, jtrans_target_decay_episodes)
-                if recent_success_rate >= jtrans_success_gate:
+            else:
+                decay_ep = episode - fixed_episodes
+                progress = min(1.0, decay_ep / max(1, target_decay_episodes))
+                linear_target = target_start + (target_end - target_start) * progress
+                step = abs(target_start - target_end) / max(1, target_decay_episodes)
+                if recent_success_rate >= success_gate:
                     env.target_score = max(linear_target, env.target_score - step)
-                env.target_score = max(jtrans_target_end, min(jtrans_target_start, env.target_score))
+                lo = min(target_start, target_end)
+                hi = max(target_start, target_end)
+                env.target_score = max(lo, min(hi, env.target_score))
                 if episode % 10 == 0:
                     logger.success(
-                        f"[JTRANS train] target_score={env.target_score:.4f} (ep={episode}) "
-                        f"sr={recent_success_rate:.2f} gate={jtrans_success_gate:.2f}"
+                        f"[{method_tag} train] target_score={env.target_score:.4f} "
+                        f"(ep={episode}, decay_ep={decay_ep}) "
+                        f"sr={recent_success_rate:.2f} gate={success_gate:.2f}"
                     )
             
             state = env.reset()
@@ -891,15 +1167,28 @@ def train_ppo(args):
             )
             if episode % 50 == 0 and action_stats:
                 parts = []
+                total_cnt = 0
                 for aid in sorted(action_stats.keys()):
                     stat = action_stats[aid]
                     if stat['count'] == 0:
                         continue
+                    total_cnt += int(stat['count'])
                     avg_r = stat['reward_sum'] / stat['count']
                     succ = stat['success'] / stat['count']
                     parts.append(f"a{aid}:cnt={stat['count']} avgR={avg_r:.3f} succ={succ:.1%}")
                 if parts:
                     logger.info("action_stats: " + " | ".join(parts))
+                high_dist_ids = (11, 14, 15, 16)
+                high_dist_cnt = sum(
+                    int(action_stats.get(aid, {}).get('count', 0))
+                    for aid in high_dist_ids
+                )
+                high_dist_ratio = high_dist_cnt / max(float(total_cnt), 1.0)
+                writer.add_scalar('Debug/HighDist_Action_Ratio_Window', high_dist_ratio, episode)
+                logger.info(
+                    f"high_dist_action_ratio(window): {high_dist_ratio:.2%} "
+                    f"(ids={high_dist_ids}, total={total_cnt})"
+                )
                 for stat in action_stats.values():
                     stat['count'] = 0
                     stat['reward_sum'] = 0.0
@@ -935,6 +1224,22 @@ def train_ppo(args):
                     writer.add_scalar('Targeted/Success_Pre', t_metrics['success_pre'], episode)
                     writer.add_scalar('Targeted/Success_Post', t_metrics['success_post'], episode)
                     writer.add_scalar('Targeted/Improved_Rate', t_metrics['improved_rate'], episode)
+
+            if fixed_asr_evaluator is not None and (episode + 1) % args.asr_eval_interval == 0:
+                try:
+                    agent.policy.eval()
+                    asr_metrics = fixed_asr_evaluator.evaluate(agent, episode + 1)
+                finally:
+                    agent.policy.train()
+                writer.add_scalar('FixedASR/ASR', asr_metrics['asr'], episode)
+                writer.add_scalar('FixedASR/Samples', asr_metrics['samples'], episode)
+                writer.add_scalar('FixedASR/ASR@1', asr_metrics.get('asr1', 0.0), episode)
+                writer.add_scalar('FixedASR/ASR@2', asr_metrics.get('asr2', 0.0), episode)
+                writer.add_scalar('FixedASR/ASR@3', asr_metrics.get('asr3', 0.0), episode)
+                writer.add_scalar('FixedASR/ASR@4', asr_metrics.get('asr4', 0.0), episode)
+                writer.add_scalar('FixedASR/wASR', asr_metrics.get('wasr', 0.0), episode)
+                writer.add_scalar('FixedASR/Recall_Pre', asr_metrics.get('recall_pre', 0.0), episode)
+                writer.add_scalar('FixedASR/Recall_Post', asr_metrics.get('recall_post', 0.0), episode)
 
             pbar.set_postfix_str(
                 f"sr={current_success_rate:.2f} drop={avg_drop:.2f} "
@@ -1025,6 +1330,21 @@ if __name__ == "__main__":
     parser.add_argument('--jtrans-model-dir', default=None)
     parser.add_argument('--jtrans-tokenizer-dir', default=None)
     parser.add_argument('--jtrans-use-gpu', action='store_true')
+    parser.add_argument('--fixed-threshold', type=float, default=None,
+                        help='训练前期固定成功阈值（target_score），适用于 asm2vec/safe/jtrans')
+    parser.add_argument('--fixed-episodes', type=int, default=None,
+                        help='训练前期固定阈值的 episode 数，适用于 asm2vec/safe/jtrans')
+    parser.add_argument('--jtrans-fixed-threshold', type=float, default=None,
+                        help='兼容旧参数：等价于 --fixed-threshold')
+    parser.add_argument('--jtrans-fixed-episodes', type=int, default=None,
+                        help='兼容旧参数：等价于 --fixed-episodes')
+    parser.add_argument('--disable-high-dist-prior', action='store_true',
+                        help='关闭高扰动动作采样先验（11/14/15/16）')
+    parser.add_argument('--high-dist-action-weights',
+                        default='16:1.8,11:1.5,14:1.3,15:1.3',
+                        help='高扰动动作先验权重配置，格式: action:weight,...')
+    parser.add_argument('--without-action12', action='store_true',
+                        help='不将 action 12 (func_state_flatten) 加入动作空间')
     parser.add_argument(
         '--feature-mode',
         choices=['full', 'no_progress', 'no_api', 'no_progress_api', 'no_section_c'],
@@ -1050,8 +1370,57 @@ if __name__ == "__main__":
                         help='定向评测随机种子')
     parser.add_argument('--targeted-eval-explore', action='store_true',
                         help='定向评测时是否使用随机采样动作（默认贪心）')
+    # 固定小评测集 ASR（真实检索）
+    parser.add_argument('--asr-eval-interval', type=int, default=200,
+                        help='每隔多少个 episode 执行一次固定小评测集 ASR（0 表示关闭）')
+    parser.add_argument('--asr-eval-samples', type=int, default=32,
+                        help='固定 ASR 评测样本数')
+    parser.add_argument('--asr-eval-k', type=int, default=10,
+                        help='固定 ASR 评测 Top-K')
+    parser.add_argument('--asr-eval-budget', type=int, default=40,
+                        help='固定 ASR 评测每样本攻击步数预算')
+    parser.add_argument('--asr-eval-dataset', default=None,
+                        help='固定 ASR 评测数据集路径（默认复用 --dataset）')
+    parser.add_argument('--asr-eval-retrieval',
+                        choices=['auto', 'asm2vec', 'safe', 'jtrans'],
+                        default='auto',
+                        help='固定 ASR 评测检索器（auto=跟随 detection_method）')
+    parser.add_argument('--asr-eval-retrieval-workers', type=int, default=1,
+                        help='固定 ASR 评测检索并发数')
+    parser.add_argument('--asr-eval-log-every', type=int, default=0,
+                        help='固定 ASR 评测检索日志频率（0 表示关闭）')
+    parser.add_argument('--asr-eval-seed', type=int, default=1234,
+                        help='固定 ASR 评测子集采样随机种子')
+    parser.add_argument('--asr-eval-mode',
+                        choices=['multi_variant'],
+                        default='multi_variant',
+                        help='固定 ASR 评测模式（仅支持 multi_variant）')
     
     args = parser.parse_args()
+    args.enable_high_dist_prior = (not args.disable_high_dist_prior)
+    args.enable_action12 = (not args.without_action12)
+    if args.asr_eval_budget <= 0:
+        args.asr_eval_budget = args.max_steps
+
+    # 兼容旧参数：若未设置通用参数，则回退到 jtrans 老参数
+    if args.fixed_threshold is None and args.jtrans_fixed_threshold is not None:
+        args.fixed_threshold = float(args.jtrans_fixed_threshold)
+    if args.fixed_episodes is None and args.jtrans_fixed_episodes is not None:
+        args.fixed_episodes = int(args.jtrans_fixed_episodes)
+
+    # 默认值按检测器保持历史行为：
+    # - jtrans: 固定 0.88 前 1000 轮
+    # - safe:   0.9（不固定轮数）
+    # - asm2vec: 0.4（不固定轮数）
+    if args.fixed_threshold is None:
+        if args.detection_method == "jtrans":
+            args.fixed_threshold = 0.88
+        elif args.detection_method == "safe":
+            args.fixed_threshold = 0.9
+        else:
+            args.fixed_threshold = 0.4
+    if args.fixed_episodes is None:
+        args.fixed_episodes = 1000 if args.detection_method == "jtrans" else 0
 
     if args.detection_method == "jtrans":
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

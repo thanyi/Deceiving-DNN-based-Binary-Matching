@@ -177,6 +177,65 @@ def _get_variant_set(sample: Dict) -> Optional[set]:
     return set(cleaned)
 
 
+ACTION_IDS_NO12 = [1, 2, 4, 7, 8, 9, 11, 13, 14, 15, 16]
+ACTION_IDS_WITH12 = [1, 2, 4, 7, 8, 9, 11, 12, 13, 14, 15, 16]
+
+
+def _action_ids_by_flag(include_action12: bool) -> List[int]:
+    return list(ACTION_IDS_WITH12 if include_action12 else ACTION_IDS_NO12)
+
+
+def _infer_action_layout_from_checkpoint(
+    model_path: str,
+    n_locs: int = 3,
+    prefer_include_action12: bool = True,
+) -> Tuple[List[int], bool, str]:
+    fallback = _action_ids_by_flag(bool(prefer_include_action12))
+    if not model_path or (not os.path.exists(model_path)):
+        return fallback, bool(prefer_include_action12), "checkpoint_missing"
+
+    try:
+        checkpoint = torch.load(model_path, map_location="cpu")
+    except Exception as e:
+        return fallback, bool(prefer_include_action12), f"checkpoint_load_failed:{e}"
+
+    state = checkpoint
+    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("policy_state_dict"), dict):
+        state = checkpoint["policy_state_dict"]
+    if not isinstance(state, dict):
+        return fallback, bool(prefer_include_action12), "checkpoint_state_invalid"
+
+    out_dim = None
+    source_key = ""
+    direct_keys = ("actor_head.6.bias", "actor_head.6.weight")
+    for key in direct_keys:
+        tensor = state.get(key)
+        if hasattr(tensor, "shape") and len(tensor.shape) >= 1:
+            out_dim = int(tensor.shape[0])
+            source_key = key
+            break
+    if out_dim is None:
+        for key, tensor in state.items():
+            if not (str(key).endswith("actor_head.6.bias") or str(key).endswith("actor_head.6.weight")):
+                continue
+            if hasattr(tensor, "shape") and len(tensor.shape) >= 1:
+                out_dim = int(tensor.shape[0])
+                source_key = str(key)
+                break
+
+    if out_dim is None:
+        return fallback, bool(prefer_include_action12), "actor_head_not_found"
+    if n_locs <= 0 or (out_dim % n_locs) != 0:
+        return fallback, bool(prefer_include_action12), f"invalid_joint_dim:{out_dim}"
+
+    n_actions = out_dim // n_locs
+    if n_actions == len(ACTION_IDS_WITH12):
+        return list(ACTION_IDS_WITH12), True, f"inferred:{source_key}:{out_dim}"
+    if n_actions == len(ACTION_IDS_NO12):
+        return list(ACTION_IDS_NO12), False, f"inferred:{source_key}:{out_dim}"
+    return fallback, bool(prefer_include_action12), f"unsupported_n_actions:{n_actions}"
+
+
 def _remove_path_quiet(path: str) -> bool:
     try:
         if os.path.isdir(path):
@@ -1244,6 +1303,7 @@ class RLAgentRunner:
         jtrans_model_dir: Optional[str] = None,
         jtrans_tokenizer_dir: Optional[str] = None,
         jtrans_use_gpu: bool = False,
+        include_action12: Optional[bool] = None,
     ) -> None:
         self.dataset_path = dataset_path
         self.save_path = save_path
@@ -1252,7 +1312,27 @@ class RLAgentRunner:
         device = "cuda" if torch.cuda.is_available() and use_gpu else "cpu"
         print(f"[ASR] Loading model: {model_path} (device={device})")
         load_start = time.time()
-        self.agent = PPOAgent(state_dim=state_dim, device=device)
+        if include_action12 is None:
+            action_ids, include_action12, infer_src = _infer_action_layout_from_checkpoint(
+                model_path=model_path,
+                n_locs=3,
+                prefer_include_action12=True,
+            )
+        else:
+            include_action12 = bool(include_action12)
+            action_ids = _action_ids_by_flag(include_action12)
+            infer_src = f"manual:{include_action12}"
+
+        print(
+            f"[ASR] Action layout: include_action12={include_action12} "
+            f"n_actions={len(action_ids)} source={infer_src}"
+        )
+        self.agent = PPOAgent(
+            state_dim=state_dim,
+            device=device,
+            action_map=list(action_ids),
+            n_actions=len(action_ids),
+        )
         self.agent.load(model_path)
         self.agent.policy.eval()
         print(f"[ASR] Model loaded in {time.time() - load_start:.2f}s")
@@ -1270,6 +1350,7 @@ class RLAgentRunner:
             jtrans_model_dir=jtrans_model_dir,
             jtrans_tokenizer_dir=jtrans_tokenizer_dir,
             jtrans_use_gpu=jtrans_use_gpu,
+            include_action12=bool(include_action12),
         )
         self.env.target_score = 0.4
         self.env.set_state_dim(state_dim)
@@ -1379,6 +1460,7 @@ class GAAgentRunner:
         seq_len: int = 8,
         loc_slots: int = 3,
         seed: Optional[int] = None,
+        include_action12: bool = True,
     ) -> None:
         self.dataset_path = dataset_path
         self.save_path = save_path
@@ -1405,6 +1487,7 @@ class GAAgentRunner:
             jtrans_model_dir=jtrans_model_dir,
             jtrans_tokenizer_dir=jtrans_tokenizer_dir,
             jtrans_use_gpu=jtrans_use_gpu,
+            include_action12=bool(include_action12),
         )
         self.env.target_score = 0.4
         self.env.set_state_dim(state_dim)
@@ -1676,6 +1759,7 @@ def build_attack_runner(
         return RLAgentRunner(
             model_path=args.model_path,
             use_gpu=args.use_gpu,
+            include_action12=(False if args.without_action12 else None),
             **common_kwargs,
         )
     if args.attack_agent == "ga":
@@ -1688,6 +1772,7 @@ def build_attack_runner(
             seq_len=args.ga_seq_len,
             loc_slots=args.ga_loc_slots,
             seed=args.ga_seed,
+            include_action12=(not args.without_action12),
             **common_kwargs,
         )
     raise ValueError(f"Unknown attack agent: {args.attack_agent}")
@@ -2420,6 +2505,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also cleanup *_container folders under --save-path when they are old enough.",
     )
     parser.add_argument("--use-gpu", action="store_true")
+    parser.add_argument(
+        "--without-action12",
+        action="store_true",
+        help="Force disable action 12 in env/action space (default: auto infer from PPO checkpoint).",
+    )
     parser.add_argument(
         "--mode",
         choices=["single", "multi_variant"],

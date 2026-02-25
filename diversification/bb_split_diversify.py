@@ -113,6 +113,6 @@ class bb_split_diversify(ailVisitor):
 
     def visit(self, instrs, target_addr = None):
         print 'start basic block split diversification'
-        self.instrs = copy.deepcopy(instrs)
+        self.instrs = self._clone_instrs_for_edit(instrs)
         self.bb_div_split(target_addr)
         return self.instrs

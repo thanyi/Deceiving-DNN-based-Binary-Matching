@@ -122,7 +122,7 @@ class func_reorder_diversify(ailVisitor):
         注意：函数重排序是函数级别的操作，target_addr 参数在此操作中无意义
         因为重排序操作改变的是函数在二进制文件中的整体布局，不是针对单个基本块的操作
         """
-        self.instrs = copy.deepcopy(instrs)
+        self.instrs = self._clone_instrs_for_edit(instrs)
         if target_addr:
             print '[func_reorder_diversify.py:visit] Warning: target_addr is not supported for function reorder (function-level operation)'
         self.func_div_process()

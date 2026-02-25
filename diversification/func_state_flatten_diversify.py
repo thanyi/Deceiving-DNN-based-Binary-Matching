@@ -10,6 +10,7 @@ from disasm.Types import *
 from utils.ail_utils import *
 from utils.pp_print import *
 from addr_utils import select_block_by_addr
+import os
 
 
 class func_state_flatten_diversify(ailVisitor):
@@ -245,14 +246,28 @@ class func_state_flatten_diversify(ailVisitor):
         print '[func_state_flatten_diversify.py] flattened %s, rewritten_edges=%d' % (fname, changed)
         return True
 
+    def _clone_instrs_for_edit(self, instrs):
+        """
+        默认使用浅拷贝列表，避免对超长指令流做递归 deepcopy 导致内存峰值暴涨。
+        如需回退旧行为，可设置环境变量 FUNC_STATE_FLATTEN_DEEPCOPY=1。
+        """
+        force_deep = str(os.environ.get('FUNC_STATE_FLATTEN_DEEPCOPY', '0')).lower() in ('1', 'true', 'yes')
+        if force_deep:
+            return copy.deepcopy(instrs)
+        try:
+            return list(instrs)
+        except Exception:
+            return copy.deepcopy(instrs)
+
     def visit(self, instrs, target_addr=None):
         print 'start function state-machine flatten diversification'
-        self.instrs = copy.deepcopy(instrs)
 
         fname = self._choose_target_function(target_addr)
         if fname is None:
             print '[func_state_flatten_diversify.py] Warning: no candidate function, skip'
-            return self.instrs
+            return list(instrs)
+
+        self.instrs = self._clone_instrs_for_edit(instrs)
 
         self._rewrite_function_cfg(fname)
         return self.instrs

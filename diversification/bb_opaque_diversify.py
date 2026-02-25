@@ -11,6 +11,7 @@ from utils.ail_utils import *
 from utils.pp_print import *
 from junkcodes import get_junk_codes
 from addr_utils import addr_equals, select_block_by_addr
+import os
 
 obfs_proportion = 0.2
 
@@ -303,6 +304,19 @@ class bb_opaque_diversify(ailVisitor):
         # remove header1 mode when compiler is gcc-4.8
         self.attach_opaque_routines()
 
+    def _clone_instrs_for_edit(self, instrs):
+        """
+        默认使用浅拷贝列表，避免对整函数指令流做递归 deepcopy 造成内存峰值过高。
+        如需回退旧行为，可设置 BB_OPAQUE_DEEPCOPY=1。
+        """
+        force_deep = str(os.environ.get('BB_OPAQUE_DEEPCOPY', '0')).lower() in ('1', 'true', 'yes')
+        if force_deep:
+            return copy.deepcopy(instrs)
+        try:
+            return list(instrs)
+        except Exception:
+            return copy.deepcopy(instrs)
+
     def visit(self, instrs, target_addr = None):
         """
         访问者模式的入口方法
@@ -314,6 +328,6 @@ class bb_opaque_diversify(ailVisitor):
             list: 处理后的指令序列（已插入不透明谓词）
         """
         print 'start basic block opaque diversification'
-        self.instrs = copy.deepcopy(instrs)
+        self.instrs = self._clone_instrs_for_edit(instrs)
         self.bb_opaque_process(target_addr)
         return self.instrs

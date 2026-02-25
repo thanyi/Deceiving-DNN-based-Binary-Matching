@@ -109,7 +109,7 @@ class cfg_edge_split_diversify(ailVisitor):
 
     def visit(self, instrs, target_addr=None):
         print 'start cfg edge split diversification'
-        self.instrs = copy.deepcopy(instrs)
+        self.instrs = self._clone_instrs_for_edit(instrs)
 
         if isinstance(target_addr, str) and target_addr.strip() == '':
             target_addr = None

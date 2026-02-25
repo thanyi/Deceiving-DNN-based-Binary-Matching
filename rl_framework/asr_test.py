@@ -177,63 +177,7 @@ def _get_variant_set(sample: Dict) -> Optional[set]:
     return set(cleaned)
 
 
-ACTION_IDS_NO12 = [1, 2, 4, 7, 8, 9, 11, 13, 14, 15, 16]
 ACTION_IDS_WITH12 = [1, 2, 4, 7, 8, 9, 11, 12, 13, 14, 15, 16]
-
-
-def _action_ids_by_flag(include_action12: bool) -> List[int]:
-    return list(ACTION_IDS_WITH12 if include_action12 else ACTION_IDS_NO12)
-
-
-def _infer_action_layout_from_checkpoint(
-    model_path: str,
-    n_locs: int = 3,
-    prefer_include_action12: bool = True,
-) -> Tuple[List[int], bool, str]:
-    fallback = _action_ids_by_flag(bool(prefer_include_action12))
-    if not model_path or (not os.path.exists(model_path)):
-        return fallback, bool(prefer_include_action12), "checkpoint_missing"
-
-    try:
-        checkpoint = torch.load(model_path, map_location="cpu")
-    except Exception as e:
-        return fallback, bool(prefer_include_action12), f"checkpoint_load_failed:{e}"
-
-    state = checkpoint
-    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("policy_state_dict"), dict):
-        state = checkpoint["policy_state_dict"]
-    if not isinstance(state, dict):
-        return fallback, bool(prefer_include_action12), "checkpoint_state_invalid"
-
-    out_dim = None
-    source_key = ""
-    direct_keys = ("actor_head.6.bias", "actor_head.6.weight")
-    for key in direct_keys:
-        tensor = state.get(key)
-        if hasattr(tensor, "shape") and len(tensor.shape) >= 1:
-            out_dim = int(tensor.shape[0])
-            source_key = key
-            break
-    if out_dim is None:
-        for key, tensor in state.items():
-            if not (str(key).endswith("actor_head.6.bias") or str(key).endswith("actor_head.6.weight")):
-                continue
-            if hasattr(tensor, "shape") and len(tensor.shape) >= 1:
-                out_dim = int(tensor.shape[0])
-                source_key = str(key)
-                break
-
-    if out_dim is None:
-        return fallback, bool(prefer_include_action12), "actor_head_not_found"
-    if n_locs <= 0 or (out_dim % n_locs) != 0:
-        return fallback, bool(prefer_include_action12), f"invalid_joint_dim:{out_dim}"
-
-    n_actions = out_dim // n_locs
-    if n_actions == len(ACTION_IDS_WITH12):
-        return list(ACTION_IDS_WITH12), True, f"inferred:{source_key}:{out_dim}"
-    if n_actions == len(ACTION_IDS_NO12):
-        return list(ACTION_IDS_NO12), False, f"inferred:{source_key}:{out_dim}"
-    return fallback, bool(prefer_include_action12), f"unsupported_n_actions:{n_actions}"
 
 
 def _remove_path_quiet(path: str) -> bool:
@@ -1300,10 +1244,10 @@ class RLAgentRunner:
         safe_checkpoint_dir: Optional[str] = None,
         safe_i2v_dir: Optional[str] = None,
         safe_use_gpu: bool = False,
+        safe_cache: Optional[Dict] = None,
         jtrans_model_dir: Optional[str] = None,
         jtrans_tokenizer_dir: Optional[str] = None,
         jtrans_use_gpu: bool = False,
-        include_action12: Optional[bool] = None,
     ) -> None:
         self.dataset_path = dataset_path
         self.save_path = save_path
@@ -1312,16 +1256,9 @@ class RLAgentRunner:
         device = "cuda" if torch.cuda.is_available() and use_gpu else "cpu"
         print(f"[ASR] Loading model: {model_path} (device={device})")
         load_start = time.time()
-        if include_action12 is None:
-            action_ids, include_action12, infer_src = _infer_action_layout_from_checkpoint(
-                model_path=model_path,
-                n_locs=3,
-                prefer_include_action12=True,
-            )
-        else:
-            include_action12 = bool(include_action12)
-            action_ids = _action_ids_by_flag(include_action12)
-            infer_src = f"manual:{include_action12}"
+        include_action12 = True
+        action_ids = list(ACTION_IDS_WITH12)
+        infer_src = "fixed_with_action12"
 
         print(
             f"[ASR] Action layout: include_action12={include_action12} "
@@ -1347,10 +1284,11 @@ class RLAgentRunner:
             safe_i2v_dir=safe_i2v_dir,
             safe_use_gpu=safe_use_gpu,
             safe_cache_enabled=(detection_method == "safe"),
+            safe_cache=safe_cache,
             jtrans_model_dir=jtrans_model_dir,
             jtrans_tokenizer_dir=jtrans_tokenizer_dir,
             jtrans_use_gpu=jtrans_use_gpu,
-            include_action12=bool(include_action12),
+            include_action12=True,
         )
         self.env.target_score = 0.4
         self.env.set_state_dim(state_dim)
@@ -1449,6 +1387,7 @@ class GAAgentRunner:
         safe_checkpoint_dir: Optional[str] = None,
         safe_i2v_dir: Optional[str] = None,
         safe_use_gpu: bool = False,
+        safe_cache: Optional[Dict] = None,
         jtrans_model_dir: Optional[str] = None,
         jtrans_tokenizer_dir: Optional[str] = None,
         jtrans_use_gpu: bool = False,
@@ -1460,7 +1399,6 @@ class GAAgentRunner:
         seq_len: int = 8,
         loc_slots: int = 3,
         seed: Optional[int] = None,
-        include_action12: bool = True,
     ) -> None:
         self.dataset_path = dataset_path
         self.save_path = save_path
@@ -1484,10 +1422,11 @@ class GAAgentRunner:
             safe_i2v_dir=safe_i2v_dir,
             safe_use_gpu=safe_use_gpu,
             safe_cache_enabled=(detection_method == "safe"),
+            safe_cache=safe_cache,
             jtrans_model_dir=jtrans_model_dir,
             jtrans_tokenizer_dir=jtrans_tokenizer_dir,
             jtrans_use_gpu=jtrans_use_gpu,
-            include_action12=bool(include_action12),
+            include_action12=True,
         )
         self.env.target_score = 0.4
         self.env.set_state_dim(state_dim)
@@ -1743,14 +1682,28 @@ def build_attack_runner(
     max_steps: int,
     retriever: RetrievalBase,
 ):
+    safe_checkpoint_dir = args.safe_checkpoint_dir
+    safe_i2v_dir = args.safe_i2v_dir
+    safe_use_gpu = args.safe_use_gpu
+    safe_cache = None
+    if isinstance(retriever, SafeRetriever):
+        if not safe_checkpoint_dir:
+            safe_checkpoint_dir = retriever.checkpoint_dir
+        if not safe_i2v_dir:
+            safe_i2v_dir = retriever.i2v_dir
+        safe_use_gpu = bool(safe_use_gpu or retriever.use_gpu)
+        if args.env_detection == "safe":
+            safe_cache = retriever.safe_cache
+
     common_kwargs = {
         "dataset_path": dataset_path,
         "save_path": save_path,
         "max_steps": max_steps,
         "detection_method": args.env_detection,
-        "safe_checkpoint_dir": getattr(retriever, "checkpoint_dir", None),
-        "safe_i2v_dir": getattr(retriever, "i2v_dir", None),
-        "safe_use_gpu": getattr(retriever, "use_gpu", False),
+        "safe_checkpoint_dir": safe_checkpoint_dir,
+        "safe_i2v_dir": safe_i2v_dir,
+        "safe_use_gpu": safe_use_gpu,
+        "safe_cache": safe_cache,
         "jtrans_model_dir": args.jtrans_model_dir,
         "jtrans_tokenizer_dir": args.jtrans_tokenizer_dir,
         "jtrans_use_gpu": args.jtrans_use_gpu,
@@ -1759,7 +1712,6 @@ def build_attack_runner(
         return RLAgentRunner(
             model_path=args.model_path,
             use_gpu=args.use_gpu,
-            include_action12=(False if args.without_action12 else None),
             **common_kwargs,
         )
     if args.attack_agent == "ga":
@@ -1772,7 +1724,6 @@ def build_attack_runner(
             seq_len=args.ga_seq_len,
             loc_slots=args.ga_loc_slots,
             seed=args.ga_seed,
-            include_action12=(not args.without_action12),
             **common_kwargs,
         )
     raise ValueError(f"Unknown attack agent: {args.attack_agent}")
@@ -2506,11 +2457,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--use-gpu", action="store_true")
     parser.add_argument(
-        "--without-action12",
-        action="store_true",
-        help="Force disable action 12 in env/action space (default: auto infer from PPO checkpoint).",
-    )
-    parser.add_argument(
         "--mode",
         choices=["single", "multi_variant"],
         default="single",
@@ -2525,6 +2471,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--safe-checkpoint-dir", default=None)
     parser.add_argument("--safe-i2v-dir", default=None)
     parser.add_argument("--safe-use-gpu", action="store_true")
+    parser.add_argument(
+        "--safe-emb-cache-max",
+        type=int,
+        default=256,
+        help="SAFE embedding cache size limit (LRU, 0 disables cache).",
+    )
+    parser.add_argument(
+        "--safe-instr-cache-max",
+        type=int,
+        default=512,
+        help="SAFE instruction cache size limit (LRU, 0 disables cache).",
+    )
+    parser.add_argument(
+        "--uroboros-mem-mb",
+        type=int,
+        default=12288,
+        help="Memory limit for python2 uroboros subprocess (MB, 0 disables limit).",
+    )
+    parser.add_argument(
+        "--uroboros-timeout-sec",
+        type=int,
+        default=300,
+        help="Timeout for python2 uroboros subprocess (seconds, 0 disables timeout).",
+    )
     parser.add_argument("--jtrans-model-dir", default=None)
     parser.add_argument("--jtrans-tokenizer-dir", default=None)
     parser.add_argument("--jtrans-use-gpu", action="store_true")
@@ -2575,6 +2545,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    os.environ["SAFE_EMB_CACHE_MAX"] = str(max(0, int(args.safe_emb_cache_max)))
+    os.environ["SAFE_INSTR_CACHE_MAX"] = str(max(0, int(args.safe_instr_cache_max)))
+    os.environ["UROBOROS_MEM_MB"] = str(max(0, int(args.uroboros_mem_mb)))
+    os.environ["UROBOROS_TIMEOUT_SEC"] = str(max(0, int(args.uroboros_timeout_sec)))
 
     os.makedirs(args.save_path, exist_ok=True)
     csv_path = args.csv

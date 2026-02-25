@@ -166,6 +166,6 @@ class bb_branchfunc_diversify(ailVisitor):
 
     def visit(self, instrs, target_addr = None):
         print 'start bb branch function'
-        self.instrs = copy.deepcopy(instrs)
+        self.instrs = self._clone_instrs_for_edit(instrs)
         self.bb_div_process(target_addr)
         return self.instrs

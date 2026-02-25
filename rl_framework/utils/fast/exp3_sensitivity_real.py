@@ -35,6 +35,27 @@ plt.rcParams['font.size'] = 12
 
 # ================= 核心工具函数 =================
 
+def select_drift_subvector(vec, mode="no_section_b"):
+    """
+    从 240 维 ACFG 向量（去掉前 16 维 RL 历史后）选择漂移计算子向量。
+
+    布局:
+    - Section A: [0:40]
+    - Section B: [40:200]
+    - Section C: [200:240]
+    """
+    arr = np.asarray(vec)
+    if arr.shape[0] < 240:
+        return arr
+    if mode == "full":
+        return arr
+    if mode == "no_section_b":
+        return np.concatenate([arr[:40], arr[200:240]])
+    if mode == "section_c_only":
+        return arr[200:240]
+    raise ValueError(f"Unsupported drift mode: {mode}")
+
+
 def apply_nop_patch(binary_path, target_addr, num_bytes=4):
     """
     【物理攻击】在二进制文件的指定虚拟地址处写入 NOP 指令 (0x90)
@@ -127,8 +148,9 @@ def get_target_blocks(binary_path, func_name):
 
 # ================= 实验主流程 =================
 
-def run_experiment():
+def run_experiment(drift_mode="no_section_b"):
     print("\n[Experiment 3] Real Binary Patching Sensitivity Test...")
+    print(f"[*] Drift mode: {drift_mode}")
     
     # 1. 加载并筛选数据
     if not os.path.exists(DATASET_PATH):
@@ -164,7 +186,8 @@ def run_experiment():
     print("[-] Pre-calculating feature distribution...")
     base_vecs = []
     for s in samples[:50]:
-        v = env.extract_features_from_function(s['binary_path'], s['func_name'])[16:] # 去掉 RL 历史
+        raw_v = np.array(env.extract_features_from_function(s['binary_path'], s['func_name'])[16:]) # 去掉 RL 历史
+        v = select_drift_subvector(raw_v, mode=drift_mode)
         base_vecs.append(v)
     vec_std = np.std(base_vecs, axis=0)
     vec_std[vec_std == 0] = 1.0 # 防止除零
@@ -180,7 +203,8 @@ def run_experiment():
         # 为了保证对比公平，我们在这里显式指定 function_name
         env.original_binary = orig_path
         env.function_name = fname
-        vec_orig = np.array(env.extract_features_from_function(orig_path, fname)[16:])
+        raw_orig = np.array(env.extract_features_from_function(orig_path, fname)[16:])
+        vec_orig = select_drift_subvector(raw_orig, mode=drift_mode)
         
         # 2. 定位目标块
         crit_addr, edge_addr, rand_addr = get_target_blocks(orig_path, fname)
@@ -204,7 +228,8 @@ def run_experiment():
                     # 4. 提取变异后特征
                     # 注意：这是对新文件提取，特征提取器会重新计算中心性等
                     print(f"[exp3_sensitivity_real:run_experiment] patched_path: {patched_path}, fname: {fname}")
-                    vec_new = np.array(env.extract_features_from_function(patched_path, fname)[16:])
+                    raw_new = np.array(env.extract_features_from_function(patched_path, fname)[16:])
+                    vec_new = select_drift_subvector(raw_new, mode=drift_mode)
                     print(f"[exp3_sensitivity_real:run_experiment] vec_new shape: {vec_new.shape}, vec_orig shape: {vec_orig.shape}")
                     
                     # 确保特征维度一致
@@ -308,4 +333,6 @@ if __name__ == "__main__":
     # 固定随机种子
     random.seed(2024)
     np.random.seed(2024)
-    run_experiment()
+    # 可选: "full" / "no_section_b" / "section_c_only"
+    DRIFT_MODE = "no_section_b"
+    run_experiment(drift_mode=DRIFT_MODE)

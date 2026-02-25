@@ -106,6 +106,6 @@ class instr_garbage_diversify(ailVisitor):
 
     def visit(self, instrs, target_addr = None):
         print 'start garbage insertion ...'
-        self.instrs = copy.deepcopy(instrs)
+        self.instrs = self._clone_instrs_for_edit(instrs)
         self.insert_garbage(target_addr)
         return self.instrs

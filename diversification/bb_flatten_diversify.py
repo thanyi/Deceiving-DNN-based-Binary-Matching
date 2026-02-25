@@ -169,6 +169,6 @@ class bb_flatten_diversify(ailVisitor):
         self.update_process()
 
     def visit(self, instrs, target_addr = None):
-        self.instrs = copy.deepcopy(instrs)
+        self.instrs = self._clone_instrs_for_edit(instrs)
         self.bb_div_flatten(target_addr)
         return self.instrs

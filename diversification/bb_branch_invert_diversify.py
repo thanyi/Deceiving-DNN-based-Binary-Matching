@@ -122,7 +122,7 @@ class bb_branch_invert_diversify(ailVisitor):
 
     def visit(self, instrs, target_addr=None):
         print 'start branch inversion diversification'
-        self.instrs = copy.deepcopy(instrs)
+        self.instrs = self._clone_instrs_for_edit(instrs)
 
         if isinstance(target_addr, str) and target_addr.strip() == '':
             target_addr = None

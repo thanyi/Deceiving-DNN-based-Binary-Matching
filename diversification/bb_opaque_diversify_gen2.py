@@ -351,6 +351,6 @@ class bb_opaque_diversify_gen2(ailVisitor):
 
     def visit(self, instrs, target_addr = None):
         print 'start basic block opaque diversification'
-        self.instrs = copy.deepcopy(instrs)
+        self.instrs = self._clone_instrs_for_edit(instrs)
         self.bb_opaque_process(target_addr)
         return self.instrs

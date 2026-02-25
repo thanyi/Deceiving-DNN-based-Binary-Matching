@@ -265,6 +265,6 @@ class instr_replace_diversify(ailVisitor):
 
     def visit(self, instrs, target_addr = None):
         print 'start instruction replacement ...'
-        self.instrs = copy.deepcopy(instrs)
+        self.instrs = self._clone_instrs_for_edit(instrs)
         self.instr_replace(target_addr)
         return self.instrs

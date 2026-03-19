@@ -48,9 +48,14 @@ class BinaryPerturbationEnv:
         safe_i2v_dir=None,
         safe_use_gpu=False,
         safe_cache_enabled=False,
+        safe_cache=None,
         jtrans_model_dir=None,
         jtrans_tokenizer_dir=None,
         jtrans_use_gpu=False,
+        uniasm_root_dir=None,
+        uniasm_model_path=None,
+        uniasm_vocab_path=None,
+        uniasm_use_gpu=False,
         feature_mode="full",
         seed=None,
         adaptive_hold=True,
@@ -61,7 +66,7 @@ class BinaryPerturbationEnv:
         progress_reward_eps=1e-3,
         include_schedule_feature=False,
         strict_invalid_loc=True,
-        include_action12=False,
+        include_action12=True,
     ):
         """
         参数:
@@ -100,7 +105,7 @@ class BinaryPerturbationEnv:
         self.progress_reward_eps = float(progress_reward_eps)
         self.include_schedule_feature = bool(include_schedule_feature)
         self.strict_invalid_loc = bool(strict_invalid_loc)
-        self.include_action12 = bool(include_action12)
+        self.include_action12 = True
         self.current_hold_limit = self.hold_max
         self.episodes_on_current = 0
         self.current_sample_data = None # 存储当前样本的元数据
@@ -118,13 +123,30 @@ class BinaryPerturbationEnv:
         self.safe_checkpoint_dir = safe_checkpoint_dir
         self.safe_i2v_dir = safe_i2v_dir
         self.safe_use_gpu = safe_use_gpu
-        self.safe_cache_enabled = bool(safe_cache_enabled)
-        self.safe_cache = {} if self.safe_cache_enabled else None
+        if safe_cache is not None:
+            self.safe_cache_enabled = True
+            self.safe_cache = safe_cache
+        else:
+            self.safe_cache_enabled = bool(safe_cache_enabled)
+            self.safe_cache = {} if self.safe_cache_enabled else None
 
         self.jtrans_model_dir = jtrans_model_dir
         self.jtrans_tokenizer_dir = jtrans_tokenizer_dir
         self.jtrans_use_gpu = jtrans_use_gpu
         self._jtrans_cache = {}
+        self.uniasm_root_dir = uniasm_root_dir
+        self.uniasm_model_path = uniasm_model_path
+        self.uniasm_vocab_path = uniasm_vocab_path
+        self.uniasm_use_gpu = uniasm_use_gpu
+        if self.detection_method == "uniasm":
+            default_root = os.path.join(self.project_root, "detection_model", "UniASM")
+            if self.uniasm_root_dir is None:
+                self.uniasm_root_dir = default_root
+            if self.uniasm_model_path is None:
+                self.uniasm_model_path = os.path.join(self.uniasm_root_dir, "data", "uniasm_base.h5")
+            if self.uniasm_vocab_path is None:
+                self.uniasm_vocab_path = os.path.join(self.uniasm_root_dir, "data", "vocab_base.txt")
+        self._uniasm_cache = {}
         self.feature_mode = feature_mode
         self.seed = seed
         if seed is not None:
@@ -139,11 +161,8 @@ class BinaryPerturbationEnv:
         self.target_score = 0.40
         self.state_dim = 256  # 默认状态维度（256维），可以通过参数修改
         # 动作空间（必须与 PPOAgent 的 action_map 保持一致）
-        # 已接入新动作: 12/13/14/15/16（12 默认可选开关）
-        self.all_action_ids = [1, 2, 4, 7, 8, 9, 11]
-        if self.include_action12:
-            self.all_action_ids.append(12)
-        self.all_action_ids.extend([13, 14, 15, 16])
+        # 12/13/14/15/16 已接入；action 12 固定启用。
+        self.all_action_ids = [1, 2, 4, 7, 8, 9, 11, 12, 13, 14, 15, 16]
         self.action_ids = list(self.all_action_ids)
         self.action_id_to_index = {aid: idx for idx, aid in enumerate(self.action_ids)}
         # 固定历史特征维度：保持 7 bins，避免改变 16 维历史特征布局（影响已实现网络切片）。
@@ -479,14 +498,26 @@ class BinaryPerturbationEnv:
         feats = features.copy()
         if self.state_dim < 256 or len(feats) < 16:
             return feats
-        if self.feature_mode in ("no_progress", "no_progress_api", "no_section_c"):
+        if self.feature_mode == "no_history":
+            feats[0:16] = 0.0
+        if self.feature_mode == "no_section_a":
+            a_start = 16
+            a_end = a_start + 40
+            if a_end <= len(feats):
+                feats[a_start:a_end] = 0.0
+        if self.feature_mode == "no_section_b":
+            b_start = 16 + 40
+            b_end = b_start + 160
+            if b_end <= len(feats):
+                feats[b_start:b_end] = 0.0
+        if self.feature_mode in ("no_progress", "no_progress_api"):
             feats[12:16] = 0.0
         if self.feature_mode in ("no_api", "no_progress_api"):
             c_start = 16 + 40 + 160
             api_start = c_start + 8
             api_end = c_start + 30
-            if api_end < len(feats):
-                feats[api_start:api_end + 1] = 0.0
+            if api_end <= len(feats):
+                feats[api_start:api_end] = 0.0
         if self.feature_mode == "no_section_c":
             c_start = 16 + 40 + 160
             if c_start < len(feats):
@@ -935,13 +966,50 @@ class BinaryPerturbationEnv:
             
             # 在项目根目录执行命令
             try:
+                # 可选：限制 uroboros(Python2) 子进程内存，避免 OOM 把整次 ASR 跑挂。
+                # 默认不启用（保持用户可见行为不变），需要显式设置环境变量：
+                #   UROBOROS_MEM_MB=4096  (单位 MB)
+                # 同时可设置超时：
+                #   UROBOROS_TIMEOUT_SEC=600
+                uroboros_mem_mb = None
+                uroboros_timeout = None
+                try:
+                    uroboros_mem_mb = int(os.environ.get("UROBOROS_MEM_MB", "0"))
+                except Exception:
+                    uroboros_mem_mb = 0
+                try:
+                    uroboros_timeout = int(os.environ.get("UROBOROS_TIMEOUT_SEC", "0"))
+                except Exception:
+                    uroboros_timeout = 0
+
+                def _limit_child_resources():
+                    if not uroboros_mem_mb or uroboros_mem_mb <= 0:
+                        return
+                    try:
+                        import resource
+                        limit_bytes = int(uroboros_mem_mb) * 1024 * 1024
+                        # RLIMIT_AS: 虚拟内存上限（比 RSS 更早拦住暴涨）
+                        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+                    except Exception:
+                        # 限制失败就算了，别因为防护逻辑反而打断正常流程
+                        return
+
                 output = subprocess.check_output(
                     cmd, 
                     stderr=subprocess.STDOUT,
                     cwd=self.project_root,
-                    universal_newlines=True  # 返回字符串而不是字节
+                    universal_newlines=True,  # 返回字符串而不是字节
+                    timeout=(uroboros_timeout if uroboros_timeout and uroboros_timeout > 0 else None),
+                    preexec_fn=_limit_child_resources,
                 )
                 logger.debug("Uroboros output: {}".format(output))
+            except subprocess.TimeoutExpired as e:
+                logger.error(
+                    "Uroboros timeout after {}s (action={}, step={})".format(
+                        uroboros_timeout, action, current_step
+                    )
+                )
+                raise Exception("Uroboros mutation timeout: {}".format(e))
             except subprocess.CalledProcessError as e:
                 # 捕获详细的错误信息
                 error_output = e.output if hasattr(e, 'output') else str(e)
@@ -1009,11 +1077,18 @@ class BinaryPerturbationEnv:
                 jtrans_tokenizer_dir=self.jtrans_tokenizer_dir,
                 jtrans_use_gpu=self.jtrans_use_gpu,
                 jtrans_cache=self._jtrans_cache,
+                uniasm_root_dir=self.uniasm_root_dir,
+                uniasm_model_path=self.uniasm_model_path,
+                uniasm_vocab_path=self.uniasm_vocab_path,
+                uniasm_use_gpu=self.uniasm_use_gpu,
+                uniasm_cache=self._uniasm_cache,
             )
             if self.detection_method == "safe":
                 logger.success(f"[SAFE] eval_score={score}")
             elif self.detection_method == "jtrans":
                 logger.success(f"[JTRANS] eval_score={score}")
+            elif self.detection_method == "uniasm":
+                logger.success(f"[UNIASM] eval_score={score}")
             else:
                 logger.debug(f"[ASM2VEC] eval_score={score}")
             if score is None or grad is None:

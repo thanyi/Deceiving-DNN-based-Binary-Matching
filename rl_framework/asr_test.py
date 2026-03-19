@@ -804,6 +804,52 @@ class GMNRetriever(RetrievalBase):
         self._opcodes_dict: Optional[Dict[str, int]] = None
         self._runtime_feature_cache: Dict[Tuple[str, str, str], Dict] = {}
 
+    def _load_and_validate_base_features(self) -> Dict:
+        if self._base_feature_dict is not None:
+            return self._base_feature_dict
+
+        with open(self.features_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(
+                "GMN features json root must be dict(idb_path -> func_map), "
+                f"got {type(data).__name__}: {self.features_json}"
+            )
+        if not data:
+            raise ValueError(f"GMN features json is empty: {self.features_json}")
+
+        first_idb = next(iter(data.keys()))
+        first_funcs = data[first_idb]
+        if not isinstance(first_funcs, dict):
+            raise ValueError(
+                "GMN features json schema invalid: value type must be dict(fva -> feature_dict), "
+                f"but got {type(first_funcs).__name__} at idb={first_idb}. "
+                "你传入的很可能是 selected_coreutils_sample*.json（样本索引），"
+                "正确文件应类似 graph_func_dict_opc_200.json。"
+            )
+
+        if first_funcs:
+            first_fva = next(iter(first_funcs.keys()))
+            first_feat = first_funcs[first_fva]
+            if not isinstance(first_feat, dict):
+                raise ValueError(
+                    "GMN features json schema invalid: feature entry must be dict, "
+                    f"but got {type(first_feat).__name__} at {first_idb}:{first_fva}"
+                )
+            required = {"graph"}
+            if self.features_type == "opc":
+                required.add("opc")
+            missing = [k for k in required if k not in first_feat]
+            if missing:
+                raise ValueError(
+                    f"GMN features json missing keys {missing} at {first_idb}:{first_fva}. "
+                    "请确认使用的是 GMN 图特征文件。"
+                )
+
+        self._base_feature_dict = data
+        self._feature_idb_keys = set(str(k) for k in data.keys())
+        return self._base_feature_dict
+
     def _ensure_engine(self):
         if self._engine is not None:
             return self._engine
@@ -812,6 +858,7 @@ class GMNRetriever(RetrievalBase):
             raise ValueError(f"GMN checkpoint dir invalid: {self.checkpoint_dir}")
         if not os.path.isfile(self.features_json):
             raise ValueError(f"GMN features json invalid: {self.features_json}")
+        self._load_and_validate_base_features()
 
         try:
             import tensorflow as tf  # noqa: F401
@@ -870,25 +917,13 @@ class GMNRetriever(RetrievalBase):
         if self._feature_idb_keys is not None:
             return self._feature_idb_keys
         try:
-            with open(self.features_json, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                self._feature_idb_keys = set(str(k) for k in data.keys())
-            else:
-                self._feature_idb_keys = set()
+            self._load_and_validate_base_features()
         except Exception:
             self._feature_idb_keys = set()
         return self._feature_idb_keys
 
     def _get_base_feature_dict(self) -> Dict:
-        if self._base_feature_dict is not None:
-            return self._base_feature_dict
-        with open(self.features_json, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError(f"GMN features json must be dict: {self.features_json}")
-        self._base_feature_dict = data
-        return self._base_feature_dict
+        return self._load_and_validate_base_features()
 
     def _get_opcodes_dict(self) -> Dict[str, int]:
         if self.features_type != "opc":
@@ -1248,6 +1283,7 @@ class RLAgentRunner:
         jtrans_model_dir: Optional[str] = None,
         jtrans_tokenizer_dir: Optional[str] = None,
         jtrans_use_gpu: bool = False,
+        top_block_only: bool = False,
     ) -> None:
         self.dataset_path = dataset_path
         self.save_path = save_path
@@ -1292,6 +1328,9 @@ class RLAgentRunner:
         )
         self.env.target_score = 0.4
         self.env.set_state_dim(state_dim)
+        self.top_block_only = bool(top_block_only)
+        if self.top_block_only:
+            print("[ASR] Location policy: top-1 critical block only")
 
     def _pin_sample(self, sample_idx: int) -> None:
         sample = self.env.dataset[sample_idx]
@@ -1325,11 +1364,12 @@ class RLAgentRunner:
                 _value,
             ) = self.agent.select_action(state, explore=True)
 
-            next_state, _reward, done, info = self.env.step(actual_action, loc_idx)
+            applied_loc_idx = 0 if self.top_block_only else loc_idx
+            next_state, _reward, done, info = self.env.step(actual_action, applied_loc_idx)
             score = info.get("score", 1.0)
             print(
                 f"[ASR] Step {step + 1}/{max_steps} action={actual_action} "
-                f"loc={loc_idx} reward={_reward:.4f} score({self.env.detection_method})={score} "
+                f"loc={applied_loc_idx} reward={_reward:.4f} score({self.env.detection_method})={score} "
                 f"done={done} should_reset={info.get('should_reset', False)}"
             )
             steps_used = step + 1
@@ -1399,6 +1439,7 @@ class GAAgentRunner:
         seq_len: int = 8,
         loc_slots: int = 3,
         seed: Optional[int] = None,
+        top_block_only: bool = False,
     ) -> None:
         self.dataset_path = dataset_path
         self.save_path = save_path
@@ -1411,6 +1452,7 @@ class GAAgentRunner:
         self.seq_len = max(1, int(seq_len))
         self.loc_slots = max(1, int(loc_slots))
         self.rng = random.Random(seed)
+        self.top_block_only = bool(top_block_only)
 
         self.env = BinaryPerturbationEnv(
             save_path=self.save_path,
@@ -1436,6 +1478,8 @@ class GAAgentRunner:
             f"elite={self.elite_size}, mut={self.mutation_rate}, cross={self.crossover_rate}, "
             f"seq_len={self.seq_len}, loc_slots={self.loc_slots})"
         )
+        if self.top_block_only:
+            print("[ASR] Location policy: top-1 critical block only")
 
     def _pin_sample(self, sample_idx: int) -> None:
         sample = self.env.dataset[sample_idx]
@@ -1455,6 +1499,8 @@ class GAAgentRunner:
         self.env.reset(force_switch=False)
 
     def _valid_locs(self) -> List[int]:
+        if self.top_block_only:
+            return [0]
         mask = self.env.get_loc_mask(self.loc_slots)
         valid = [i for i, m in enumerate(mask) if m]
         return valid if valid else [0]
@@ -1512,7 +1558,8 @@ class GAAgentRunner:
         for action, loc_idx in genome:
             if steps_used >= step_budget:
                 break
-            _state, _reward, done, info = self.env.step(action, loc_idx)
+            applied_loc_idx = 0 if self.top_block_only else loc_idx
+            _state, _reward, done, info = self.env.step(action, applied_loc_idx)
             steps_used += 1
             if info.get("binary"):
                 final_binary = info["binary"]
@@ -1707,6 +1754,7 @@ def build_attack_runner(
         "jtrans_model_dir": args.jtrans_model_dir,
         "jtrans_tokenizer_dir": args.jtrans_tokenizer_dir,
         "jtrans_use_gpu": args.jtrans_use_gpu,
+        "top_block_only": args.top_block_only,
     }
     if args.attack_agent == "ppo":
         return RLAgentRunner(
@@ -2521,6 +2569,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["ppo", "ga"],
         default="ppo",
         help="Mutation attacker: PPO policy or GA baseline.",
+    )
+    parser.add_argument(
+        "--top-block-only",
+        action="store_true",
+        help="Always mutate only the highest-scored ACFG block (loc_idx=0).",
     )
     parser.add_argument("--ga-population-size", type=int, default=6)
     parser.add_argument("--ga-generations", type=int, default=4)

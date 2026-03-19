@@ -890,10 +890,18 @@ def train_ppo(args):
     target_end = 0.4
     target_decay_episodes = 1200
     fixed_episodes = max(0, int(args.fixed_episodes))
-    success_gate = 0.55
-    env.target_score = target_start
+    success_gate = 0.8
+    targeted_train_enabled = bool(args.targeted_train)
+    targeted_success_threshold = float(args.targeted_train_threshold)
+    env.target_score = -1.0 if targeted_train_enabled else target_start
 
-    if args.detection_method == "safe":
+    if targeted_train_enabled:
+        logger.success(
+            f"[{method_tag} targeted-train] success_threshold={targeted_success_threshold:.3f} "
+            f"reward_scale={args.targeted_train_reward_scale} "
+            f"success_bonus={args.targeted_train_success_bonus}"
+        )
+    elif args.detection_method == "safe":
         env.no_change_penalty = 0.05
         logger.success(
             f"[SAFE train] target_score fixed={target_start} for first {fixed_episodes} eps, "
@@ -922,6 +930,106 @@ def train_ppo(args):
             agent.set_action_prior(prior_cfg)
         else:
             logger.warning("高扰动动作先验配置为空，已跳过")
+
+    targeted_train_rng = random.Random(args.targeted_train_seed)
+    targeted_train_sym_cache = {}
+    targeted_train_original_asm_cache = {}
+    targeted_train_mutated_asm_cache = {}
+
+    def _pin_training_sample(sample_idx: int) -> None:
+        sample = env.dataset[sample_idx]
+        env.current_sample_idx = sample_idx
+        env.current_sample_data = sample
+        env.episodes_on_current = 0
+        env.original_func_addr = None
+        env.original_binary = sample["binary_path"]
+        env.function_name = sample["func_name"]
+
+    def _sample_targeted_training_pair() -> Optional[Dict]:
+        if not env.dataset or len(env.dataset) < 2:
+            return None
+        max_attempts = 120
+        for _ in range(max_attempts):
+            attacker_idx = targeted_train_rng.randrange(len(env.dataset))
+            target_idx = targeted_train_rng.randrange(len(env.dataset))
+            if attacker_idx == target_idx:
+                continue
+            attacker = env.dataset[attacker_idx]
+            target = env.dataset[target_idx]
+            attacker_id = str(attacker.get("id", "")).strip()
+            target_id = str(target.get("id", "")).strip()
+            if attacker_id and target_id and attacker_id == target_id:
+                continue
+            if str(attacker.get("func_name", "")) == str(target.get("func_name", "")):
+                continue
+            if not attacker.get("binary_path") or _parse_addr(attacker.get("func_addr")) is None:
+                continue
+            if not target.get("binary_path") or _parse_addr(target.get("func_addr")) is None:
+                continue
+            return {
+                "attacker_idx": attacker_idx,
+                "attacker": attacker,
+                "target": target,
+            }
+        return None
+
+    def _resolve_targeted_mutated_addr(mutated_binary: str, attacker_func_name: str, attacker_item: Dict) -> Optional[int]:
+        bpath = os.path.abspath(mutated_binary)
+        attacker_binary = os.path.abspath(str(attacker_item.get("binary_path", "")))
+        attacker_addr = _parse_addr(attacker_item.get("func_addr"))
+        if attacker_addr is None:
+            return None
+        if attacker_binary and bpath == attacker_binary:
+            return attacker_addr
+        sym_map = targeted_train_sym_cache.get(bpath)
+        if sym_map is None:
+            sym_map = _load_sym_to_addr(_find_sym_to_addr(bpath))
+            targeted_train_sym_cache[bpath] = sym_map
+        if not sym_map:
+            return None
+        return _parse_addr(sym_map.get(attacker_func_name))
+
+    def _score_targeted_similarity(
+        mutated_binary: str,
+        attacker_func_name: str,
+        target_item: Dict,
+        attacker_item: Dict,
+    ) -> Optional[float]:
+        target_binary = target_item.get("binary_path")
+        target_func = str(target_item.get("func_name", ""))
+        target_addr = _parse_addr(target_item.get("func_addr"))
+        if not target_binary or not target_func or target_addr is None:
+            return None
+
+        attacker_addr = _resolve_targeted_mutated_addr(mutated_binary, attacker_func_name, attacker_item)
+        if attacker_addr is None:
+            return None
+
+        score, _grad = run_one(
+            original_binary=target_binary,
+            mutated_binary=mutated_binary,
+            model_original=None,
+            checkdict={},
+            function_name=target_func,
+            detection_method=args.detection_method,
+            asm_work_dir=env._asm_work_dir,
+            original_asm_cache=targeted_train_original_asm_cache,
+            simple_mode=True,
+            original_func_addr=target_addr,
+            mutated_func_addr=attacker_addr,
+            safe_checkpoint_dir=args.safe_checkpoint_dir,
+            safe_i2v_dir=args.safe_i2v_dir,
+            safe_use_gpu=args.safe_use_gpu,
+            mutated_asm_cache=targeted_train_mutated_asm_cache,
+            safe_cache=env.safe_cache,
+            jtrans_model_dir=args.jtrans_model_dir,
+            jtrans_tokenizer_dir=args.jtrans_tokenizer_dir,
+            jtrans_use_gpu=args.jtrans_use_gpu,
+            jtrans_cache=env._jtrans_cache,
+        )
+        if score is None:
+            return None
+        return float(score)
 
     targeted_evaluator = None
     if args.targeted_eval_interval > 0:
@@ -1011,35 +1119,58 @@ def train_ppo(args):
             logger.info(f"回合 {episode + 1}/{args.episodes}")
             # 训练动态：基于最近成功率调整目标分数（避免单纯线性下降）
             recent_success_rate = np.mean(success_window) if success_window else 0.0
-            if episode < fixed_episodes:
-                env.target_score = target_start
-                if episode % 10 == 0:
-                    logger.success(
-                        f"[{method_tag} train] target_score={env.target_score:.4f} "
-                        f"(ep={episode}, warmup<{fixed_episodes}) "
-                        f"sr={recent_success_rate:.2f}"
-                    )
+            if targeted_train_enabled:
+                env.target_score = -1.0
             else:
-                decay_ep = episode - fixed_episodes
-                progress = min(1.0, decay_ep / max(1, target_decay_episodes))
-                linear_target = target_start + (target_end - target_start) * progress
-                step = abs(target_start - target_end) / max(1, target_decay_episodes)
-                if recent_success_rate >= success_gate:
-                    env.target_score = max(linear_target, env.target_score - step)
-                lo = min(target_start, target_end)
-                hi = max(target_start, target_end)
-                env.target_score = max(lo, min(hi, env.target_score))
-                if episode % 10 == 0:
-                    logger.success(
-                        f"[{method_tag} train] target_score={env.target_score:.4f} "
-                        f"(ep={episode}, decay_ep={decay_ep}) "
-                        f"sr={recent_success_rate:.2f} gate={success_gate:.2f}"
-                    )
-            
-            state = env.reset()
+                if episode < fixed_episodes:
+                    env.target_score = target_start
+                    if episode % 10 == 0:
+                        logger.success(
+                            f"[{method_tag} train] target_score={env.target_score:.4f} "
+                            f"(ep={episode}, warmup<{fixed_episodes}) "
+                            f"sr={recent_success_rate:.2f}"
+                        )
+                else:
+                    decay_ep = episode - fixed_episodes
+                    progress = min(1.0, decay_ep / max(1, target_decay_episodes))
+                    linear_target = target_start + (target_end - target_start) * progress
+                    step = abs(target_start - target_end) / max(1, target_decay_episodes)
+                    if recent_success_rate >= success_gate:
+                        env.target_score = max(linear_target, env.target_score - step)
+                    lo = min(target_start, target_end)
+                    hi = max(target_start, target_end)
+                    env.target_score = max(lo, min(hi, env.target_score))
+                    if episode % 10 == 0:
+                        logger.success(
+                            f"[{method_tag} train] target_score={env.target_score:.4f} "
+                            f"(ep={episode}, decay_ep={decay_ep}) "
+                            f"sr={recent_success_rate:.2f} gate={success_gate:.2f}"
+                        )
+
+            targeted_pair = None
+            targeted_prev_score = None
+            if targeted_train_enabled:
+                targeted_pair = _sample_targeted_training_pair()
+                if targeted_pair is None:
+                    logger.warning("targeted_train: 无法采样有效的源-目标函数对，跳过当前回合")
+                    pbar.update(1)
+                    continue
+                _pin_training_sample(targeted_pair["attacker_idx"])
+                state = env.reset(force_switch=False)
+                attacker_func_name = str(targeted_pair["attacker"].get("func_name", ""))
+                targeted_prev_score = _score_targeted_similarity(
+                    env.current_binary, attacker_func_name, targeted_pair["target"], targeted_pair["attacker"]
+                )
+                if targeted_prev_score is None:
+                    logger.warning("targeted_train: 初始源-目标相似度计算失败，跳过当前回合")
+                    agent.clear_memory()
+                    pbar.update(1)
+                    continue
+            else:
+                state = env.reset()
             
             episode_actions = [] 
-            initial_score = 1.0 # 【优化】默认初始为1.0，防止第一步没取到score导致计算错误
+            initial_score = float(targeted_prev_score) if targeted_train_enabled and targeted_prev_score is not None else 1.0
             
             episode_reward = 0
             episode_loc_total_steps = 0
@@ -1059,7 +1190,31 @@ def train_ppo(args):
                 prev_state = state
                 
                 # 执行动作
-                next_state, reward, done, info = env.step(actual_action, loc_idx)
+                next_state, env_reward, done, info = env.step(actual_action, loc_idx)
+                reward = env_reward
+                if targeted_train_enabled:
+                    done = bool(step + 1 >= args.max_steps)
+                    target_score = None
+                    if info.get('binary') and targeted_pair is not None:
+                        target_score = _score_targeted_similarity(
+                            info.get('binary'),
+                            str(targeted_pair["attacker"].get("func_name", "")),
+                            targeted_pair["target"],
+                            targeted_pair["attacker"],
+                        )
+                    if target_score is None:
+                        reward = -float(args.targeted_train_invalid_penalty)
+                        info['targeted_score'] = None
+                    else:
+                        delta = float(target_score - targeted_prev_score)
+                        reward = float(args.targeted_train_reward_scale) * delta
+                        if not info.get('loc_valid', True):
+                            reward -= float(args.targeted_train_invalid_penalty)
+                        if target_score >= targeted_success_threshold:
+                            reward += float(args.targeted_train_success_bonus)
+                            done = True
+                        targeted_prev_score = float(target_score)
+                        info['targeted_score'] = float(target_score)
                 logger.success(f"Step {step}: Loc {loc_idx}, Action {actual_action} (JointIdx {joint_idx}), reward {reward:.4f}")
                 # input("step down, press enter to continue")
                 episode_reward += reward
@@ -1078,23 +1233,35 @@ def train_ppo(args):
                     # 记录每步指标 (当前设置：每步都记，如果太慢可改为 if step % 5 == 0)
                     writer.add_scalar('Step/Shaped_Reward', reward, global_total_steps)            # Agent 每做一步动作得到的即时反馈（包含进步分、惩罚分等）。
                     writer.add_scalar('Step/Critic_Value', value, global_total_steps)                     # Critic 网络（裁判）认为“当前这个状态，未来能拿多少分”。
-                    if 'score' in info:
+                    if targeted_train_enabled:
+                        if info.get('targeted_score') is not None:
+                            writer.add_scalar('Step/Similarity_Score', info['targeted_score'], global_total_steps)
+                    elif 'score' in info:
                         writer.add_scalar('Step/Similarity_Score', info['score'], global_total_steps)     # 每一步变异后的代码与原代码的相似度。
 
                 # 统计动作级别的 reward/success
                 stat = action_stats.setdefault(actual_action, {'count': 0, 'reward_sum': 0.0, 'success': 0})
                 stat['count'] += 1
                 stat['reward_sum'] += reward
-                if info.get('score', 1.0) < env.target_score:
+                if targeted_train_enabled:
+                    if info.get('targeted_score') is not None and info.get('targeted_score') >= targeted_success_threshold:
+                        stat['success'] += 1
+                elif info.get('score', 1.0) < env.target_score:
                     stat['success'] += 1
 
                 # 存储经验
                 agent.store_transition(prev_state, joint_idx, reward, log_prob, value, done, loc_mask=loc_mask)
  
                 if 'binary' in info:
+                    step_score = (
+                        info.get('targeted_score')
+                        if targeted_train_enabled else info.get('score', 1.0)
+                    )
+                    if targeted_train_enabled and step_score is None:
+                        step_score = float(targeted_prev_score) if targeted_prev_score is not None else -1.0
                     last_binary_info = {
                         'episode': episode, 'step': step,
-                        'binary': info['binary'], 'score': info.get('score', 1.0),
+                        'binary': info['binary'], 'score': step_score,
                         'func': info.get('target_func', 'unknown') # 存一下函数名
                     }
                 
@@ -1110,18 +1277,37 @@ def train_ppo(args):
             
             # ✅ 统一的统计逻辑
             # 1. 统计成功率和降分 (使用 last_binary_info 更安全)
-            final_score = last_binary_info['score'] if last_binary_info else 1.0
+            final_score = last_binary_info['score'] if last_binary_info else (
+                float(targeted_prev_score) if targeted_train_enabled and targeted_prev_score is not None else 1.0
+            )
             target_func = last_binary_info['func'] if last_binary_info else "unknown"
 
-            is_success = final_score < env.target_score
-            success_window.append(1 if is_success else 0)
-            similarity_drop_window.append(max(0.0, initial_score - final_score))
+            if targeted_train_enabled:
+                target_func = str(targeted_pair["target"].get("func_name", "unknown")) if targeted_pair else target_func
+                is_success = final_score >= targeted_success_threshold
+                success_window.append(1 if is_success else 0)
+                similarity_drop_window.append(max(0.0, final_score - initial_score))
+                if is_success:
+                    success_count += 1
+                    logger.success(
+                        f"🎯 定向成功! 源函数: {str(targeted_pair['attacker'].get('func_name', 'unknown')) if targeted_pair else 'unknown'} "
+                        f"| 目标函数: {target_func} | 相似度: {final_score:.4f}"
+                    )
+                    with open(os.path.join(args.save_path, 'success.log'), 'a') as f:
+                        f.write(
+                            f"Ep {episode}, Src: {str(targeted_pair['attacker'].get('func_name', 'unknown')) if targeted_pair else 'unknown'}, "
+                            f"Tgt: {target_func}, Score: {final_score:.4f}\n"
+                        )
+            else:
+                is_success = final_score < env.target_score
+                success_window.append(1 if is_success else 0)
+                similarity_drop_window.append(max(0.0, initial_score - final_score))
 
-            if is_success:
-                success_count += 1
-                logger.success(f"🎉 攻破! 目标: {info.get('target_func')} | 分数: {final_score:.4f}")
-                with open(os.path.join(args.save_path, 'success.log'), 'a') as f:
-                    f.write(f"Ep {episode}, Func: {info.get('target_func')}, Score: {final_score:.4f}\n")
+                if is_success:
+                    success_count += 1
+                    logger.success(f"🎉 攻破! 目标: {info.get('target_func')} | 分数: {final_score:.4f}")
+                    with open(os.path.join(args.save_path, 'success.log'), 'a') as f:
+                        f.write(f"Ep {episode}, Func: {info.get('target_func')}, Score: {final_score:.4f}\n")
 
             if last_binary_info:
                 episode_binaries.append(last_binary_info)
@@ -1156,8 +1342,9 @@ def train_ppo(args):
                 if global_loc_total_steps > 0 else 0.0
             )
 
+            metric_name = "平均提分" if targeted_train_enabled else "平均降分"
             logger.success(
-                f"回合总结: 总奖={episode_reward:.2f} | 滑动成功率={current_success_rate:.2f} | 平均降分={avg_drop:.2f} "
+                f"回合总结: 总奖={episode_reward:.2f} | 滑动成功率={current_success_rate:.2f} | {metric_name}={avg_drop:.2f} "
                 f"| loc_valid=False(本回合)={episode_loc_invalid_ratio:.2%} | loc_valid=False(全局)={global_loc_invalid_ratio:.2%} "
                 f"| 步数={step+1} | 目标函数={target_func} | 目标二进制={last_binary_info['binary'] if last_binary_info else 'N/A'}"
             )
@@ -1195,7 +1382,10 @@ def train_ppo(args):
                     stat['success'] = 0
             
             writer.add_scalar('Main/Success_Rate_MA50', current_success_rate, episode)      # 最近 50 个回合中，成功绕过检测（分数 < 0.4）的比例。
-            writer.add_scalar('Main/Similarity_Drop_MA50', avg_drop, episode)               # 最近 50 个回合中，平均把相似度降低了多少（初始分 1.0 - 最终分）
+            if targeted_train_enabled:
+                writer.add_scalar('Main/Similarity_Gain_MA50', avg_drop, episode)
+            else:
+                writer.add_scalar('Main/Similarity_Drop_MA50', avg_drop, episode)               # 最近 50 个回合中，平均把相似度降低了多少（初始分 1.0 - 最终分）
             writer.add_scalar('Main/Episode_Reward', episode_reward, episode)               # Agent 在一个回合内拿到的所有奖励之和。
             writer.add_scalar('Main/Episode_Length', step + 1, episode)                      # 一个回合内总共执行了多少步。
             writer.add_scalar('Debug/Loc_Invalid_Ratio_Episode', episode_loc_invalid_ratio, episode)
@@ -1242,7 +1432,7 @@ def train_ppo(args):
                 writer.add_scalar('FixedASR/Recall_Post', asr_metrics.get('recall_post', 0.0), episode)
 
             pbar.set_postfix_str(
-                f"sr={current_success_rate:.2f} drop={avg_drop:.2f} "
+                f"sr={current_success_rate:.2f} {'gain' if targeted_train_enabled else 'drop'}={avg_drop:.2f} "
                 f"loss={loss:.2f} adv_std={update_info['adv_std_raw']:.2f}"
             )
             pbar.update(1)
@@ -1306,7 +1496,7 @@ if __name__ == "__main__":
     parser.add_argument('--epsilon', type=float, default=0.15)
     parser.add_argument('--n-locs', type=int, default=3)
     parser.add_argument('--episodes', type=int, default=6000)
-    parser.add_argument('--max-steps', type=int, default=40)
+    parser.add_argument('--max-steps', type=int, default=25)
     parser.add_argument('--save-interval', type=int, default=50)
     parser.add_argument('--sample-hold-interval', type=int, default=15)
     parser.add_argument('--stall-limit', type=int, default=8)
@@ -1351,6 +1541,19 @@ if __name__ == "__main__":
         default='full'
     )
     parser.add_argument('--seed', type=int, default=None)
+    # 定向训练（Targeted Training）
+    parser.add_argument('--targeted-train', action='store_true',
+                        help='启用定向训练：每回合随机选择源函数和无关目标函数，奖励相似度上升')
+    parser.add_argument('--targeted-train-threshold', type=float, default=0.70,
+                        help='定向训练成功阈值（与目标函数相似度 >= 该值）')
+    parser.add_argument('--targeted-train-reward-scale', type=float, default=10.0,
+                        help='定向训练每步奖励系数（reward = scale * Δsimilarity）')
+    parser.add_argument('--targeted-train-success-bonus', type=float, default=1.0,
+                        help='定向训练达到阈值时的额外奖励')
+    parser.add_argument('--targeted-train-invalid-penalty', type=float, default=0.1,
+                        help='定向训练中 loc 无效时附加惩罚')
+    parser.add_argument('--targeted-train-seed', type=int, default=1234,
+                        help='定向训练源-目标配对采样随机种子')
     # 定向攻击评测（Targeted Attack Eval）
     parser.add_argument('--targeted-eval-interval', type=int, default=0,
                         help='每隔多少个 episode 执行一次定向攻击评测（0 表示关闭）')
@@ -1414,7 +1617,7 @@ if __name__ == "__main__":
     # - asm2vec: 0.4（不固定轮数）
     if args.fixed_threshold is None:
         if args.detection_method == "jtrans":
-            args.fixed_threshold = 0.88
+            args.fixed_threshold = 0.85
         elif args.detection_method == "safe":
             args.fixed_threshold = 0.9
         else:

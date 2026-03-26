@@ -10,11 +10,14 @@ import hashlib
 import json
 import os
 import pickle
+from contextlib import nullcontext
 import random
 import shutil
+import sys
 import threading
 import time
 import tempfile
+from collections import OrderedDict
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
@@ -44,6 +47,49 @@ def validate_safe_config(checkpoint_dir: Optional[str], i2v_dir: Optional[str]) 
         raise ValueError(f"SAFE checkpoint dir invalid: {checkpoint_dir}")
     if not _is_valid_dir(i2v_dir):
         raise ValueError(f"SAFE i2v dir invalid: {i2v_dir}")
+
+
+def _get_uniasm_paths(
+    root_dir: Optional[str] = None,
+    model_path: Optional[str] = None,
+    vocab_path: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = root_dir or os.environ.get(
+        "UNIASM_ROOT",
+        os.path.join(project_root, "detection_model", "UniASM"),
+    )
+    model = model_path or os.environ.get(
+        "UNIASM_MODEL_PATH",
+        os.path.join(base, "data", "uniasm_base.h5"),
+    )
+    vocab = vocab_path or os.environ.get(
+        "UNIASM_VOCAB_PATH",
+        os.path.join(base, "data", "vocab_base.txt"),
+    )
+    return base, model, vocab
+
+
+def validate_uniasm_config(
+    root_dir: Optional[str],
+    model_path: Optional[str],
+    vocab_path: Optional[str],
+) -> Tuple[str, str, str]:
+    base, model, vocab = _get_uniasm_paths(
+        root_dir=root_dir,
+        model_path=model_path,
+        vocab_path=vocab_path,
+    )
+    if not _is_valid_dir(base):
+        raise ValueError(f"UniASM root dir invalid: {base}")
+    if not os.path.isfile(model):
+        raise ValueError(
+            f"UniASM model file missing: {model}. "
+            "请下载 uniasm_base.h5 并通过 --uniasm-model-path 指定。"
+        )
+    if not os.path.isfile(vocab):
+        raise ValueError(f"UniASM vocab file missing: {vocab}")
+    return base, model, vocab
 
 
 def _find_sym_to_addr(binary_path: str) -> Optional[str]:
@@ -772,6 +818,301 @@ class JTransRetriever(RetrievalBase):
         return scored
 
 
+class UniASMRetriever(RetrievalBase):
+    name = "uniasm"
+
+    _UNIASM_CONFIG_JSON = """
+{
+    "hidden_act": "gelu",
+    "hidden_size": 516,
+    "intermediate_size": 3072,
+    "max_position_embeddings": 256,
+    "num_hidden_layers": 4,
+    "vocab_size": 21000,
+    "num_attention_heads": 12
+}
+"""
+
+    def __init__(
+        self,
+        root_dir: Optional[str],
+        model_path: Optional[str],
+        vocab_path: Optional[str],
+        use_gpu: bool,
+        asm_work_dir: Optional[str],
+        retrieval_workers: int = 1,
+        emb_cache_max: int = 512,
+        log_every: int = 0,
+    ) -> None:
+        super().__init__(log_every=log_every)
+        base, model, vocab = validate_uniasm_config(
+            root_dir=root_dir,
+            model_path=model_path,
+            vocab_path=vocab_path,
+        )
+        self.uniasm_root = base
+        self.model_path = model
+        self.vocab_path = vocab
+        self.use_gpu = bool(use_gpu)
+        self.asm_work_dir = asm_work_dir or tempfile.mkdtemp(prefix="uniasm_asm_")
+        self.retrieval_workers = int(retrieval_workers or 1)
+        self.original_asm_cache: Dict = {}
+        self.mutated_asm_cache: Dict = {}
+
+        self._session_lock = threading.Lock()
+        self._infer_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._session: Optional[Dict] = None
+        self._emb_cache: "OrderedDict[Tuple[str, float], np.ndarray]" = OrderedDict()
+        self._emb_cache_max = max(0, int(emb_cache_max))
+
+    def _get_worker_dir(self, cand_idx: int) -> str:
+        if self.retrieval_workers <= 1:
+            os.makedirs(self.asm_work_dir, exist_ok=True)
+            return self.asm_work_dir
+        worker_dir = os.path.join(self.asm_work_dir, f"cand_{cand_idx}")
+        os.makedirs(worker_dir, exist_ok=True)
+        return worker_dir
+
+    def _get_query_addr(self, query: Dict, query_kind: str) -> Optional[int]:
+        if query_kind == "original":
+            addr = _parse_addr(query.get("func_addr"))
+            if addr is None:
+                raise ValueError("original query missing func_addr in dataset json")
+            return addr
+        if query_kind == "mutated":
+            return _resolve_mutated_addr(query.get("binary_path", ""), query.get("func_name"))
+        raise ValueError(f"query_kind must be original/mutated, got {query_kind}")
+
+    def _prepare_import_path(self) -> None:
+        if self.uniasm_root in sys.path:
+            return
+        old_utils = sys.modules.get("utils")
+        old_utils_file = os.path.abspath(getattr(old_utils, "__file__", "")) if old_utils else ""
+        uniasm_prefix = os.path.abspath(self.uniasm_root) + os.sep
+        if old_utils and old_utils_file and not old_utils_file.startswith(uniasm_prefix):
+            for mod in list(sys.modules.keys()):
+                if mod == "utils" or mod.startswith("utils."):
+                    sys.modules.pop(mod, None)
+        sys.path.insert(0, self.uniasm_root)
+
+    def _get_uniasm_session(self) -> Dict:
+        with self._session_lock:
+            if self._session is not None:
+                return self._session
+
+            self._prepare_import_path()
+            try:
+                from utils.vocab import (
+                    check_vocab,
+                    generate_embeddings,
+                    init_tokenizer,
+                    load_asmfile,
+                )
+                from utils.model import load_weights_uniasm
+                import tensorflow as tf
+            except Exception as e:
+                raise RuntimeError(f"UniASM import/init failed: {e}")
+
+            try:
+                if not self.use_gpu:
+                    tf.config.set_visible_devices([], "GPU")
+            except Exception:
+                pass
+
+            model = load_weights_uniasm(self.model_path, self._UNIASM_CONFIG_JSON)
+            tokenizer = init_tokenizer(self.vocab_path)
+            self._session = {
+                "model": model,
+                "tokenizer": tokenizer,
+                "load_asmfile": load_asmfile,
+                "check_vocab": check_vocab,
+                "generate_embeddings": generate_embeddings,
+            }
+            return self._session
+
+    def _extract_asm(
+        self,
+        binary_path: str,
+        func_name: str,
+        func_addr: Optional[int],
+        worker_dir: str,
+        cache_dict: Dict,
+        cache_prefix: str,
+    ) -> Optional[str]:
+        if not binary_path or not os.path.isfile(binary_path):
+            return None
+
+        addr_tag = hex(func_addr) if isinstance(func_addr, int) else str(func_addr)
+        cache_key = (os.path.abspath(binary_path), str(func_name), addr_tag)
+        cached = cache_dict.get(cache_key)
+        if cached and os.path.exists(cached):
+            return cached
+
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        asm2vec_root = os.path.join(project_root, "detection_model", "asm2vec-pytorch")
+        if asm2vec_root not in sys.path:
+            sys.path.insert(0, asm2vec_root)
+        try:
+            from scripts.bin2asm_util import binfunc2asm
+        except Exception:
+            return None
+
+        out_dir = os.path.join(worker_dir, cache_prefix)
+        os.makedirs(out_dir, exist_ok=True)
+        asm_path = binfunc2asm(
+            ipath=binary_path,
+            target_func_name=str(func_name),
+            opath=out_dir,
+            verbose=False,
+            current_sym_addr=(hex(func_addr) if isinstance(func_addr, int) else None),
+        )
+        if not asm_path:
+            return None
+        cache_dict[cache_key] = asm_path
+        return asm_path
+
+    def _get_embedding(self, asm_path: str) -> Optional[np.ndarray]:
+        if not asm_path or not os.path.exists(asm_path):
+            return None
+        cache_key = (os.path.abspath(asm_path), os.path.getmtime(asm_path))
+        with self._cache_lock:
+            emb = self._emb_cache.get(cache_key)
+            if emb is not None:
+                self._emb_cache.move_to_end(cache_key)
+                return emb
+
+        sess = self._get_uniasm_session()
+        with self._infer_lock:
+            funcs = sess["load_asmfile"](asm_path)
+            if not funcs or len(funcs) != 1:
+                return None
+            sess["check_vocab"](self.vocab_path, funcs)
+            sess["generate_embeddings"](
+                sess["tokenizer"],
+                sess["model"],
+                funcs,
+                "liner",
+                b_num=True,
+            )
+            emb_vec = np.asarray(funcs[0].embedding, dtype=np.float32)
+            if emb_vec.ndim != 1 or emb_vec.size == 0:
+                return None
+
+        with self._cache_lock:
+            self._emb_cache[cache_key] = emb_vec
+            if self._emb_cache_max <= 0:
+                self._emb_cache.clear()
+            else:
+                while len(self._emb_cache) > self._emb_cache_max:
+                    self._emb_cache.popitem(last=False)
+        return emb_vec
+
+    def _score_candidate(
+        self,
+        query: Dict,
+        cand: Dict,
+        query_kind: str,
+        worker_dir: str,
+    ) -> Optional[Dict]:
+        query_addr = self._get_query_addr(query, query_kind)
+        cand_addr = _parse_addr(cand.get("func_addr"))
+        if cand_addr is None:
+            return None
+
+        query_asm = self._extract_asm(
+            binary_path=str(query.get("binary_path") or ""),
+            func_name=str(query.get("func_name") or ""),
+            func_addr=query_addr,
+            worker_dir=worker_dir,
+            cache_dict=self.original_asm_cache,
+            cache_prefix="query",
+        )
+        cand_asm = self._extract_asm(
+            binary_path=str(cand.get("binary_path") or ""),
+            func_name=str(cand.get("func_name") or ""),
+            func_addr=cand_addr,
+            worker_dir=worker_dir,
+            cache_dict=self.mutated_asm_cache,
+            cache_prefix="cand",
+        )
+        if not query_asm or not cand_asm:
+            return None
+
+        emb_query = self._get_embedding(query_asm)
+        emb_cand = self._get_embedding(cand_asm)
+        if emb_query is None or emb_cand is None:
+            return None
+
+        denom = float(np.linalg.norm(emb_query) * np.linalg.norm(emb_cand))
+        if denom <= 1e-12:
+            return None
+        score = float(np.dot(emb_query, emb_cand) / denom)
+        if not np.isfinite(score):
+            return None
+        cand_id = str(cand.get("id") or cand.get("func_name") or "unknown_cand")
+        return {"id": cand_id, "score": abs(float(score))}
+
+    def topk(self, query: Dict, dataset: List[Dict], k: int, query_kind: str) -> List[Dict]:
+        scored: List[Dict] = []
+        total = len(dataset)
+        self._log_start(total, query_kind)
+        if self.retrieval_workers > 1 and total > 0:
+            max_workers = min(self.retrieval_workers, total)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._score_candidate,
+                        query,
+                        cand,
+                        query_kind,
+                        self._get_worker_dir(idx),
+                    ): idx
+                    for idx, cand in enumerate(dataset, start=1)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    result = future.result()
+                    if result is not None:
+                        scored.append(result)
+                        self._log_candidate(
+                            idx=idx,
+                            total=total,
+                            cand_id=str(result.get("id")),
+                            score=float(result.get("score", 0.0)),
+                            query_kind=query_kind,
+                        )
+        else:
+            for idx, cand in enumerate(dataset, start=1):
+                result = self._score_candidate(
+                    query, cand, query_kind, self._get_worker_dir(idx)
+                )
+                if result is not None:
+                    scored.append(result)
+                    self._log_candidate(
+                        idx=idx,
+                        total=total,
+                        cand_id=str(result.get("id")),
+                        score=float(result.get("score", 0.0)),
+                        query_kind=query_kind,
+                    )
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:k]
+
+    def score_candidates(
+        self,
+        query: Dict,
+        candidates: List[Dict],
+        query_kind: str,
+    ) -> List[Dict]:
+        scored: List[Dict] = []
+        for idx, cand in enumerate(candidates, start=1):
+            result = self._score_candidate(query, cand, query_kind, self._get_worker_dir(idx))
+            if result is not None:
+                scored.append(result)
+        return scored
+
+
 class GMNRetriever(RetrievalBase):
     name = "gmn"
 
@@ -803,6 +1144,7 @@ class GMNRetriever(RetrievalBase):
         self._base_feature_dict: Optional[Dict] = None
         self._opcodes_dict: Optional[Dict[str, int]] = None
         self._runtime_feature_cache: Dict[Tuple[str, str, str], Dict] = {}
+        self._engine_lock = threading.Lock()
 
     def _load_and_validate_base_features(self) -> Dict:
         if self._base_feature_dict is not None:
@@ -853,59 +1195,72 @@ class GMNRetriever(RetrievalBase):
     def _ensure_engine(self):
         if self._engine is not None:
             return self._engine
+        with self._engine_lock:
+            if self._engine is not None:
+                return self._engine
 
-        if not os.path.isdir(self.checkpoint_dir):
-            raise ValueError(f"GMN checkpoint dir invalid: {self.checkpoint_dir}")
-        if not os.path.isfile(self.features_json):
-            raise ValueError(f"GMN features json invalid: {self.features_json}")
-        self._load_and_validate_base_features()
+            if not os.path.isdir(self.checkpoint_dir):
+                raise ValueError(f"GMN checkpoint dir invalid: {self.checkpoint_dir}")
+            if not os.path.isfile(self.features_json):
+                raise ValueError(f"GMN features json invalid: {self.features_json}")
+            self._load_and_validate_base_features()
 
-        try:
-            import tensorflow as tf  # noqa: F401
-        except Exception as e:
-            raise RuntimeError(f"GMN requires tensorflow==1.x. Import failed: {e}")
+            try:
+                import tensorflow as tf  # noqa: F401
+                try:
+                    tf.compat.v1.disable_eager_execution()
+                except Exception:
+                    pass
+            except Exception as e:
+                raise RuntimeError(f"GMN requires tensorflow==1.x. Import failed: {e}")
 
-        gmn_root = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..",
-            "detection_model",
-            "binary_function_similarity",
-            "Models",
-            "GGSNN-GMN",
-            "NeuralNetwork",
-        )
-        gmn_root = os.path.abspath(gmn_root)
-        if gmn_root not in os.sys.path:
-            os.sys.path.insert(0, gmn_root)
+            gmn_root = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..",
+                "detection_model",
+                "binary_function_similarity",
+                "Models",
+                "GGSNN-GMN",
+                "NeuralNetwork",
+            )
+            gmn_root = os.path.abspath(gmn_root)
+            if gmn_root not in os.sys.path:
+                os.sys.path.insert(0, gmn_root)
 
-        from core.config import get_config
-        from core.gnn_model import GNNModel
-        from core.build_dataset import build_testing_generator
-        from core.model_evaluation import evaluate_sim
+            from core.config import get_config
+            from core.gnn_model import GNNModel
+            from core.build_dataset import build_testing_generator
+            from core.model_evaluation import evaluate_sim
 
-        args = SimpleNamespace(
-            model_type="matching",
-            training_mode="pair",
-            features_type=self.features_type,
-            dataset=self.dataset,
-            num_epochs=1,
-            checkpointdir=self.checkpoint_dir,
-            outputdir=self.output_dir,
-            featuresdir=os.path.dirname(os.path.dirname(self.features_json)),
-        )
-        config = get_config(args)
-        config["checkpoint_dir"] = self.checkpoint_dir
-        config["batch_size"] = self.batch_size
-        config["testing"]["features_testing_path"] = self.features_json
+            args = SimpleNamespace(
+                model_type="matching",
+                training_mode="pair",
+                features_type=self.features_type,
+                dataset=self.dataset,
+                num_epochs=1,
+                checkpointdir=self.checkpoint_dir,
+                outputdir=self.output_dir,
+                featuresdir=os.path.dirname(os.path.dirname(self.features_json)),
+            )
+            config = get_config(args)
+            config["checkpoint_dir"] = self.checkpoint_dir
+            config["batch_size"] = self.batch_size
+            config["testing"]["features_testing_path"] = self.features_json
 
-        self._engine = {
-            "config": config,
-            "model": GNNModel(config),
-            "build_testing_generator": build_testing_generator,
-            "evaluate_sim": evaluate_sim,
-            "initialized": False,
-        }
-        return self._engine
+            gmn_graph = tf.Graph()
+            with gmn_graph.as_default():
+                model = GNNModel(config)
+
+            self._engine = {
+                "config": config,
+                "model": model,
+                "graph": gmn_graph,
+                "lock": threading.Lock(),
+                "build_testing_generator": build_testing_generator,
+                "evaluate_sim": evaluate_sim,
+                "initialized": False,
+            }
+            return self._engine
 
     def _format_fva(self, addr: Optional[object]) -> Optional[str]:
         val = _parse_addr(addr)
@@ -1164,6 +1519,8 @@ class GMNRetriever(RetrievalBase):
         engine = self._ensure_engine()
         config = engine["config"]
         model = engine["model"]
+        graph = engine.get("graph")
+        runtime_lock = engine.setdefault("lock", threading.Lock())
         build_testing_generator = engine["build_testing_generator"]
         evaluate_sim = engine["evaluate_sim"]
 
@@ -1193,22 +1550,44 @@ class GMNRetriever(RetrievalBase):
         if features_override is not None:
             config["testing"]["features_testing_path"] = features_override
 
+        graph_ctx = graph.as_default() if graph is not None else nullcontext()
         try:
-            if not engine["initialized"]:
-                init_gen = build_testing_generator(config, csv_path)
-                model._model_initialize(init_gen, is_training=False)
-                model._create_tfsaver()
-                model._restore_model()
-                engine["initialized"] = True
+            with runtime_lock:
+                with graph_ctx:
+                    if not engine["initialized"]:
+                        init_gen = build_testing_generator(config, csv_path)
+                        if graph is None:
+                            model._model_initialize(init_gen, is_training=False)
+                        else:
+                            import tensorflow as tf
 
-            batch_gen = build_testing_generator(config, csv_path)
-            sims = evaluate_sim(
-                model._session,
-                model._tensors["metrics"]["evaluation"],
-                model._placeholders,
-                batch_gen,
-            )
-            return sims.tolist()
+                            session_conf = tf.compat.v1.ConfigProto(
+                                allow_soft_placement=True,
+                                log_device_placement=False,
+                            )
+                            model._session = tf.compat.v1.Session(
+                                graph=graph,
+                                config=session_conf,
+                            )
+                            tf.compat.v1.set_random_seed(config["seed"] + 2)
+                            model._create_network(init_gen, is_training=False)
+                            init_ops = (
+                                tf.compat.v1.global_variables_initializer(),
+                                tf.compat.v1.local_variables_initializer(),
+                            )
+                            model._session.run(init_ops)
+                        model._create_tfsaver()
+                        model._restore_model()
+                        engine["initialized"] = True
+
+                    batch_gen = build_testing_generator(config, csv_path)
+                    sims = evaluate_sim(
+                        model._session,
+                        model._tensors["metrics"]["evaluation"],
+                        model._placeholders,
+                        batch_gen,
+                    )
+                    return sims.tolist()
         finally:
             try:
                 os.remove(csv_path)
@@ -1283,6 +1662,11 @@ class RLAgentRunner:
         jtrans_model_dir: Optional[str] = None,
         jtrans_tokenizer_dir: Optional[str] = None,
         jtrans_use_gpu: bool = False,
+        uniasm_root_dir: Optional[str] = None,
+        uniasm_model_path: Optional[str] = None,
+        uniasm_vocab_path: Optional[str] = None,
+        uniasm_use_gpu: bool = False,
+        feature_mode: str = "full",
         top_block_only: bool = False,
     ) -> None:
         self.dataset_path = dataset_path
@@ -1324,11 +1708,17 @@ class RLAgentRunner:
             jtrans_model_dir=jtrans_model_dir,
             jtrans_tokenizer_dir=jtrans_tokenizer_dir,
             jtrans_use_gpu=jtrans_use_gpu,
+            uniasm_root_dir=uniasm_root_dir,
+            uniasm_model_path=uniasm_model_path,
+            uniasm_vocab_path=uniasm_vocab_path,
+            uniasm_use_gpu=uniasm_use_gpu,
+            feature_mode=feature_mode,
             include_action12=True,
         )
-        self.env.target_score = 0.4
+        self.env.target_score = 0.1
         self.env.set_state_dim(state_dim)
         self.top_block_only = bool(top_block_only)
+        print(f"[ASR] Feature mode: {feature_mode}")
         if self.top_block_only:
             print("[ASR] Location policy: top-1 critical block only")
 
@@ -1431,6 +1821,10 @@ class GAAgentRunner:
         jtrans_model_dir: Optional[str] = None,
         jtrans_tokenizer_dir: Optional[str] = None,
         jtrans_use_gpu: bool = False,
+        uniasm_root_dir: Optional[str] = None,
+        uniasm_model_path: Optional[str] = None,
+        uniasm_vocab_path: Optional[str] = None,
+        uniasm_use_gpu: bool = False,
         population_size: int = 6,
         generations: int = 4,
         elite_size: int = 2,
@@ -1439,6 +1833,7 @@ class GAAgentRunner:
         seq_len: int = 8,
         loc_slots: int = 3,
         seed: Optional[int] = None,
+        feature_mode: str = "full",
         top_block_only: bool = False,
     ) -> None:
         self.dataset_path = dataset_path
@@ -1468,10 +1863,16 @@ class GAAgentRunner:
             jtrans_model_dir=jtrans_model_dir,
             jtrans_tokenizer_dir=jtrans_tokenizer_dir,
             jtrans_use_gpu=jtrans_use_gpu,
+            uniasm_root_dir=uniasm_root_dir,
+            uniasm_model_path=uniasm_model_path,
+            uniasm_vocab_path=uniasm_vocab_path,
+            uniasm_use_gpu=uniasm_use_gpu,
+            feature_mode=feature_mode,
             include_action12=True,
         )
-        self.env.target_score = 0.4
+        self.env.target_score = 0.05
         self.env.set_state_dim(state_dim)
+        print(f"[ASR] Feature mode: {feature_mode}")
         print(
             "[ASR] GA baseline loaded "
             f"(pop={self.population_size}, gen={self.generations}, "
@@ -1706,6 +2107,17 @@ def build_retriever(args: argparse.Namespace, save_path: str) -> RetrievalBase:
             retrieval_workers=args.retrieval_workers,
             log_every=args.retrieval_log_every,
         )
+    if args.retrieval_model == "uniasm":
+        return UniASMRetriever(
+            root_dir=args.uniasm_root,
+            model_path=args.uniasm_model_path,
+            vocab_path=args.uniasm_vocab_path,
+            use_gpu=args.uniasm_use_gpu,
+            asm_work_dir=asm_work_dir,
+            retrieval_workers=args.retrieval_workers,
+            emb_cache_max=args.uniasm_emb_cache_max,
+            log_every=args.retrieval_log_every,
+        )
     if args.retrieval_model == "gmn":
         return GMNRetriever(
             checkpoint_dir=args.gmn_checkpoint_dir,
@@ -1754,6 +2166,11 @@ def build_attack_runner(
         "jtrans_model_dir": args.jtrans_model_dir,
         "jtrans_tokenizer_dir": args.jtrans_tokenizer_dir,
         "jtrans_use_gpu": args.jtrans_use_gpu,
+        "uniasm_root_dir": args.uniasm_root,
+        "uniasm_model_path": args.uniasm_model_path,
+        "uniasm_vocab_path": args.uniasm_vocab_path,
+        "uniasm_use_gpu": args.uniasm_use_gpu,
+        "feature_mode": args.feature_mode,
         "top_block_only": args.top_block_only,
     }
     if args.attack_agent == "ppo":
@@ -2475,7 +2892,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", default=default_dataset)
     parser.add_argument("--model-path", default=default_model)
     parser.add_argument("-k", "--topk", type=int, default=10)
-    parser.add_argument("-b", "--budget", type=int, default=30)
+    parser.add_argument("-b", "--budget", type=int, default=15)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
         "--limit-mode",
@@ -2512,7 +2929,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--retrieval-model",
-        choices=["asm2vec", "safe", "jtrans", "gmn"],
+        choices=["asm2vec", "safe", "jtrans", "uniasm", "gmn"],
         default="asm2vec",
         help="Retrieval model for Top-K ranking.",
     )
@@ -2546,9 +2963,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jtrans-model-dir", default=None)
     parser.add_argument("--jtrans-tokenizer-dir", default=None)
     parser.add_argument("--jtrans-use-gpu", action="store_true")
+    parser.add_argument("--uniasm-root", default=None)
+    parser.add_argument("--uniasm-model-path", default=None)
+    parser.add_argument("--uniasm-vocab-path", default=None)
+    parser.add_argument("--uniasm-use-gpu", action="store_true")
+    parser.add_argument(
+        "--uniasm-emb-cache-max",
+        type=int,
+        default=512,
+        help="UniASM embedding cache size limit (LRU, 0 disables cache).",
+    )
     parser.add_argument(
         "--env-detection",
-        choices=["asm2vec", "safe", "jtrans"],
+        choices=["asm2vec", "safe", "jtrans", "uniasm"],
         default="asm2vec",
         help="Detection method for env.step() scoring.",
     )
@@ -2574,6 +3001,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--top-block-only",
         action="store_true",
         help="Always mutate only the highest-scored ACFG block (loc_idx=0).",
+    )
+    parser.add_argument(
+        "--feature-mode",
+        choices=[
+            "full",
+            "no_history",
+            "no_section_a",
+            "no_section_b",
+            "no_section_c",
+            "no_progress",
+            "no_api",
+            "no_progress_api",
+        ],
+        default="full",
+        help="Feature ablation mode for state vector construction.",
     )
     parser.add_argument("--ga-population-size", type=int, default=6)
     parser.add_argument("--ga-generations", type=int, default=4)
@@ -2616,6 +3058,16 @@ def main() -> None:
             args.jtrans_model_dir = os.path.join(jtrans_root, "models", "jTrans-finetune")
         if args.jtrans_tokenizer_dir is None:
             args.jtrans_tokenizer_dir = os.path.join(jtrans_root, "jtrans_tokenizer")
+
+    if args.env_detection == "uniasm" or args.retrieval_model == "uniasm":
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        uniasm_root = os.path.join(project_root, "detection_model", "UniASM")
+        if args.uniasm_root is None:
+            args.uniasm_root = uniasm_root
+        if args.uniasm_model_path is None:
+            args.uniasm_model_path = os.path.join(uniasm_root, "data", "uniasm_base.h5")
+        if args.uniasm_vocab_path is None:
+            args.uniasm_vocab_path = os.path.join(uniasm_root, "data", "vocab_base.txt")
 
     retriever = build_retriever(args, args.save_path)
     cleanup_mgr = SavePathCleanupManager(

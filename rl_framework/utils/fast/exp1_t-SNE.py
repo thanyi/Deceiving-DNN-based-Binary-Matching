@@ -19,7 +19,8 @@ from rl_framework.env_wrapper import BinaryPerturbationEnv
 
 # ================= 配置 =================
 DATASET_PATH = "dataset_train.json"
-SAVE_DIR = "chapter3_results_final"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SAVE_DIR = os.path.join(SCRIPT_DIR, "chapter3_0326")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # 绘图风格
@@ -85,7 +86,7 @@ def exp1_discriminability(data, extractor, input_perplexity=10, input_candidates
     func_counts = Counter(valid_candidates)
     
     # 选取前 4 类，且每类样本数要足够多 (比如 > 15 个，保证簇的丰满度)
-    top_funcs = [name for name, cnt in func_counts.most_common(20) if cnt >= 15][:6]
+    top_funcs = [name for name, cnt in func_counts.most_common(20) if cnt >= 15][:4]
     
     print(f"[*] Selected Target Functions for Clustering: {top_funcs}")
     # 打印一下来源，确认是跨文件的
@@ -206,14 +207,14 @@ if __name__ == "__main__":
     
     data = load_dataset()
     extractor = get_feature_extractor()
-    exp1_discriminability(data, extractor, input_perplexity=5, input_candidates_num=20)
-    exp1_discriminability(data, extractor, input_perplexity=10, input_candidates_num=20)
-    exp1_discriminability(data, extractor, input_perplexity=15, input_candidates_num=20)  # 最佳
+    exp1_discriminability(data, extractor, input_perplexity=5, input_candidates_num=40)
+    exp1_discriminability(data, extractor, input_perplexity=10, input_candidates_num=40)
+    exp1_discriminability(data, extractor, input_perplexity=15, input_candidates_num=40)  # 最佳
     
     
-    exp1_discriminability(data, extractor, input_perplexity=10, input_candidates_num=30)
-    exp1_discriminability(data, extractor, input_perplexity=15, input_candidates_num=30)  # 最佳
-    exp1_discriminability(data, extractor, input_perplexity=20, input_candidates_num=30)
+    exp1_discriminability(data, extractor, input_perplexity=10, input_candidates_num=60)
+    exp1_discriminability(data, extractor, input_perplexity=15, input_candidates_num=60)  # 最佳
+    exp1_discriminability(data, extractor, input_perplexity=20, input_candidates_num=60)
 
 
     print("\n[+] All Done!")
